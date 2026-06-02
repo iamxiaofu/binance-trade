@@ -10,6 +10,7 @@ credentials.*
 config.local.*
 config/secrets/
 /secrets/
+*.local.md
 
 # ===== Python 产物 =====
 __pycache__/
