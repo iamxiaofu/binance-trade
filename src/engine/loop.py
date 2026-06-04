@@ -44,6 +44,7 @@ class TradingEngine:
         self._notifier = Notifier(
             settings.notify, creds.telegram_bot_token, creds.telegram_chat_id
         )
+        self._symbol_enabled = {symbol: True for symbol in settings.symbols}
         self.runtime = RuntimeState()
         self._stopped = asyncio.Event()
 
@@ -167,6 +168,8 @@ class TradingEngine:
             self._settings.execution.dry_run = val
             await self._store.set_runtime_setting("execution.dry_run", str(val).lower())
             return f"dry_run set to {val} (persisted)"
+        if name == "SET_SYMBOL_ENABLED":
+            return await self._set_symbol_enabled(arg)
         if name == "CANCEL_AND_FLATTEN":
             return await self._cancel_and_flatten("web")
         if name == "STOP_ENGINE":
@@ -183,10 +186,40 @@ class TradingEngine:
             await self._store.set_runtime_setting(
                 "execution.dry_run", str(self._settings.execution.dry_run).lower()
             )
-            return
-        val = raw.strip().lower() in ("1", "true", "yes", "on")
-        self._settings.execution.dry_run = val
-        logger.info("runtime setting applied: execution.dry_run={}", val)
+        else:
+            val = raw.strip().lower() in ("1", "true", "yes", "on")
+            self._settings.execution.dry_run = val
+            logger.info("runtime setting applied: execution.dry_run={}", val)
+        for symbol in self._settings.symbols:
+            key = self._symbol_enabled_key(symbol)
+            raw_enabled = await self._store.get_runtime_setting(key)
+            if raw_enabled is None:
+                await self._store.set_runtime_setting(key, "true")
+                self._symbol_enabled[symbol] = True
+                continue
+            enabled = raw_enabled.strip().lower() in ("1", "true", "yes", "on")
+            self._symbol_enabled[symbol] = enabled
+            logger.info("runtime setting applied: {}={}", key, enabled)
+
+    async def _set_symbol_enabled(self, arg: str) -> str:
+        """持久化单个币种的策略启用状态。"""
+        raw = (arg or "").strip()
+        if "=" not in raw:
+            raise ValueError("SET_SYMBOL_ENABLED requires SYMBOL=true|false")
+        symbol_raw, value_raw = raw.split("=", 1)
+        symbol = normalize_symbol(symbol_raw)
+        if symbol not in self._settings.symbols:
+            raise ValueError(f"symbol not configured: {symbol}")
+        enabled = value_raw.strip().lower() in ("1", "true", "yes", "on")
+        self._symbol_enabled[symbol] = enabled
+        await self._store.set_runtime_setting(
+            self._symbol_enabled_key(symbol), str(enabled).lower()
+        )
+        return f"{symbol} strategy enabled set to {enabled} (persisted)"
+
+    @staticmethod
+    def _symbol_enabled_key(symbol: str) -> str:
+        return f"symbol.enabled.{normalize_symbol(symbol)}"
 
     async def _cancel_and_flatten(self, source: str) -> str:
         """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
@@ -485,6 +518,13 @@ class TradingEngine:
 
     async def _process_symbol(self, symbol: str) -> None:
         snap = self._market.snapshot(symbol)
+        if not self._symbol_enabled.get(symbol, True):
+            logger.info("[skip-llm] {} reason=symbol disabled", symbol)
+            await self._store.log_decision(
+                symbol=symbol, skipped=True, skip_reason="symbol disabled",
+                ref_price=snap.last_price,
+            )
+            return
         position = build_position_snapshot(self.runtime.positions.get(symbol))
 
         # 1. 节流：是否调用 LLM

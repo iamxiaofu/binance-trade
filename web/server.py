@@ -138,6 +138,18 @@ async def _effective_dry_run() -> tuple[bool, str]:
     return _settings.execution.dry_run, "config"
 
 
+async def _effective_symbol_enabled() -> dict[str, bool]:
+    out = {symbol: True for symbol in _settings.symbols}
+    try:
+        store = await _get_store()
+        for symbol in _settings.symbols:
+            raw = await store.get_runtime_setting(f"symbol.enabled.{symbol}")
+            out[symbol] = _parse_bool_setting(raw, True)
+    except Exception as e:
+        logger.warning("runtime symbol settings unavailable, fallback to enabled: {}", e)
+    return out
+
+
 async def _live_positions_snapshot() -> dict[str, Any]:
     """Fetch current exchange positions with a short cache for dashboard pushes."""
     now = int(time.time() * 1000)
@@ -306,9 +318,15 @@ async def api_config(_: str = Depends(_check_auth)):
     """暴露非敏感运行配置，供前端展示风控阈值等。"""
     s = _settings
     dry_run, dry_run_source = await _effective_dry_run()
+    symbol_enabled = await _effective_symbol_enabled()
     return {
         "mode": s.mode.value,
         "symbols": s.symbols,
+        "symbol_enabled": symbol_enabled,
+        "symbols_state": [
+            {"symbol": symbol, "enabled": symbol_enabled.get(symbol, True)}
+            for symbol in s.symbols
+        ],
         "dry_run": dry_run,
         "dry_run_source": dry_run_source,
         "dry_run_config": s.execution.dry_run,
@@ -389,6 +407,7 @@ _ALLOWED_COMMANDS = {
     "PAUSE",
     "RESUME",
     "SET_DRY_RUN",
+    "SET_SYMBOL_ENABLED",
     "REPAIR_SL_TP",
     "CANCEL_AND_FLATTEN",
     "STOP_ENGINE",

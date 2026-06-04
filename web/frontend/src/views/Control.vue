@@ -1,17 +1,23 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { api } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useLiveStore } from '../stores/live'
 
+const live = useLiveStore()
 const cfg = ref(null)
 const commands = ref([])
 const loading = ref(false)
+const symbolLoading = ref({})
 
 async function loadCommands() {
   commands.value = await api.commands(50).catch(() => [])
 }
 async function loadCfg() {
   cfg.value = await api.config().catch(() => null)
+}
+async function refreshAll() {
+  await Promise.all([loadCfg(), loadCommands()])
 }
 
 async function send(name, arg = '', confirmText = null) {
@@ -50,6 +56,7 @@ function commandLabel(name) {
     PAUSE: '暂停策略',
     RESUME: '恢复策略',
     SET_DRY_RUN: '切换下单模式',
+    SET_SYMBOL_ENABLED: '切换币种交易',
     REPAIR_SL_TP: '补止盈止损',
     CANCEL_AND_FLATTEN: '撤单+平仓',
     STOP_ENGINE: '停止交易引擎',
@@ -57,7 +64,44 @@ function commandLabel(name) {
   }[name] || name
 }
 
-onMounted(async () => { await loadCfg(); await loadCommands() })
+const symbolRows = computed(() => (cfg.value?.symbols || []).map((symbol) => ({
+  symbol,
+  enabled: cfg.value?.symbol_enabled?.[symbol] !== false,
+  hasPosition: (live.positions || []).some((p) =>
+    p.symbol === symbol && Number(p.contracts || 0) > 0
+  ),
+})))
+
+function setSymbolLoading(symbol, val) {
+  const next = { ...symbolLoading.value }
+  if (val) next[symbol] = true
+  else delete next[symbol]
+  symbolLoading.value = next
+}
+
+async function setSymbolEnabled(symbol, enabled) {
+  if (!enabled && symbolRows.value.find((row) => row.symbol === symbol)?.hasPosition) {
+    try {
+      await ElMessageBox.confirm(
+        `${symbol} 当前仍有持仓。停用后不会继续请求 LLM 管理该币种，但交易所条件单仍会保留。`,
+        '确认停用币种交易',
+        { confirmButtonText: '确认停用', cancelButtonText: '取消', type: 'warning' }
+      )
+    } catch (_) { return }
+  }
+  setSymbolLoading(symbol, true)
+  try {
+    const r = await api.command('SET_SYMBOL_ENABLED', `${symbol}=${enabled ? 'true' : 'false'}`)
+    ElMessage.success(`${symbol} ${enabled ? '启用' : '停用'}命令已入队 (#${r.id})`)
+    await loadCommands()
+  } catch (e) {
+    ElMessage.error(`下发失败: ${e.message}`)
+  } finally {
+    setSymbolLoading(symbol, false)
+  }
+}
+
+onMounted(refreshAll)
 </script>
 
 <template>
@@ -155,10 +199,60 @@ onMounted(async () => { await loadCfg(); await loadCommands() })
     </el-row>
 
     <el-card shadow="never" style="margin-top:16px">
+      <template #header>币种交易开关</template>
+      <el-table :data="symbolRows" stripe>
+        <el-table-column prop="symbol" label="币种" width="120" />
+        <el-table-column label="状态" width="110">
+          <template #default="{ row }">
+            <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
+              {{ row.enabled ? '已启用' : '已停用' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="持仓" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.hasPosition ? 'warning' : 'info'" size="small">
+              {{ row.hasPosition ? '有持仓' : '无持仓' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="LLM 调用" width="120">
+          <template #default="{ row }">
+            <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
+              {{ row.enabled ? '允许' : '禁止' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" min-width="160">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.enabled"
+              type="warning"
+              size="small"
+              :loading="Boolean(symbolLoading[row.symbol])"
+              @click="setSymbolEnabled(row.symbol, false)"
+            >
+              停用交易
+            </el-button>
+            <el-button
+              v-else
+              type="success"
+              size="small"
+              :loading="Boolean(symbolLoading[row.symbol])"
+              @click="setSymbolEnabled(row.symbol, true)"
+            >
+              启用交易
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card shadow="never" style="margin-top:16px">
       <template #header>
         <div style="display:flex; justify-content:space-between; align-items:center">
           <span>命令历史</span>
-          <el-button size="small" :icon="'Refresh'" @click="loadCommands">刷新</el-button>
+          <el-button size="small" :icon="'Refresh'" @click="refreshAll">刷新</el-button>
         </div>
       </template>
       <el-table :data="commands" stripe max-height="340">

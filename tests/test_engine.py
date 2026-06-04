@@ -309,6 +309,33 @@ async def test_runtime_dry_run_applied_on_startup(settings, creds, monkeypatch):
     assert eng._settings.execution.dry_run is True
 
 
+async def test_runtime_symbol_enabled_applied_on_startup(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.runtime_settings["symbol.enabled.BTCUSDT"] = "false"
+    await eng._apply_runtime_settings()
+    assert eng._symbol_enabled["BTCUSDT"] is False
+
+
+async def test_command_set_symbol_enabled(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 1, "command": "SET_SYMBOL_ENABLED", "arg": "BTCUSDT=false"}]
+    await eng._process_commands()
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+
+
+async def test_disabled_symbol_skips_llm(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = False
+    monkeypatch.setattr(eng._market, "snapshot", lambda s: _snap(100.0))
+
+    await eng._process_symbol("BTCUSDT")
+
+    assert eng._store.decisions[0]["skipped"] is True
+    assert eng._store.decisions[0]["skip_reason"] == "symbol disabled"
+    assert eng._executor.opened == []
+
+
 async def test_command_cancel_and_flatten_keeps_engine_running(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._store.pending = [{"id": 1, "command": "CANCEL_AND_FLATTEN", "arg": ""}]
