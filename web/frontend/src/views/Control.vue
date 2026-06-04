@@ -33,7 +33,7 @@ async function send(name, arg = '', confirmText = null) {
   try {
     const r = await api.command(name, arg)
     ElMessage.success(`命令已入队 (#${r.id})，交易进程将在下个周期执行`)
-    await loadCommands()
+    await Promise.all([loadCommands(), loadCfg()])
   } catch (e) {
     ElMessage.error(`下发失败: ${e.message}`)
   } finally {
@@ -43,6 +43,18 @@ async function send(name, arg = '', confirmText = null) {
 
 function statusTag(s) {
   return { pending: 'warning', done: 'success', failed: 'danger' }[s] || 'info'
+}
+
+function commandLabel(name) {
+  return {
+    PAUSE: '暂停策略',
+    RESUME: '恢复策略',
+    SET_DRY_RUN: '切换下单模式',
+    REPAIR_SL_TP: '补止盈止损',
+    CANCEL_AND_FLATTEN: '撤单+平仓',
+    STOP_ENGINE: '停止交易引擎',
+    KILL_SWITCH: 'Kill Switch',
+  }[name] || name
 }
 
 onMounted(async () => { await loadCfg(); await loadCommands() })
@@ -57,17 +69,17 @@ onMounted(async () => { await loadCfg(); await loadCommands() })
     <el-row :gutter="16">
       <el-col :span="12">
         <el-card shadow="never">
-          <template #header>紧急操作</template>
+          <template #header>策略状态</template>
           <el-space direction="vertical" :size="14" fill style="width:100%">
-            <el-button type="danger" size="large" :loading="loading" style="width:100%"
-                       @click="send('KILL_SWITCH', '', 'KILL')">
-              🛑 Kill Switch（撤单 + 平仓 + 停机）
-            </el-button>
             <div style="display:flex; gap:12px">
               <el-button type="warning" :loading="loading" style="flex:1"
-                         @click="send('PAUSE')">⏸ 暂停开新仓</el-button>
+                         :icon="'VideoPause'" @click="send('PAUSE')">
+                暂停策略
+              </el-button>
               <el-button type="success" :loading="loading" style="flex:1"
-                         @click="send('RESUME')">▶ 恢复开新仓</el-button>
+                         :icon="'VideoPlay'" @click="send('RESUME')">
+                恢复策略
+              </el-button>
             </div>
           </el-space>
         </el-card>
@@ -80,6 +92,9 @@ onMounted(async () => { await loadCfg(); await loadCommands() })
             当前：
             <el-tag :type="cfg.dry_run ? 'info' : 'danger'" effect="dark">
               {{ cfg.dry_run ? 'DRY-RUN（模拟）' : '真实下单' }}
+            </el-tag>
+            <el-tag size="small" style="margin-left:8px">
+              {{ cfg.dry_run_source === 'runtime' ? '运行时持久化' : '配置文件' }}
             </el-tag>
           </div>
           <div style="display:flex; gap:12px">
@@ -95,6 +110,50 @@ onMounted(async () => { await loadCfg(); await loadCommands() })
       </el-col>
     </el-row>
 
+    <el-row :gutter="16" style="margin-top:16px">
+      <el-col :span="12">
+        <el-card shadow="never">
+          <template #header>风险出清</template>
+          <el-button
+            type="danger"
+            plain
+            :loading="loading"
+            :icon="'CircleCloseFilled'"
+            style="width:100%"
+            @click="send('CANCEL_AND_FLATTEN', '', 'FLATTEN')"
+          >
+            撤单 + 平仓
+          </el-button>
+        </el-card>
+      </el-col>
+
+      <el-col :span="12">
+        <el-card shadow="never">
+          <template #header>引擎控制</template>
+          <div style="display:flex; gap:12px">
+            <el-button
+              type="warning"
+              :loading="loading"
+              :icon="'SwitchButton'"
+              style="flex:1"
+              @click="send('STOP_ENGINE', '', 'STOP')"
+            >
+              停止交易引擎
+            </el-button>
+            <el-button
+              type="danger"
+              :loading="loading"
+              :icon="'WarningFilled'"
+              style="flex:1"
+              @click="send('KILL_SWITCH', '', 'KILL')"
+            >
+              Kill Switch
+            </el-button>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
+
     <el-card shadow="never" style="margin-top:16px">
       <template #header>
         <div style="display:flex; justify-content:space-between; align-items:center">
@@ -104,11 +163,15 @@ onMounted(async () => { await loadCfg(); await loadCommands() })
       </template>
       <el-table :data="commands" stripe max-height="340">
         <el-table-column prop="created_at" label="入队时间" width="170" />
-        <el-table-column prop="command" label="命令" width="140" />
+        <el-table-column label="命令" width="150">
+          <template #default="{ row }">{{ commandLabel(row.command) }}</template>
+        </el-table-column>
         <el-table-column prop="arg" label="参数" width="90" />
         <el-table-column prop="source" label="来源" width="140" />
         <el-table-column label="状态" width="100">
-          <template #default="{ row }"><el-tag :type="statusTag(row.status)" size="small">{{ row.status }}</el-tag></template>
+          <template #default="{ row }">
+            <el-tag :type="statusTag(row.status)" size="small">{{ row.status }}</el-tag>
+          </template>
         </el-table-column>
         <el-table-column prop="result" label="结果" min-width="200" show-overflow-tooltip />
         <el-table-column prop="executed_at" label="执行时间" width="170" />

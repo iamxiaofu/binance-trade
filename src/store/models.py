@@ -137,6 +137,19 @@ class BalanceSnapshotRow(Base):
     drawdown_pct: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class RuntimeSettingRow(Base):
+    """运行时设置。
+
+    用于保存 Web 命令修改的有效运行态，避免交易进程、Web 进程和重启后的配置
+    各自显示不同状态。
+    """
+    __tablename__ = "runtime_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+
+
 class ControlCommandRow(Base):
     """Web 操作面板下发的命令队列。
 
@@ -149,7 +162,7 @@ class ControlCommandRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
     created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
-    command: Mapped[str] = mapped_column(String(32), index=True)  # KILL_SWITCH/PAUSE/RESUME/SET_DRY_RUN
+    command: Mapped[str] = mapped_column(String(32), index=True)  # PAUSE/RESUME/SET_DRY_RUN/etc.
     arg: Mapped[str] = mapped_column(String(64), default="")       # 命令参数(如 dry_run 的 true/false)
     source: Mapped[str] = mapped_column(String(32), default="web")
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending/done/failed

@@ -31,6 +31,7 @@ class FakeStore:
         self.condition_exits = []
         self.templates = {}
         self.latest_decision = None
+        self.runtime_settings = {}
         self.pending = []          # 待执行命令
         self.marked = []           # (id, status, result)
 
@@ -58,6 +59,12 @@ class FakeStore:
     async def latest_open_decision(self, symbol):
         return self.latest_decision
 
+    async def set_runtime_setting(self, key, value):
+        self.runtime_settings[key] = value
+
+    async def get_runtime_setting(self, key):
+        return self.runtime_settings.get(key)
+
     async def fetch_pending_commands(self):
         out, self.pending = self.pending, []
         return out
@@ -78,6 +85,7 @@ class FakeNotifier:
 class FakeExecutor:
     def __init__(self):
         self.flattened = 0
+        self.canceled = 0
         self.opened = []
 
     async def flatten_all(self):
@@ -85,7 +93,7 @@ class FakeExecutor:
         return []
 
     async def cancel_all_orders(self):
-        pass
+        self.canceled += 1
 
     async def open_position(self, *, decision, qty, price):
         self.opened.append((decision.symbol, qty))
@@ -276,11 +284,12 @@ async def test_command_pause_resume(settings, creds, monkeypatch):
     eng._store.pending = [{"id": 1, "command": "PAUSE", "arg": ""}]
     await eng._process_commands()
     assert eng.runtime.halt_new_entries is True
-    assert eng._store.marked == [(1, "done", "new entries halted")]
+    assert eng._store.marked == [(1, "done", "strategy paused")]
 
     eng._store.pending = [{"id": 2, "command": "RESUME", "arg": ""}]
     await eng._process_commands()
     assert eng.runtime.halt_new_entries is False
+    assert eng._store.marked[-1] == (2, "done", "strategy resumed")
 
 
 async def test_command_set_dry_run(settings, creds, monkeypatch):
@@ -289,6 +298,38 @@ async def test_command_set_dry_run(settings, creds, monkeypatch):
     eng._store.pending = [{"id": 1, "command": "SET_DRY_RUN", "arg": "false"}]
     await eng._process_commands()
     assert eng._settings.execution.dry_run is False
+    assert eng._store.runtime_settings["execution.dry_run"] == "false"
+
+
+async def test_runtime_dry_run_applied_on_startup(settings, creds, monkeypatch):
+    settings.execution.dry_run = False
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.runtime_settings["execution.dry_run"] = "true"
+    await eng._apply_runtime_settings()
+    assert eng._settings.execution.dry_run is True
+
+
+async def test_command_cancel_and_flatten_keeps_engine_running(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 1, "command": "CANCEL_AND_FLATTEN", "arg": ""}]
+    await eng._process_commands()
+    assert eng._executor.canceled == 1
+    assert eng._executor.flattened == 1
+    assert eng.runtime.halt_new_entries is True
+    assert eng.runtime.kill_switch is False
+    assert eng._stopped.is_set() is False
+    assert "flattened 0 positions" in eng._store.marked[0][2]
+
+
+async def test_command_stop_engine_does_not_flatten(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 1, "command": "STOP_ENGINE", "arg": ""}]
+    await eng._process_commands()
+    assert eng._executor.canceled == 0
+    assert eng._executor.flattened == 0
+    assert eng.runtime.kill_switch is False
+    assert eng._stopped.is_set() is True
+    assert eng._store.marked[0][1] == "done"
 
 
 async def test_command_kill_switch(settings, creds, monkeypatch):

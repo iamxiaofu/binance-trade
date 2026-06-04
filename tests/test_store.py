@@ -15,6 +15,7 @@ from src.store.models import (
     OrderRow,
     PositionSnapshotRow,
     RejectRow,
+    RuntimeSettingRow,
 )
 from src.store.repo import Store
 
@@ -79,6 +80,16 @@ async def test_log_order_and_snapshots(store):
     rt.day_realized_pnl = -5.0
     await store.snapshot_balance(total_equity=200.0, available_margin=180.0, runtime=rt)
     assert await _count(store, BalanceSnapshotRow) == 1
+
+
+async def test_runtime_settings_upsert_and_list(store):
+    assert await store.get_runtime_setting("execution.dry_run") is None
+    await store.set_runtime_setting("execution.dry_run", "true")
+    await store.set_runtime_setting("execution.dry_run", "false")
+
+    assert await _count(store, RuntimeSettingRow) == 1
+    assert await store.get_runtime_setting("execution.dry_run") == "false"
+    assert await store.runtime_settings() == {"execution.dry_run": "false"}
 
 
 async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):

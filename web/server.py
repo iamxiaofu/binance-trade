@@ -121,6 +121,23 @@ async def _get_market() -> ExchangeClient:
     return _market_client
 
 
+def _parse_bool_setting(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _effective_dry_run() -> tuple[bool, str]:
+    try:
+        store = await _get_store()
+        raw = await store.get_runtime_setting("execution.dry_run")
+        if raw is not None:
+            return _parse_bool_setting(raw, _settings.execution.dry_run), "runtime"
+    except Exception as e:
+        logger.warning("runtime dry_run unavailable, fallback to config: {}", e)
+    return _settings.execution.dry_run, "config"
+
+
 async def _live_positions_snapshot() -> dict[str, Any]:
     """Fetch current exchange positions with a short cache for dashboard pushes."""
     now = int(time.time() * 1000)
@@ -288,10 +305,13 @@ async def api_commands(limit: int = 50, _: str = Depends(_check_auth)):
 async def api_config(_: str = Depends(_check_auth)):
     """暴露非敏感运行配置，供前端展示风控阈值等。"""
     s = _settings
+    dry_run, dry_run_source = await _effective_dry_run()
     return {
         "mode": s.mode.value,
         "symbols": s.symbols,
-        "dry_run": s.execution.dry_run,
+        "dry_run": dry_run,
+        "dry_run_source": dry_run_source,
+        "dry_run_config": s.execution.dry_run,
         "cycle_interval": s.cycle.interval,
         # 看板默认行情源（mainnet 真实价 / testnet 沙盒），供前端初始化源切换
         "market_source": _DEFAULT_SOURCE,
@@ -364,7 +384,15 @@ async def api_ticker(symbol: str, source: str | None = None,
 
 
 # ---------- 操作类：写命令队列（不直接碰交易所）----------
-_ALLOWED_COMMANDS = {"KILL_SWITCH", "PAUSE", "RESUME", "SET_DRY_RUN", "REPAIR_SL_TP"}
+_ALLOWED_COMMANDS = {
+    "KILL_SWITCH",
+    "PAUSE",
+    "RESUME",
+    "SET_DRY_RUN",
+    "REPAIR_SL_TP",
+    "CANCEL_AND_FLATTEN",
+    "STOP_ENGINE",
+}
 
 
 @app.post("/api/command/{name}")

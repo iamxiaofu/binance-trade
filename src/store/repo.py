@@ -29,6 +29,7 @@ from src.store.models import (
     OrderRow,
     PositionSnapshotRow,
     RejectRow,
+    RuntimeSettingRow,
 )
 
 
@@ -291,6 +292,31 @@ class Store:
                 drawdown_pct=runtime.drawdown_pct,
             )
         )
+
+    # ---------- 运行时设置 ----------
+    async def set_runtime_setting(self, key: str, value: str) -> None:
+        """持久化一项运行时设置。"""
+        import time as _t
+        async with self._sessionmaker() as session:
+            row = await session.get(RuntimeSettingRow, key)
+            if row is None:
+                session.add(RuntimeSettingRow(key=key, value=value))
+            else:
+                row.value = value
+                row.updated_at = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
+            await session.commit()
+
+    async def get_runtime_setting(self, key: str) -> str | None:
+        """读取单项运行时设置。"""
+        async with self._sessionmaker() as session:
+            row = await session.get(RuntimeSettingRow, key)
+            return row.value if row is not None else None
+
+    async def runtime_settings(self) -> dict[str, str]:
+        """读取全部运行时设置，供 Web 展示有效运行态。"""
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(select(RuntimeSettingRow))).scalars().all()
+            return {row.key: row.value for row in rows}
 
     # ---------- 未完成挂单 ----------
     async def snapshot_open_orders(self, orders: list[dict]) -> None:

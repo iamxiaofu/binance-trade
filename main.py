@@ -7,7 +7,7 @@
     python main.py backtest --symbol BTCUSDT --csv data/btc.csv
 
 mainnet + 非 dry_run 时会二次确认（除非 --yes），防止误触真实下单。
-SIGINT/SIGTERM 优雅退出：触发 kill 流程后再停循环。
+SIGINT/SIGTERM 只优雅停止交易引擎；撤单+平仓需显式执行 kill-switch。
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ async def _cmd_run(args) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(
-                sig, lambda: asyncio.ensure_future(engine.kill("signal"))
+                sig, lambda: asyncio.ensure_future(engine.stop("signal"))
             )
         except NotImplementedError:
             pass  # 某些平台不支持

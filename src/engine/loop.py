@@ -50,6 +50,7 @@ class TradingEngine:
     # ---------- 生命周期 ----------
     async def startup(self) -> None:
         await self._store.connect()
+        await self._apply_runtime_settings()
         await self._client.load_markets()
         await self._market.start()
         self.runtime.roll_day_if_needed()
@@ -157,17 +158,61 @@ class TradingEngine:
         if name == "PAUSE":
             self.runtime.halt_new_entries = True
             await self._notifier.send(Event.CIRCUIT_BREAK, "paused via web (no new entries)")
-            return "new entries halted"
+            return "strategy paused"
         if name == "RESUME":
             self.runtime.halt_new_entries = False
-            return "new entries resumed"
+            return "strategy resumed"
         if name == "SET_DRY_RUN":
             val = arg.strip().lower() in ("1", "true", "yes", "on")
             self._settings.execution.dry_run = val
-            return f"dry_run set to {val}"
+            await self._store.set_runtime_setting("execution.dry_run", str(val).lower())
+            return f"dry_run set to {val} (persisted)"
+        if name == "CANCEL_AND_FLATTEN":
+            return await self._cancel_and_flatten("web")
+        if name == "STOP_ENGINE":
+            await self.stop("web stop-engine")
+            return "trading engine stopped; positions/orders untouched"
         if name == "REPAIR_SL_TP":
             return await self._repair_sl_tp(arg)
         raise ValueError(f"unknown command: {name}")
+
+    async def _apply_runtime_settings(self) -> None:
+        """启动时加载持久化运行态；缺省时用 config.yaml 并写入 DB。"""
+        raw = await self._store.get_runtime_setting("execution.dry_run")
+        if raw is None:
+            await self._store.set_runtime_setting(
+                "execution.dry_run", str(self._settings.execution.dry_run).lower()
+            )
+            return
+        val = raw.strip().lower() in ("1", "true", "yes", "on")
+        self._settings.execution.dry_run = val
+        logger.info("runtime setting applied: execution.dry_run={}", val)
+
+    async def _cancel_and_flatten(self, source: str) -> str:
+        """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
+        self.runtime.halt_new_entries = True
+        await self._executor.cancel_all_orders()
+        results = await self._executor.flatten_all()
+        closed = 0
+        for result in results:
+            await self._store.log_order(result)
+            if not result.get("filled"):
+                continue
+            closed += 1
+            pnl = realized_pnl(
+                side=result.get("pos_side", ""),
+                entry_price=result.get("entry_price", 0.0),
+                exit_price=result.get("price", 0.0),
+                qty=result.get("qty", 0.0),
+            )
+            self.runtime.add_realized_pnl(pnl)
+            self.runtime.positions.pop(result.get("symbol", ""), None)
+            self.runtime.mark_order_event(result.get("symbol", ""))
+        await self._notifier.send(
+            Event.CIRCUIT_BREAK,
+            f"cancel+flatten via {source}: closed={closed}, strategy paused",
+        )
+        return f"open orders canceled; flattened {closed} positions; strategy paused"
 
     async def _repair_sl_tp(self, arg: str) -> str:
         """补挂当前持仓缺失的 SL/TP 条件单。
@@ -704,6 +749,14 @@ class TradingEngine:
         return ""
 
     # <!-- APPEND_CYCLE -->
+
+    # ---------- Stop / Kill switch ----------
+    async def stop(self, reason: str = "manual") -> None:
+        """停止交易引擎主循环，不撤单、不平仓。"""
+        logger.warning("trading engine stop requested: {}", reason)
+        self.runtime.halt_new_entries = True
+        self._stopped.set()
+        await self._notifier.send(Event.CIRCUIT_BREAK, f"engine stopped: {reason}")
 
     # ---------- Kill switch ----------
     async def kill(self, reason: str = "manual") -> None:
