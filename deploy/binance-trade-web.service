@@ -1,7 +1,7 @@
 [Unit]
-Description=binance-trade web dashboard (FastAPI + uvicorn)
-After=network-online.target
-Wants=network-online.target
+Description=binance-trade web dashboard (FastAPI + static frontend)
+After=network-online.target binance-trade-frontend.service
+Wants=network-online.target binance-trade-frontend.service
 
 [Service]
 Type=simple

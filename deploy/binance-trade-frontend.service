@@ -1,0 +1,23 @@
+[Unit]
+Description=binance-trade frontend static build
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=trader
+Group=trader
+WorkingDirectory=/opt/binance-trade/web/frontend
+Environment=NPM_CONFIG_CACHE=/var/cache/binance-trade/npm
+ExecStart=/usr/bin/npm run build
+RemainAfterExit=yes
+CacheDirectory=binance-trade/npm
+CacheDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/binance-trade /var/cache/binance-trade
+
+[Install]
+WantedBy=multi-user.target

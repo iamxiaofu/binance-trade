@@ -68,11 +68,15 @@ sudo firewall-cmd --reload
 ## 5. 部署（systemd + nginx）
 
 ```bash
-# 后端服务
+# 前端静态构建 + 后端服务
+sudo cp deploy/binance-trade-frontend.service /etc/systemd/system/
 sudo cp deploy/binance-trade-web.service /etc/systemd/system/
-sudo mkdir -p /var/log/binance-trade && sudo chown trader:trader /var/log/binance-trade
+sudo mkdir -p /var/cache/binance-trade /var/log/binance-trade
+sudo chown -R trader:trader /var/cache/binance-trade /var/log/binance-trade
 sudo systemctl daemon-reload
+sudo systemctl enable --now binance-trade-frontend
 sudo systemctl enable --now binance-trade-web
+sudo systemctl status binance-trade-frontend
 sudo systemctl status binance-trade-web
 
 # nginx 反代（改 server_name 和证书路径后）
