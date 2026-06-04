@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import * as echarts from 'echarts'
 import { useLiveStore } from '../stores/live'
 import { api } from '../api'
+import { decisionLabel, localTime } from '../labels'
 
 const live = useLiveStore()
 const cfg = ref(null)
@@ -106,8 +107,8 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
             <el-descriptions-item label="最近决策">
               <span v-if="lastDecision">
                 {{ lastDecision.symbol }} ·
-                {{ lastDecision.skipped ? '跳过LLM' : lastDecision.action }} ·
-                {{ lastDecision.created_at }}
+                {{ decisionLabel(lastDecision.action, lastDecision.skipped) }} ·
+                {{ localTime(lastDecision.ts_ms, lastDecision.created_at) }}
               </span>
               <span v-else>—</span>
             </el-descriptions-item>

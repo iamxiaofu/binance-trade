@@ -81,9 +81,38 @@ async def test_log_order_and_snapshots(store):
     assert await _count(store, BalanceSnapshotRow) == 1
 
 
+async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "buy", "order_type": "STOP_MARKET",
+        "qty": 0.01, "price": 105.0, "notional": 1.05, "dry_run": False,
+        "status": "placed", "id": "sl", "raw": {},
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "buy",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 0.01, "price": 95.0,
+        "notional": 0.95, "dry_run": False, "status": "placed", "id": "tp", "raw": {},
+    })
+    await store.mark_condition_exit(symbol="BTCUSDT", triggered_kind="TP", qty=0.01, price=94.5)
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        rows = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
+    by_kind = {r.client_kind: r for r in rows}
+    assert by_kind["TP"].status == "filled"
+    assert by_kind["TP"].price == pytest.approx(94.5)
+    assert by_kind["SL"].status == "canceled"
+
+
 async def test_snapshot_skips_zero_contracts(store):
     await store.snapshot_positions([{"symbol": "BTC/USDT:USDT", "contracts": 0}])
     assert await _count(store, PositionSnapshotRow) == 0
+
+
+async def test_snapshot_records_zero_for_tracked_symbols(store):
+    await store.snapshot_positions(
+        [{"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0}],
+        symbols=["BTCUSDT"],
+    )
+    assert await _count(store, PositionSnapshotRow) == 1
 
 
 async def test_reconcile_fills_runtime(store):

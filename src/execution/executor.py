@@ -39,17 +39,18 @@ def _result(
     status: str,
     order_id: str = "",
     raw: dict | None = None,
+    order_type: str = "market",
 ) -> dict:
     return {
         "symbol": symbol,
         "kind": kind,            # OPEN / CLOSE / SL / TP
         "side": side,            # buy / sell
-        "order_type": "market",
+        "order_type": order_type,
         "qty": qty,              # 实际成交数量（部分成交时为已成交量）
         "price": price,
         "notional": notional,
         "dry_run": dry_run,
-        "status": status,        # filled / partial / dry_run / rejected / error
+        "status": status,        # filled / partial / placed / dry_run / rejected / error
         "id": order_id,
         "raw": raw or {},
         "opened": kind == "OPEN" and status in _FILLED_STATES,
@@ -193,8 +194,8 @@ class Executor:
             if self._cfg.dry_run:
                 logger.info("[dry-run][{}] {} trigger={}", symbol, kind, trigger)
                 results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
-                                       price=trigger, notional=qty * trigger, dry_run=True,
-                                       status="dry_run"))
+                                       order_type=otype, price=trigger,
+                                       notional=qty * trigger, dry_run=True, status="dry_run"))
                 continue
             try:
                 order = await self._with_retry(
@@ -205,14 +206,14 @@ class Executor:
                     f"{kind} {symbol}",
                 )
                 results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
-                                       price=trigger, notional=qty * trigger, dry_run=False,
-                                       status="filled", order_id=str(order.get("id") or ""),
-                                       raw=order))
+                                       order_type=otype, price=trigger,
+                                       notional=qty * trigger, dry_run=False, status="placed",
+                                       order_id=str(order.get("id") or ""), raw=order))
             except Exception as e:
                 logger.error("[{}] place {} failed: {}", symbol, kind, e)
                 results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
-                                       price=trigger, notional=0.0, dry_run=False,
-                                       status="error", raw={"error": str(e)}))
+                                       order_type=otype, price=trigger, notional=0.0,
+                                       dry_run=False, status="error", raw={"error": str(e)}))
         return results
 
     # ---------- 平仓 ----------

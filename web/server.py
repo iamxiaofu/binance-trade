@@ -16,6 +16,8 @@ import asyncio
 import hashlib
 import os
 import secrets
+import time
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
@@ -25,6 +27,8 @@ from loguru import logger
 
 from src.config.loader import load_config
 from src.exchange.client import ExchangeClient
+from src.exchange.orders import normalize_condition_order
+from src.exchange.positions import normalize_position
 from src.features.indicators import compute_snapshot
 from src.store.repo import Store
 from web import status as st
@@ -45,10 +49,21 @@ _security = HTTPBasic()
 # 只读行情客户端（懒加载，单例）
 _market_client: ExchangeClient | None = None
 _market_lock = asyncio.Lock()
+# 交易所实时持仓缓存：WS 每秒推送，但私有持仓接口不需要每帧都打交易所。
+_positions_lock = asyncio.Lock()
+_positions_cache: dict[str, Any] = {
+    "ts_ms": 0,
+    "positions": [],
+    "condition_orders": [],
+    "error": "",
+    "condition_error": "",
+}
+_POSITIONS_TTL_MS = int(os.environ.get("WEB_POSITIONS_TTL_MS", "2000"))
 # 行情数据源注册表：mainnet/testnet 双源（REST + WS），供看板行情用
 _feeds = MarketFeedRegistry()
-# 默认行情源：引擎在 testnet 交易，但看板默认看主网真实价（更有参考意义）
-_DEFAULT_SOURCE = os.environ.get("WEB_MARKET_SOURCE", "mainnet")
+# 默认行情源跟随交易模式；需要单独看主网时可用 WEB_MARKET_SOURCE=mainnet 覆盖。
+_SOURCE_ENV = os.environ.get("WEB_MARKET_SOURCE", _settings.mode.value).lower()
+_DEFAULT_SOURCE = _SOURCE_ENV if _SOURCE_ENV in ("mainnet", "testnet") else _settings.mode.value
 # 控制命令写入用的 Store（懒加载）
 _store: Store | None = None
 
@@ -106,15 +121,129 @@ async def _get_market() -> ExchangeClient:
     return _market_client
 
 
+async def _live_positions_snapshot() -> dict[str, Any]:
+    """Fetch current exchange positions with a short cache for dashboard pushes."""
+    now = int(time.time() * 1000)
+    async with _positions_lock:
+        cached_ts = int(_positions_cache.get("ts_ms") or 0)
+        if cached_ts and now - cached_ts <= _POSITIONS_TTL_MS:
+            return dict(_positions_cache)
+
+        try:
+            client = await _get_market()
+            raw_positions = await client.fetch_positions(_settings.symbols)
+            positions = []
+            for raw in raw_positions:
+                pos = normalize_position(raw)
+                if pos["contracts"] > 0:
+                    positions.append(pos)
+            condition_orders, condition_error = await _live_condition_orders(
+                client, [p["symbol"] for p in positions]
+            )
+            _attach_protection_orders(positions, condition_orders)
+            _positions_cache.update({
+                "ts_ms": int(time.time() * 1000),
+                "positions": positions,
+                "condition_orders": condition_orders,
+                "error": "",
+                "condition_error": condition_error,
+            })
+        except Exception as e:
+            _positions_cache["error"] = str(e)
+            raise
+        return dict(_positions_cache)
+
+
+async def _live_condition_orders(
+    client: ExchangeClient,
+    symbols: list[str],
+) -> tuple[list[dict[str, Any]], str]:
+    merged: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for symbol in symbols:
+        try:
+            recent = await client.fetch_condition_orders(symbol, limit=20)
+            for raw in recent:
+                order = normalize_condition_order(raw)
+                if order["kind"] in ("SL", "TP"):
+                    merged[order["id"] or f"{symbol}:{order['kind']}:{order['ts_ms']}"] = order
+        except Exception as e:
+            errors.append(f"{symbol} history: {e}")
+        try:
+            open_orders = await client.fetch_open_condition_orders(symbol)
+            for raw in open_orders:
+                order = normalize_condition_order(raw)
+                if order["kind"] in ("SL", "TP"):
+                    order["status"] = "placed"
+                    merged[order["id"] or f"{symbol}:{order['kind']}:{order['ts_ms']}"] = order
+        except Exception as e:
+            errors.append(f"{symbol} open: {e}")
+    orders = sorted(merged.values(), key=lambda x: (x["symbol"], x["kind"], -(x["ts_ms"] or 0)))
+    return orders, "; ".join(errors)
+
+
+def _attach_protection_orders(positions: list[dict], orders: list[dict[str, Any]]) -> None:
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for order in orders:
+        by_symbol.setdefault(order["symbol"], []).append(order)
+
+    for pos in positions:
+        related = by_symbol.get(pos["symbol"], [])
+        protection: dict[str, Any] = {
+            "sl": _select_protection_order(related, "SL"),
+            "tp": _select_protection_order(related, "TP"),
+        }
+        protection["sl_active"] = (protection["sl"] or {}).get("status") == "placed"
+        protection["tp_active"] = (protection["tp"] or {}).get("status") == "placed"
+        protection["missing_sl"] = not protection["sl_active"]
+        protection["missing_tp"] = not protection["tp_active"]
+        pos["protection_orders"] = related
+        pos["protection"] = protection
+
+
+def _select_protection_order(orders: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
+    matching = [o for o in orders if o["kind"] == kind]
+    active = [o for o in matching if o["status"] == "placed"]
+    pool = active or matching
+    if not pool:
+        return None
+    return sorted(pool, key=lambda x: x.get("ts_ms") or 0, reverse=True)[0]
+
+
+async def _status_summary() -> dict[str, Any]:
+    summary = st.status_summary(_DB)
+    try:
+        live = await _live_positions_snapshot()
+        summary["positions"] = live["positions"]
+        summary["positions_source"] = "exchange"
+        summary["positions_error"] = live.get("error", "")
+        summary["condition_orders"] = live.get("condition_orders", [])
+        summary["condition_orders_error"] = live.get("condition_error", "")
+        summary["positions_synced_at_ms"] = live.get("ts_ms")
+    except Exception as e:
+        logger.warning("live positions unavailable, fallback to db snapshot: {}", e)
+        summary["positions_source"] = "db_snapshot"
+        summary["positions_error"] = str(e)
+        summary["condition_orders"] = []
+        summary["condition_orders_error"] = ""
+        summary["positions_synced_at_ms"] = None
+    return summary
+
+
 # ---------- REST：只读数据 ----------
 @app.get("/api/summary")
 async def api_summary(_: str = Depends(_check_auth)):
-    return st.status_summary(_DB)
+    return await _status_summary()
 
 
 @app.get("/api/positions")
 async def api_positions(_: str = Depends(_check_auth)):
-    return st.latest_positions(_DB)
+    try:
+        live = await _live_positions_snapshot()
+        return live["positions"]
+    except Exception as e:
+        logger.warning("live positions endpoint fallback to db snapshot: {}", e)
+        return st.latest_positions(_DB)
 
 
 @app.get("/api/decisions")
@@ -344,7 +473,7 @@ async def ws_stream(websocket: WebSocket):
     push_interval = float(os.environ.get("WEB_PUSH_INTERVAL", "1"))
     try:
         while True:
-            await websocket.send_json(st.status_summary(_DB))
+            await websocket.send_json(await _status_summary())
             await asyncio.sleep(push_interval)
     except WebSocketDisconnect:
         return

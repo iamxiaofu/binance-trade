@@ -39,6 +39,14 @@ async def test_latest_positions_and_balance(db):
     assert bal is not None and bal["total_equity"] == 200.0
 
 
+async def test_latest_positions_ignores_latest_zero_snapshot(db):
+    s = Store(db)
+    await s.connect()
+    await s.snapshot_positions([], symbols=["BTCUSDT"])
+    await s.close()
+    assert status.latest_positions(db) == []
+
+
 async def test_status_summary_shape(db):
     s = status.status_summary(db)
     assert set(s) == {"balance", "positions", "recent_decisions", "recent_orders",

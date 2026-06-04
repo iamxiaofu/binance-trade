@@ -13,6 +13,11 @@ export const useLiveStore = defineStore('live', () => {
   const summary = ref({
     balance: null,
     positions: [],
+    positions_source: 'db_snapshot',
+    positions_error: '',
+    positions_synced_at_ms: null,
+    condition_orders: [],
+    condition_orders_error: '',
     recent_decisions: [],
     recent_orders: [],
     recent_rejects: [],
@@ -37,8 +42,8 @@ export const useLiveStore = defineStore('live', () => {
 
   function _resetStale() {
     if (staleTimer) clearTimeout(staleTimer)
-    // 超过 4 秒没有任何新数据 → 标记断开（兜底轮询是 3s，4s 足够宽容）
-    staleTimer = setTimeout(() => { connected.value = false }, 4000)
+    // 超过 10 秒没有任何新数据 → 标记断开（轮询 3s，给交易所接口留出余量）
+    staleTimer = setTimeout(() => { connected.value = false }, 10000)
   }
 
   // ---- WebSocket（可用则用，连不上不影响轮询）----
@@ -52,7 +57,7 @@ export const useLiveStore = defineStore('live', () => {
     ws.onmessage = (ev) => {
       try { _apply(JSON.parse(ev.data), 'ws') } catch (_) { /* ignore */ }
     }
-    ws.onopen = () => { _stopPoll() }
+    ws.onopen = () => { _startPoll() }
     ws.onclose = () => {
       ws = null
       _startPoll()
@@ -62,7 +67,7 @@ export const useLiveStore = defineStore('live', () => {
     ws.onerror = () => { try { ws.close() } catch (_) { /* ignore */ } }
   }
 
-  // ---- HTTPS 轮询（仅 WS 断开时兜底）----
+  // ---- HTTPS 轮询（WS 正常时也保留低频兜底）----
   async function _pollOnce() {
     if (document.hidden) return
     try {

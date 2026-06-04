@@ -39,13 +39,14 @@ def recent_rejects(db_path: str, limit: int = 50) -> list[dict]:
 
 
 def latest_positions(db_path: str) -> list[dict]:
-    """每个 symbol 的最新一条持仓快照。"""
+    """每个 symbol 的最新一条非零持仓快照。"""
     return _rows(
         db_path,
         """
         SELECT p.* FROM position_snapshots p
         JOIN (SELECT symbol, MAX(id) AS mid FROM position_snapshots GROUP BY symbol) m
           ON p.id = m.mid
+        WHERE ABS(COALESCE(p.contracts, 0)) > 0
         ORDER BY p.symbol
         """,
     )

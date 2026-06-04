@@ -110,6 +110,16 @@ class ExchangeClient:
         sym = self._to_ccxt_symbol(symbol) if symbol else None
         return await self._exchange.fetch_open_orders(sym)
 
+    async def fetch_open_condition_orders(self, symbol: str) -> list[dict]:
+        return await self._exchange.fetch_open_orders(
+            self._to_ccxt_symbol(symbol), params={"conditional": True}
+        )
+
+    async def fetch_condition_orders(self, symbol: str, limit: int = 20) -> list[dict]:
+        return await self._exchange.fetch_orders(
+            self._to_ccxt_symbol(symbol), limit=limit, params={"conditional": True}
+        )
+
     # ---------- 行情 ----------
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
         return await self._exchange.fetch_ohlcv(

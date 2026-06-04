@@ -54,7 +54,9 @@ class TradingEngine:
             try:
                 positions = await self._client.fetch_positions()
                 open_orders = await self._fetch_open_orders_safe()
-                await self._store.reconcile(positions, self.runtime, open_orders)
+                await self._store.reconcile(
+                    positions, self.runtime, open_orders, symbols=self._settings.symbols
+                )
             except Exception as e:
                 logger.warning("startup reconcile failed: {}", e)
         # 启动即拉一次权益，确保第一个周期的风控/上限基于真实权益而非退回保证金
@@ -389,9 +391,11 @@ class TradingEngine:
         new_positions = {
             (p.get("symbol") or "").replace("/USDT:USDT", "USDT"): p for p in positions
         }
-        self._detect_external_closes(prev_positions, new_positions)
+        condition_exits = self._detect_external_closes(prev_positions, new_positions)
         self.runtime.positions = new_positions
-        await self._store.snapshot_positions(positions)
+        await self._store.snapshot_positions(positions, symbols=self._settings.symbols)
+        for exit_event in condition_exits:
+            await self._store.mark_condition_exit(**exit_event)
         try:
             bal = await self._client.fetch_balance()
             total = (bal.get("total") or {}).get(self._settings.account.quote_asset) or 0.0
@@ -405,12 +409,13 @@ class TradingEngine:
         except Exception as e:
             logger.warning("balance snapshot failed: {}", e)
 
-    def _detect_external_closes(self, prev: dict[str, dict], curr: dict[str, dict]) -> None:
+    def _detect_external_closes(self, prev: dict[str, dict], curr: dict[str, dict]) -> list[dict]:
         """对比前后持仓，对消失的持仓估算已实现盈亏并累加。
 
         估算用最后已知标记价作为出场价（SL/TP 实际触发价与之接近，未计手续费），
         是近似值；精确对账以交易所 income 流水为准（见 RUNBOOK 复盘章节）。
         """
+        condition_exits: list[dict] = []
         for symbol, old in prev.items():
             still_open = float((curr.get(symbol) or {}).get("contracts") or 0) != 0
             if still_open:
@@ -424,8 +429,29 @@ class TradingEngine:
                                exit_price=exit_px, qty=qty)
             self.runtime.add_realized_pnl(pnl)
             self.runtime.mark_order_event(symbol)
+            kind = self._infer_condition_exit_kind(old, exit_px)
+            if kind:
+                condition_exits.append({
+                    "symbol": symbol,
+                    "triggered_kind": kind,
+                    "qty": qty,
+                    "price": exit_px,
+                })
             logger.info("[{}] external close detected, est. pnl={:.2f} day_pnl={:.2f}",
                         symbol, pnl, self.runtime.day_realized_pnl)
+        return condition_exits
+
+    @staticmethod
+    def _infer_condition_exit_kind(position: dict, exit_price: float) -> str:
+        side = (position.get("side") or "").lower()
+        entry = float(position.get("entryPrice") or 0)
+        if entry <= 0 or exit_price <= 0:
+            return ""
+        if side == "long":
+            return "TP" if exit_price >= entry else "SL"
+        if side == "short":
+            return "TP" if exit_price <= entry else "SL"
+        return ""
 
     # <!-- APPEND_CYCLE -->
 

@@ -25,6 +25,7 @@ class FakeStore:
         self.decisions = []
         self.rejects = []
         self.orders = []
+        self.condition_exits = []
         self.pending = []          # 待执行命令
         self.marked = []           # (id, status, result)
 
@@ -42,6 +43,9 @@ class FakeStore:
 
     async def snapshot_balance(self, **kw):
         pass
+
+    async def mark_condition_exit(self, **kw):
+        self.condition_exits.append(kw)
 
     async def fetch_pending_commands(self):
         out, self.pending = self.pending, []
@@ -226,9 +230,15 @@ async def test_external_close_detected_in_snapshot(settings, creds, monkeypatch)
     prev = {"BTCUSDT": {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
                         "entryPrice": 100.0, "markPrice": 95.0}}
     # 本周期交易所已无持仓
-    eng._detect_external_closes(prev, {})
+    exits = eng._detect_external_closes(prev, {})
     assert eng.runtime.day_realized_pnl == pytest.approx(-5.0)
     assert eng.runtime.pop_order_event("BTCUSDT") is True
+    assert exits == [{
+        "symbol": "BTCUSDT",
+        "triggered_kind": "SL",
+        "qty": 1.0,
+        "price": 95.0,
+    }]
 
 
 async def test_external_close_ignores_still_open(settings, creds, monkeypatch):

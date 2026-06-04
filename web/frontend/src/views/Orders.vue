@@ -2,6 +2,17 @@
 import { ref, onMounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
+import {
+  localTime,
+  decisionLabel,
+  orderActionLabel,
+  orderKindTag,
+  orderStatusLabel,
+  orderStatusTag,
+  orderTypeLabel,
+  rejectCodeLabel,
+  sideLabel,
+} from '../labels'
 
 const tab = ref('orders')
 const orders = ref([])
@@ -21,13 +32,6 @@ async function load() {
   }
 }
 
-function kindTag(k) {
-  return { OPEN: 'success', CLOSE: 'primary', SL: 'danger', TP: 'warning' }[k] || 'info'
-}
-function statusTag(s) {
-  return { filled: 'success', partial: 'warning', dry_run: 'info', rejected: 'danger', error: 'danger' }[s] || 'info'
-}
-
 onMounted(load)
 </script>
 
@@ -45,12 +49,23 @@ onMounted(load)
       </template>
 
       <el-table v-if="tab === 'orders'" :data="orders" stripe height="calc(100vh - 240px)">
-        <el-table-column prop="created_at" label="时间" width="170" />
-        <el-table-column prop="symbol" label="标的" width="100" />
-        <el-table-column label="类型" width="80">
-          <template #default="{ row }"><el-tag :type="kindTag(row.client_kind)" size="small">{{ row.client_kind }}</el-tag></template>
+        <el-table-column label="本地时间" width="180">
+          <template #default="{ row }">{{ localTime(row.ts_ms, row.created_at) }}</template>
         </el-table-column>
-        <el-table-column prop="side" label="方向" width="70" />
+        <el-table-column prop="symbol" label="标的" width="100" />
+        <el-table-column label="动作" width="130">
+          <template #default="{ row }">
+            <el-tag :type="orderKindTag(row.client_kind)" size="small">
+              {{ orderActionLabel(row) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="订单类型" width="150">
+          <template #default="{ row }">{{ orderTypeLabel(row.order_type) }}</template>
+        </el-table-column>
+        <el-table-column label="买卖" width="80">
+          <template #default="{ row }">{{ sideLabel(row.side) }}</template>
+        </el-table-column>
         <el-table-column label="数量" width="120">
           <template #default="{ row }"><span class="mono">{{ row.qty }}</span></template>
         </el-table-column>
@@ -60,24 +75,34 @@ onMounted(load)
         <el-table-column label="名义价值" width="110">
           <template #default="{ row }"><span class="mono">{{ Number(row.notional).toFixed(2) }}</span></template>
         </el-table-column>
-        <el-table-column label="状态" width="100">
-          <template #default="{ row }"><el-tag :type="statusTag(row.status)" size="small">{{ row.status }}</el-tag></template>
-        </el-table-column>
-        <el-table-column label="DRY" width="70">
+        <el-table-column label="状态" width="150">
           <template #default="{ row }">
-            <el-tag v-if="row.dry_run" type="info" size="small">dry</el-tag>
+            <el-tag :type="orderStatusTag(row)" size="small">
+              {{ orderStatusLabel(row) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="模式" width="80">
+          <template #default="{ row }">
+            <el-tag v-if="row.dry_run" type="info" size="small">模拟</el-tag>
             <el-tag v-else type="danger" size="small">真实</el-tag>
           </template>
         </el-table-column>
       </el-table>
 
       <el-table v-else :data="rejects" stripe height="calc(100vh - 240px)">
-        <el-table-column prop="created_at" label="时间" width="170" />
+        <el-table-column label="本地时间" width="180">
+          <template #default="{ row }">{{ localTime(row.ts_ms, row.created_at) }}</template>
+        </el-table-column>
         <el-table-column prop="symbol" label="标的" width="100" />
         <el-table-column label="拒单码" width="180">
-          <template #default="{ row }"><el-tag type="danger" size="small">{{ row.code }}</el-tag></template>
+          <template #default="{ row }">
+            <el-tag type="danger" size="small">{{ rejectCodeLabel(row.code) }}</el-tag>
+          </template>
         </el-table-column>
-        <el-table-column prop="action" label="动作" width="100" />
+        <el-table-column label="动作" width="110">
+          <template #default="{ row }">{{ decisionLabel(row.action) }}</template>
+        </el-table-column>
         <el-table-column label="杠杆" width="70">
           <template #default="{ row }">{{ row.leverage }}x</template>
         </el-table-column>

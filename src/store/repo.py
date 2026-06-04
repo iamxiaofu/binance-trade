@@ -16,6 +16,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from src.exchange.positions import normalize_position, normalize_symbol
 from src.llm.schema import MarketContext, TradeDecision
 from src.risk.manager import Verdict
 from src.state.runtime import RuntimeState
@@ -127,25 +128,79 @@ class Store:
         await self._add(row)
 
     # ---------- 快照 ----------
-    async def snapshot_positions(self, positions: list[dict]) -> None:
+    async def snapshot_positions(
+        self,
+        positions: list[dict],
+        symbols: list[str] | None = None,
+    ) -> None:
         async with self._sessionmaker() as session:
-            for p in positions:
-                contracts = float(p.get("contracts") or 0)
-                if contracts == 0:
+            by_symbol: dict[str, dict] = {}
+            for raw in positions:
+                pos = normalize_position(raw)
+                if pos["symbol"]:
+                    by_symbol[pos["symbol"]] = pos
+
+            tracked = list(by_symbol)
+            for sym in symbols or []:
+                ns = normalize_symbol(sym)
+                if ns and ns not in by_symbol:
+                    tracked.append(ns)
+
+            for sym in tracked:
+                pos = by_symbol.get(sym) or normalize_position({}, symbol=sym)
+                if pos["contracts"] == 0 and symbols is None:
                     continue
-                mark = float(p.get("markPrice") or p.get("entryPrice") or 0)
                 session.add(
                     PositionSnapshotRow(
-                        symbol=(p.get("symbol") or "").replace("/USDT:USDT", "USDT"),
-                        side=(p.get("side") or ""),
-                        contracts=contracts,
-                        entry_price=float(p.get("entryPrice") or 0),
-                        mark_price=mark,
-                        leverage=int(float(p.get("leverage") or 0)),
-                        unrealized_pnl=float(p.get("unrealizedPnl") or 0),
-                        notional=abs(contracts) * mark,
+                        symbol=pos["symbol"],
+                        side=pos["side"],
+                        contracts=pos["contracts"],
+                        entry_price=pos["entry_price"],
+                        mark_price=pos["mark_price"],
+                        leverage=pos["leverage"],
+                        unrealized_pnl=pos["unrealized_pnl"],
+                        notional=pos["notional"],
                     )
                 )
+            await session.commit()
+
+    async def mark_condition_exit(
+        self,
+        *,
+        symbol: str,
+        triggered_kind: str,
+        qty: float,
+        price: float,
+    ) -> None:
+        """标记最近一组 SL/TP 条件单：触发的一侧成交，另一侧取消。
+
+        交易所侧 SL/TP 触发后，本系统通过持仓消失检测到平仓；这里把前面挂出的
+        保护条件单状态补齐，供前端区分「成功挂出」与「触发成交」。
+        """
+        if triggered_kind not in ("SL", "TP"):
+            return
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(OrderRow)
+                    .where(OrderRow.symbol == symbol)
+                    .where(OrderRow.client_kind.in_(("SL", "TP")))
+                    .where(OrderRow.dry_run.is_(False))
+                    .where(OrderRow.status.in_(("placed", "open", "filled")))
+                    .order_by(OrderRow.id.desc())
+                    .limit(2)
+                )
+            ).scalars().all()
+            for row in rows:
+                if row.client_kind == triggered_kind:
+                    row.status = "filled"
+                    if qty > 0:
+                        row.qty = qty
+                    if price > 0:
+                        row.price = price
+                    row.notional = abs((row.qty or 0.0) * (row.price or 0.0))
+                elif row.status in ("placed", "open", "filled"):
+                    row.status = "canceled"
             await session.commit()
 
     async def snapshot_balance(
@@ -195,20 +250,21 @@ class Store:
         positions: list[dict],
         runtime: RuntimeState,
         open_orders: list[dict] | None = None,
+        symbols: list[str] | None = None,
     ) -> None:
         """与交易所对账：恢复当前持仓与未完成挂单，回填 RuntimeState。"""
         runtime.positions = {}
         for p in positions:
-            if float(p.get("contracts") or 0) == 0:
+            pos = normalize_position(p)
+            if pos["contracts"] == 0:
                 continue
-            sym = (p.get("symbol") or "").replace("/USDT:USDT", "USDT")
-            runtime.positions[sym] = p
-        await self.snapshot_positions(positions)
+            runtime.positions[pos["symbol"]] = p
+        await self.snapshot_positions(positions, symbols=symbols)
 
         runtime.open_orders = {}
         orders = open_orders or []
         for o in orders:
-            sym = (o.get("symbol") or "").replace("/USDT:USDT", "USDT")
+            sym = normalize_symbol(o.get("symbol"))
             runtime.open_orders.setdefault(sym, []).append(o)
         if orders:
             await self.snapshot_open_orders(orders)

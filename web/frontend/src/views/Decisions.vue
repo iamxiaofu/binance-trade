@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
+import { decisionLabel, decisionTagType, localTime } from '../labels'
 
 const rows = ref([])
 const loading = ref(false)
@@ -47,13 +48,14 @@ onMounted(load)
         </div>
       </template>
       <el-table :data="rows" stripe height="calc(100vh - 220px)">
-        <el-table-column prop="created_at" label="时间" width="170" />
+        <el-table-column label="本地时间" width="180">
+          <template #default="{ row }">{{ localTime(row.ts_ms, row.created_at) }}</template>
+        </el-table-column>
         <el-table-column prop="symbol" label="标的" width="100" />
         <el-table-column label="类型" width="100">
           <template #default="{ row }">
-            <el-tag v-if="row.skipped" type="info" size="small">跳过</el-tag>
-            <el-tag v-else :type="row.action === 'HOLD' ? 'warning' : 'primary'" size="small">
-              {{ row.action }}
+            <el-tag :type="decisionTagType(row.action, row.skipped)" size="small">
+              {{ decisionLabel(row.action, row.skipped) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -84,9 +86,11 @@ onMounted(load)
       <template v-if="detail">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="ID">{{ detail.id }}</el-descriptions-item>
-          <el-descriptions-item label="时间">{{ detail.created_at }}</el-descriptions-item>
+          <el-descriptions-item label="本地时间">{{ localTime(detail.ts_ms, detail.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="标的">{{ detail.symbol }}</el-descriptions-item>
-          <el-descriptions-item label="动作">{{ detail.skipped ? '跳过' : detail.action }}</el-descriptions-item>
+          <el-descriptions-item label="动作">
+            {{ decisionLabel(detail.action, detail.skipped) }}
+          </el-descriptions-item>
           <el-descriptions-item label="置信度">{{ detail.confidence }}</el-descriptions-item>
           <el-descriptions-item label="杠杆">{{ detail.leverage }}x</el-descriptions-item>
           <el-descriptions-item label="参考价">{{ detail.ref_price }}</el-descriptions-item>

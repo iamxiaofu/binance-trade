@@ -93,6 +93,22 @@ async def test_sl_tp_trigger_prices_for_long(settings):
     assert kinds["SL"]["price"] == pytest.approx(98.0, abs=0.1)
     assert kinds["TP"]["price"] == pytest.approx(104.0, abs=0.1)
     assert kinds["SL"]["side"] == "sell"
+    assert kinds["SL"]["order_type"] == "STOP_MARKET"
+    assert kinds["TP"]["order_type"] == "TAKE_PROFIT_MARKET"
+
+
+async def test_sl_tp_live_records_placed_status(settings):
+    settings.execution.dry_run = False
+    settings.execution.attach_sl_tp = True
+    client = FakeClient()
+    ex = Executor(client, settings)
+    out = await ex.place_sl_tp(decision=_decision(), entry_price=100.0, qty=0.05)
+    kinds = {o["kind"]: o for o in out}
+    assert kinds["SL"]["status"] == "placed"
+    assert kinds["TP"]["status"] == "placed"
+    assert kinds["SL"]["filled"] is False
+    assert client.created[0][3] == "stop_market"
+    assert client.created[1][3] == "take_profit_market"
 
 
 async def test_sl_tp_disabled(settings):
