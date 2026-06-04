@@ -1,0 +1,16 @@
+# biance-trade 运行依赖（与当前 .venv 锁定版本一致，确保可复现部署）
+# 注意：代码已弃用 pandas-ta（改用纯 pandas/numpy 实现指标），故不在此列出。
+ccxt==4.5.56
+anthropic==0.105.2
+pydantic==2.13.4
+PyYAML==6.0.3
+pandas==3.0.3
+numpy==2.0.2
+SQLAlchemy==2.0.50
+aiosqlite==0.22.1
+loguru==0.7.3
+python-dotenv==1.0.1
+httpx==0.28.1
+
+# 开发/测试（可选）：
+# pytest==8.3.* pytest-asyncio==0.24.* ruff mypy

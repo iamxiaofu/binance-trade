@@ -1,0 +1,279 @@
+"""engine/loop.py 测试：熔断优先级、跳过落库、开仓流水线（全 dry-run + 假 I/O）。
+
+不触网：构造 TradingEngine 后替换其 collaborators 为假对象，直接驱动内部方法。
+"""
+from __future__ import annotations
+
+import pytest
+
+from src.config.schema import Credentials
+from src.engine.loop import TradingEngine
+from src.exchange.market_data import SymbolSnapshot
+from src.llm.schema import Action, MarketContext, TradeDecision
+from src.notify.telegram import Event
+
+
+@pytest.fixture
+def creds():
+    return Credentials(
+        binance_api_key="k", binance_api_secret="s", anthropic_api_key="a",
+    )
+
+
+class FakeStore:
+    def __init__(self):
+        self.decisions = []
+        self.rejects = []
+        self.orders = []
+        self.pending = []          # 待执行命令
+        self.marked = []           # (id, status, result)
+
+    async def log_decision(self, **kw):
+        self.decisions.append(kw)
+
+    async def log_reject(self, **kw):
+        self.rejects.append(kw)
+
+    async def log_order(self, order):
+        self.orders.append(order)
+
+    async def snapshot_positions(self, positions):
+        pass
+
+    async def snapshot_balance(self, **kw):
+        pass
+
+    async def fetch_pending_commands(self):
+        out, self.pending = self.pending, []
+        return out
+
+    async def mark_command(self, cmd_id, status, result=""):
+        self.marked.append((cmd_id, status, result))
+
+
+class FakeNotifier:
+    def __init__(self):
+        self.events = []
+
+    async def send(self, event, message):
+        self.events.append((event, message))
+        return True
+
+
+class FakeExecutor:
+    def __init__(self):
+        self.flattened = 0
+        self.opened = []
+
+    async def flatten_all(self):
+        self.flattened += 1
+        return []
+
+    async def cancel_all_orders(self):
+        pass
+
+    async def open_position(self, *, decision, qty, price):
+        self.opened.append((decision.symbol, qty))
+        return {"symbol": decision.symbol, "kind": "OPEN", "status": "dry_run",
+                "filled": True, "opened": True, "qty": qty, "price": price,
+                "notional": qty * price, "dry_run": True, "side": "buy", "id": ""}
+
+    async def place_sl_tp(self, *, decision, entry_price, qty):
+        return []
+
+    async def close_position(self, position):
+        return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "dry_run",
+                "filled": True, "closed": True, "dry_run": True,
+                "qty": abs(float(position.get("contracts") or 0)),
+                "price": float(position.get("markPrice") or 0),
+                "entry_price": float(position.get("entryPrice") or 0),
+                "pos_side": (position.get("side") or "").lower()}
+
+
+def _engine(settings, creds, monkeypatch):
+    eng = TradingEngine(settings, creds)
+    eng._store = FakeStore()
+    eng._notifier = FakeNotifier()
+    eng._executor = FakeExecutor()
+    return eng
+
+
+def _snap(price=100.0):
+    s = SymbolSnapshot(symbol="BTCUSDT")
+    s.last_price = price
+    s.mark_price = price
+    s.updated_ms = 1
+    s.klines = [[i * 60000, price, price + 1, price - 1, price, 10.0] for i in range(60)]
+    return s
+
+
+async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.update_equity(200.0)  # 权益基准
+    # 日亏限额 = 200 * 10% = 20；亏 21 触发
+    limit = 200.0 * settings.risk.daily_max_loss_pct / 100.0
+    eng.runtime.day_realized_pnl = -limit - 1
+    tripped = await eng._check_circuit_breaker()
+    assert tripped is True
+    assert eng.runtime.halt_new_entries is True
+    assert eng._executor.flattened == 1
+    assert any(e == Event.CIRCUIT_BREAK for e, _ in eng._notifier.events)
+
+
+async def test_circuit_breaker_trips_on_drawdown(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.drawdown_pct = settings.risk.max_drawdown_pct + 1
+    assert await eng._check_circuit_breaker() is True
+    assert eng._executor.flattened == 1
+
+
+async def test_no_breaker_under_limits(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.day_realized_pnl = -1.0
+    eng.runtime.drawdown_pct = 1.0
+    assert await eng._check_circuit_breaker() is False
+    assert eng._executor.flattened == 0
+
+
+async def test_skip_logs_decision(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    # 给一个已有决策价，且价格不动 → 跳过
+    eng.runtime.record_decision("BTCUSDT", 100.0)
+    monkeypatch.setattr(eng._market, "snapshot", lambda s: _snap(100.0))
+    await eng._process_symbol("BTCUSDT")
+    assert len(eng._store.decisions) == 1
+    assert eng._store.decisions[0]["skipped"] is True
+    assert eng._executor.opened == []
+
+
+async def test_open_pipeline_passes_risk_and_executes(settings, creds, monkeypatch):
+    settings.risk.max_leverage = 5
+    settings.risk.min_confidence = 0.6
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(eng._market, "snapshot", lambda s: _snap(100.0))
+
+    async def fake_margin():
+        return 200.0
+    monkeypatch.setattr(eng, "_fetch_margin_safe", fake_margin)
+
+    async def fake_decide(ctx):
+        return TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
+                             size_pct=0.05, leverage=2, stop_loss_pct=0.02,
+                             take_profit_pct=0.04, reason="ok")
+    monkeypatch.setattr(eng._llm, "decide", fake_decide)
+
+    await eng._process_symbol("BTCUSDT")
+    assert eng._executor.opened and eng._executor.opened[0][0] == "BTCUSDT"
+    assert any(e == Event.OPEN for e, _ in eng._notifier.events)
+    assert eng._store.rejects == []
+
+
+async def test_open_pipeline_rejects_high_leverage(settings, creds, monkeypatch):
+    settings.risk.max_leverage = 3
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(eng._market, "snapshot", lambda s: _snap(100.0))
+
+    async def fake_margin():
+        return 200.0
+    monkeypatch.setattr(eng, "_fetch_margin_safe", fake_margin)
+
+    async def fake_decide(ctx):
+        return TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
+                             size_pct=0.05, leverage=10, stop_loss_pct=0.02,
+                             take_profit_pct=0.04, reason="too much")
+    monkeypatch.setattr(eng._llm, "decide", fake_decide)
+
+    await eng._process_symbol("BTCUSDT")
+    assert eng._executor.opened == []
+    assert len(eng._store.rejects) == 1
+    assert any(e == Event.REJECT for e, _ in eng._notifier.events)
+
+
+# ---------- P0: 已实现盈亏接通日亏熔断 ----------
+async def test_close_accumulates_realized_pnl(settings, creds, monkeypatch):
+    """显式 CLOSE 平仓 → 计算盈亏并累加进 day_realized_pnl。"""
+    eng = _engine(settings, creds, monkeypatch)
+    # 多头 100 进、110 出、量 2 → pnl = +20
+    eng.runtime.positions["BTCUSDT"] = {
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 2.0,
+        "entryPrice": 100.0, "markPrice": 110.0,
+    }
+    await eng._handle_close("BTCUSDT")
+    assert eng.runtime.day_realized_pnl == pytest.approx(20.0)
+    assert "BTCUSDT" not in eng.runtime.positions
+    assert any(e == Event.CLOSE for e, _ in eng._notifier.events)
+
+
+async def test_losing_close_drives_daily_loss(settings, creds, monkeypatch):
+    """亏损平仓累计到日亏阈值后，熔断检查应触发。"""
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.update_equity(200.0)  # 日亏限额=200*10%=20
+    # 多头 100 进、90 出、量 3 → pnl = -30，超过日亏限额 20
+    eng.runtime.positions["BTCUSDT"] = {
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 3.0,
+        "entryPrice": 100.0, "markPrice": 90.0,
+    }
+    await eng._handle_close("BTCUSDT")
+    assert eng.runtime.day_realized_pnl == pytest.approx(-30.0)
+    # 熔断检查现在应判定日亏超限
+    assert await eng._check_circuit_breaker() is True
+    assert eng.runtime.halt_new_entries is True
+
+
+async def test_external_close_detected_in_snapshot(settings, creds, monkeypatch):
+    """SL/TP 在交易所侧触发 → 持仓消失 → _snapshot 差异检测补记盈亏。"""
+    eng = _engine(settings, creds, monkeypatch)
+    prev = {"BTCUSDT": {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+                        "entryPrice": 100.0, "markPrice": 95.0}}
+    # 本周期交易所已无持仓
+    eng._detect_external_closes(prev, {})
+    assert eng.runtime.day_realized_pnl == pytest.approx(-5.0)
+    assert eng.runtime.pop_order_event("BTCUSDT") is True
+
+
+async def test_external_close_ignores_still_open(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    prev = {"BTCUSDT": {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+                        "entryPrice": 100.0, "markPrice": 95.0}}
+    curr = {"BTCUSDT": {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+                        "entryPrice": 100.0, "markPrice": 95.0}}
+    eng._detect_external_closes(prev, curr)
+    assert eng.runtime.day_realized_pnl == 0.0
+
+
+# ---------- 控制命令执行 ----------
+async def test_command_pause_resume(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 1, "command": "PAUSE", "arg": ""}]
+    await eng._process_commands()
+    assert eng.runtime.halt_new_entries is True
+    assert eng._store.marked == [(1, "done", "new entries halted")]
+
+    eng._store.pending = [{"id": 2, "command": "RESUME", "arg": ""}]
+    await eng._process_commands()
+    assert eng.runtime.halt_new_entries is False
+
+
+async def test_command_set_dry_run(settings, creds, monkeypatch):
+    settings.execution.dry_run = True
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 1, "command": "SET_DRY_RUN", "arg": "false"}]
+    await eng._process_commands()
+    assert eng._settings.execution.dry_run is False
+
+
+async def test_command_kill_switch(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 1, "command": "KILL_SWITCH", "arg": ""}]
+    await eng._process_commands()
+    assert eng.runtime.kill_switch is True
+    assert eng._executor.flattened == 1
+    assert eng._store.marked[0][1] == "done"
+
+
+async def test_command_unknown_marked_failed(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.pending = [{"id": 9, "command": "BOGUS", "arg": ""}]
+    await eng._process_commands()
+    assert eng._store.marked[0][0] == 9
+    assert eng._store.marked[0][1] == "failed"

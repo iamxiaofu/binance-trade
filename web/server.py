@@ -1,0 +1,314 @@
+"""Web 后端：FastAPI 只读看板 + WebSocket 推送 + 受控操作端点。
+
+安全与解耦原则：
+- 独立进程，与交易主进程分离；只读 SQLite（status.py）+ 只读交易所行情。
+- 操作类命令（Kill Switch / 暂停 / dry_run 切换）只写 control_commands 表，
+  由交易进程每周期消费执行；web 绝不直接碰交易所下单。
+- 全站 HTTP Basic Auth；WS 握手复用同源 Basic 凭证。
+
+启动：
+    python -m web.server          # 读 config.yaml + .env，默认监听 127.0.0.1:8000
+凭据来自 .env：WEB_USER / WEB_PASSWORD（缺省 admin / 见日志告警）。
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import secrets
+
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
+from loguru import logger
+
+from src.config.loader import load_config
+from src.exchange.client import ExchangeClient
+from src.features.indicators import compute_snapshot
+from src.store.repo import Store
+from web import status as st
+from web.market_feed import MarketFeedRegistry
+
+# ---------- 配置与全局 ----------
+_settings, _creds = load_config(
+    os.environ.get("BIANCE_CONFIG", "config.yaml"),
+    os.environ.get("BIANCE_ENV", ".env"),
+)
+_DB = _settings.storage.db_path
+_WEB_USER = os.environ.get("WEB_USER", "admin")
+_WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+
+app = FastAPI(title="biance-trade dashboard", docs_url=None, redoc_url=None)
+_security = HTTPBasic()
+
+# 只读行情客户端（懒加载，单例）
+_market_client: ExchangeClient | None = None
+_market_lock = asyncio.Lock()
+# 行情数据源注册表：mainnet/testnet 双源（REST + WS），供看板行情用
+_feeds = MarketFeedRegistry()
+# 默认行情源：引擎在 testnet 交易，但看板默认看主网真实价（更有参考意义）
+_DEFAULT_SOURCE = os.environ.get("WEB_MARKET_SOURCE", "mainnet")
+# 控制命令写入用的 Store（懒加载）
+_store: Store | None = None
+
+
+def _check_auth(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
+    """Basic Auth 校验。用 compare_digest 防时序攻击。"""
+    if not _WEB_PASSWORD:
+        # 未配置密码 → 拒绝一切访问，避免裸奔
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WEB_PASSWORD 未配置，拒绝访问。请在 .env 设置 WEB_USER/WEB_PASSWORD。",
+        )
+    ok_user = secrets.compare_digest(credentials.username, _WEB_USER)
+    ok_pass = secrets.compare_digest(credentials.password, _WEB_PASSWORD)
+    if not (ok_user and ok_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="认证失败",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+async def _get_store() -> Store:
+    global _store
+    if _store is None:
+        _store = Store(_DB)
+        await _store.connect()
+    return _store
+
+
+async def _get_market() -> ExchangeClient:
+    global _market_client
+    async with _market_lock:
+        if _market_client is None:
+            client = ExchangeClient(_settings, _creds)
+            await client.load_markets()
+            _market_client = client
+    return _market_client
+
+
+# ---------- REST：只读数据 ----------
+@app.get("/api/summary")
+async def api_summary(_: str = Depends(_check_auth)):
+    return st.status_summary(_DB)
+
+
+@app.get("/api/positions")
+async def api_positions(_: str = Depends(_check_auth)):
+    return st.latest_positions(_DB)
+
+
+@app.get("/api/decisions")
+async def api_decisions(limit: int = 100, _: str = Depends(_check_auth)):
+    return st.recent_decisions(_DB, min(limit, 500))
+
+
+@app.get("/api/decisions/{decision_id}")
+async def api_decision_detail(decision_id: int, _: str = Depends(_check_auth)):
+    row = st.decision_detail(_DB, decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="decision not found")
+    return row
+
+
+@app.get("/api/orders")
+async def api_orders(limit: int = 100, _: str = Depends(_check_auth)):
+    return st.recent_orders(_DB, min(limit, 500))
+
+
+@app.get("/api/rejects")
+async def api_rejects(limit: int = 100, _: str = Depends(_check_auth)):
+    return st.recent_rejects(_DB, min(limit, 500))
+
+
+@app.get("/api/pnl")
+async def api_pnl(_: str = Depends(_check_auth)):
+    return st.pnl_stats(_DB)
+
+
+@app.get("/api/equity")
+async def api_equity(limit: int = 500, _: str = Depends(_check_auth)):
+    return st.balance_history(_DB, min(limit, 2000))
+
+
+@app.get("/api/commands")
+async def api_commands(limit: int = 50, _: str = Depends(_check_auth)):
+    return st.recent_commands(_DB, min(limit, 200))
+
+
+@app.get("/api/config")
+async def api_config(_: str = Depends(_check_auth)):
+    """暴露非敏感运行配置，供前端展示风控阈值等。"""
+    s = _settings
+    return {
+        "mode": s.mode.value,
+        "symbols": s.symbols,
+        "dry_run": s.execution.dry_run,
+        "cycle_interval": s.cycle.interval,
+        # 看板默认行情源（mainnet 真实价 / testnet 沙盒），供前端初始化源切换
+        "market_source": _DEFAULT_SOURCE,
+        "risk": {
+            "max_leverage": s.risk.max_leverage,
+            # 保证金/亏损限额按「账户权益」动态缩放
+            "max_order_margin_pct": s.risk.max_order_margin_pct,
+            "max_symbol_margin_pct": s.risk.max_symbol_margin_pct,
+            "max_total_margin_pct": s.risk.max_total_margin_pct,
+            "max_loss_per_trade_pct": s.risk.max_loss_per_trade_pct,
+            "max_drawdown_pct": s.risk.max_drawdown_pct,
+            "daily_max_loss_pct": s.risk.daily_max_loss_pct,
+            "min_confidence": s.risk.min_confidence,
+        },
+    }
+
+
+# ---------- REST：行情（K线 + 指标，只读交易所）----------
+def _norm_source(source: str | None) -> str:
+    """归一化行情源；非法值回落到默认源。"""
+    s = (source or _DEFAULT_SOURCE).lower()
+    return s if s in ("mainnet", "testnet") else _DEFAULT_SOURCE
+
+
+@app.get("/api/klines/{symbol}")
+async def api_klines(symbol: str, timeframe: str = "5m", limit: int = 200,
+                     source: str | None = None, _: str = Depends(_check_auth)):
+    """返回 K 线 + 最新指标快照，供前端 KLineCharts 渲染。
+
+    source=mainnet|testnet：选择行情数据源。默认主网（真实价）。
+    """
+    symbol = symbol.upper()
+    if symbol not in _settings.symbols:
+        raise HTTPException(status_code=400, detail=f"symbol not configured: {symbol}")
+    src = _norm_source(source)
+    try:
+        feed = await _feeds.get(src)
+        klines = await feed.fetch_ohlcv(symbol, timeframe, min(limit, 1500))
+    except Exception as e:
+        logger.warning("klines fetch failed {} [{}]: {}", symbol, src, e)
+        raise HTTPException(status_code=502, detail=f"exchange error: {e}")
+    indicators = compute_snapshot(klines) if len(klines) >= 30 else {}
+    # 当前持仓的开仓价/方向，供前端在图上标注
+    pos = next((p for p in st.latest_positions(_DB) if p["symbol"] == symbol), None)
+    return {"symbol": symbol, "timeframe": timeframe, "source": src,
+            "klines": klines, "indicators": indicators, "position": pos}
+
+
+@app.get("/api/ticker/{symbol}")
+async def api_ticker(symbol: str, source: str | None = None,
+                     _: str = Depends(_check_auth)):
+    """轻量最新价/标记价。WS 不可用时的回退；正常实时价走 /ws/market。"""
+    symbol = symbol.upper()
+    if symbol not in _settings.symbols:
+        raise HTTPException(status_code=400, detail=f"symbol not configured: {symbol}")
+    src = _norm_source(source)
+    try:
+        feed = await _feeds.get(src)
+        t = await feed.fetch_ticker(symbol)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"exchange error: {e}")
+    return {
+        "symbol": symbol,
+        "source": src,
+        "last": t.get("last"),
+        "mark": t.get("mark") or (t.get("info") or {}).get("markPrice"),
+        "change_24h_pct": t.get("percentage"),
+        "ts": t.get("timestamp"),
+    }
+
+
+# ---------- 操作类：写命令队列（不直接碰交易所）----------
+_ALLOWED_COMMANDS = {"KILL_SWITCH", "PAUSE", "RESUME", "SET_DRY_RUN"}
+
+
+@app.post("/api/command/{name}")
+async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)):
+    """下发控制命令。交易进程每周期消费执行（最多一个周期延迟）。"""
+    name = name.upper()
+    if name not in _ALLOWED_COMMANDS:
+        raise HTTPException(status_code=400, detail=f"unknown command: {name}")
+    store = await _get_store()
+    cmd_id = await store.enqueue_command(name, arg=arg, source=f"web:{user}")
+    logger.warning("web command queued: {} arg={} by={} id={}", name, arg, user, cmd_id)
+    return {"queued": True, "id": cmd_id, "command": name,
+            "note": "交易进程将在下个周期内执行"}
+
+
+# ---------- WebSocket：实时推送 ----------
+@app.websocket("/ws")
+async def ws_stream(websocket: WebSocket):
+    """每 push_interval 秒推送一帧聚合状态。
+
+    鉴权：浏览器对同源 WS 握手会自动带上已建立的 Basic 凭证；这里再校验一次。
+    """
+    # 复用 HTTP Basic：从握手头解析
+    if not _ws_authorized(websocket):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    await websocket.accept()
+    push_interval = float(os.environ.get("WEB_PUSH_INTERVAL", "1"))
+    try:
+        while True:
+            await websocket.send_json(st.status_summary(_DB))
+            await asyncio.sleep(push_interval)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.warning("ws stream error: {}", e)
+        await websocket.close()
+
+
+def _ws_authorized(websocket: WebSocket) -> bool:
+    import base64
+    if not _WEB_PASSWORD:
+        return False
+    auth = websocket.headers.get("authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode()
+        user, _, pwd = decoded.partition(":")
+    except Exception:
+        return False
+    return (secrets.compare_digest(user, _WEB_USER)
+            and secrets.compare_digest(pwd, _WEB_PASSWORD))
+
+
+@app.get("/healthz")
+async def healthz():
+    """健康检查（无需鉴权），供 systemd/nginx 探活。"""
+    return JSONResponse({"status": "ok"})
+
+
+@app.on_event("startup")
+async def _ensure_schema() -> None:
+    """确保数据库表已建（即使交易进程尚未运行过），避免只读查询命中缺表。"""
+    try:
+        await _get_store()  # Store.connect() 会 create_all（幂等）
+    except Exception as e:
+        logger.warning("ensure schema on startup failed: {}", e)
+
+
+# ---------- 静态前端（构建产物）----------
+_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.isdir(_FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=_FRONTEND_DIST, html=True), name="frontend")
+else:
+    logger.warning("frontend dist 未构建：{}（先 npm run build）", _FRONTEND_DIST)
+
+
+def main() -> None:
+    import uvicorn
+    host = os.environ.get("WEB_HOST", "127.0.0.1")
+    port = int(os.environ.get("WEB_PORT", "8000"))
+    if not _WEB_PASSWORD:
+        logger.warning("⚠️  WEB_PASSWORD 未设置，所有接口将拒绝访问。请在 .env 配置。")
+    logger.info("starting web dashboard on {}:{}", host, port)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# <!-- APPEND_ENDPOINTS -->

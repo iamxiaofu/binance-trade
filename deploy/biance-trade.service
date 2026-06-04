@@ -1,0 +1,31 @@
+[Unit]
+Description=biance-trade LLM-driven Binance USDT-M futures bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/biance-trade
+# venv 解释器路径；按部署实际调整
+Environment=PYTHONPATH=/opt/biance-trade
+ExecStart=/opt/biance-trade/.venv/bin/python main.py run --yes
+# 优雅停机：systemd 发 SIGTERM，main.py 捕获后撤单+平仓
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+# 资源与安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# 允许写 SQLite/日志（项目目录）
+ReadWritePaths=/opt/biance-trade
+# .env 文件权限 600，仅 trader 可读
+EnvironmentFile=-/opt/biance-trade/.env
+# 日志走 journald（journalctl -u biance-trade）
+
+[Install]
+WantedBy=multi-user.target

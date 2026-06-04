@@ -1,0 +1,41 @@
+:root {
+  color-scheme: light dark;
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+  font-family: var(--sans);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #f5f7fa;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.mono { font-family: var(--mono); }
+
+.pnl-pos { color: #16a34a; font-weight: 600; }
+.pnl-neg { color: #dc2626; font-weight: 600; }
+
+.metric-card {
+  padding: 16px 18px;
+}
+.metric-card .label {
+  font-size: 13px;
+  color: #909399;
+  margin-bottom: 6px;
+}
+.metric-card .value {
+  font-size: 26px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+
+.page { padding: 16px; }
+.page h2 { margin: 0 0 14px; font-size: 20px; }
+
+.chart-box { width: 100%; }
