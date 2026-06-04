@@ -34,7 +34,7 @@ onUnmounted(() => live.disconnect())
   <el-container style="height: 100vh">
     <el-aside width="200px" style="background:#1f2329; color:#fff">
       <div style="padding:18px 16px; font-size:18px; font-weight:600; color:#fff">
-        biance-trade
+        binance-trade
       </div>
       <el-menu :default-active="activePath" background-color="#1f2329"
                text-color="#cfd3dc" active-text-color="#ffd04b" @select="onMenuSelect">

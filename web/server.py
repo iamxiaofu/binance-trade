@@ -31,14 +31,14 @@ from web.market_feed import MarketFeedRegistry
 
 # ---------- 配置与全局 ----------
 _settings, _creds = load_config(
-    os.environ.get("BIANCE_CONFIG", "config.yaml"),
-    os.environ.get("BIANCE_ENV", ".env"),
+    os.environ.get("BINANCE_CONFIG", "config.yaml"),
+    os.environ.get("BINANCE_ENV", ".env"),
 )
 _DB = _settings.storage.db_path
 _WEB_USER = os.environ.get("WEB_USER", "admin")
 _WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
 
-app = FastAPI(title="biance-trade dashboard", docs_url=None, redoc_url=None)
+app = FastAPI(title="binance-trade dashboard", docs_url=None, redoc_url=None)
 _security = HTTPBasic()
 
 # 只读行情客户端（懒加载，单例）

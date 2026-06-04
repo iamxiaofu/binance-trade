@@ -1,5 +1,5 @@
 [project]
-name = "biance-trade"
+name = "binance-trade"
 version = "0.1.0"
 description = "LLM-driven Binance USDT-M perpetual futures trading bot"
 readme = "README.md"
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
-biance-trade = "main:cli"
+binance-trade = "main:cli"
 
 [project.optional-dependencies]
 dev = [

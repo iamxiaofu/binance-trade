@@ -22,7 +22,7 @@ from src.utils.logger import setup_logger
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="biance-trade", description="LLM 驱动的币安永续合约交易机器人")
+    p = argparse.ArgumentParser(prog="binance-trade", description="LLM 驱动的币安永续合约交易机器人")
     p.add_argument("-c", "--config", default="config.yaml", help="config.yaml 路径")
     p.add_argument("-e", "--env", default=".env", help=".env 路径")
     sub = p.add_subparsers(dest="command", required=True)

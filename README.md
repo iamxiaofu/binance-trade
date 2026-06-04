@@ -1,4 +1,4 @@
-# biance-trade
+# binance-trade
 
 LLM 驱动的币安 USDT 本位永续合约交易机器人。Claude 出结构化决策，**硬风控**夹断，
 按周期节流调用，dry-run 默认开启。安全优先：杠杆超限直接拒单（不截断）、多道名义价值闸、
@@ -72,12 +72,12 @@ python main.py backtest --symbol BTCUSDT --csv data/btc_5m.csv --leverage 10
 ## 部署（systemd）
 
 ```bash
-sudo cp deploy/biance-trade.service /etc/systemd/system/
+sudo cp deploy/binance-trade.service /etc/systemd/system/
 # 按实际路径修改 WorkingDirectory / ExecStart / User
-sudo mkdir -p /var/log/biance-trade && sudo chown trader:trader /var/log/biance-trade
+sudo mkdir -p /var/log/binance-trade && sudo chown trader:trader /var/log/binance-trade
 sudo systemctl daemon-reload
-sudo systemctl enable --now biance-trade
-sudo journalctl -u biance-trade -f      # 或看 /var/log/biance-trade/*.log
+sudo systemctl enable --now binance-trade
+sudo journalctl -u binance-trade -f      # 或看 /var/log/binance-trade/*.log
 ```
 
 收到 `SIGTERM`（`systemctl stop`）时 main.py 捕获信号，先撤单+平仓再退出。

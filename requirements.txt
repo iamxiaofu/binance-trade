@@ -1,4 +1,4 @@
-# biance-trade 运行依赖（与当前 .venv 锁定版本一致，确保可复现部署）
+# binance-trade 运行依赖（与当前 .venv 锁定版本一致，确保可复现部署）
 # 注意：代码已弃用 pandas-ta（改用纯 pandas/numpy 实现指标），故不在此列出。
 ccxt==4.5.56
 anthropic==0.105.2

@@ -46,7 +46,7 @@ def setup_logger(cfg: "LoggingConfig") -> None:
     log_dir = Path(cfg.dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.add(
-        log_dir / "biance-trade_{time:YYYY-MM-DD}.log",
+        log_dir / "binance-trade_{time:YYYY-MM-DD}.log",
         level=cfg.level,
         rotation=cfg.rotation,
         retention=cfg.retention,

@@ -28,7 +28,7 @@ curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
 sudo dnf install -y nodejs nginx
 
 # --- 后端 Python 依赖（写入 .venv；本仓库用 uv 管理）---
-cd /opt/biance-trade        # 部署路径，开发机为 /data0/biance-trade
+cd /opt/binance-trade        # 部署路径，开发机为 /data0/binance-trade
 VIRTUAL_ENV=$PWD/.venv uv pip install "fastapi>=0.115" "uvicorn[standard]>=0.32" "python-multipart>=0.0.12"
 # 或用 pip：.venv/bin/python -m pip install ...
 # 也可：uv pip install -e ".[web]"   （pyproject 已声明 web 可选依赖组）
@@ -56,27 +56,27 @@ sudo firewall-cmd --reload
 
 ## 4. 凭据位置（Basic Auth）
 
-- 全部在 **`/opt/biance-trade/.env`**（权限 600，已 gitignore）：
+- 全部在 **`/opt/binance-trade/.env`**（权限 600，已 gitignore）：
   - `WEB_USER`（默认 `admin`）
   - `WEB_PASSWORD`（已用 `secrets.token_urlsafe(18)` 生成强随机值）
   - `WEB_HOST=127.0.0.1` / `WEB_PORT=8000`
   - 可选 `WEB_PUSH_INTERVAL`（WS 推送间隔秒，默认 5）
 - **安全约束**：`WEB_PASSWORD` 未设置时，后端拒绝一切 API 访问（503），不会裸奔。
-- 查看当前密码：`grep WEB_ /opt/biance-trade/.env`
-- 更换密码：编辑 .env 后 `systemctl restart biance-trade-web`。
+- 查看当前密码：`grep WEB_ /opt/binance-trade/.env`
+- 更换密码：编辑 .env 后 `systemctl restart binance-trade-web`。
 
 ## 5. 部署（systemd + nginx）
 
 ```bash
 # 后端服务
-sudo cp deploy/biance-trade-web.service /etc/systemd/system/
-sudo mkdir -p /var/log/biance-trade && sudo chown trader:trader /var/log/biance-trade
+sudo cp deploy/binance-trade-web.service /etc/systemd/system/
+sudo mkdir -p /var/log/binance-trade && sudo chown trader:trader /var/log/binance-trade
 sudo systemctl daemon-reload
-sudo systemctl enable --now biance-trade-web
-sudo systemctl status biance-trade-web
+sudo systemctl enable --now binance-trade-web
+sudo systemctl status binance-trade-web
 
 # nginx 反代（改 server_name 和证书路径后）
-sudo cp deploy/nginx-biance-trade.conf /etc/nginx/conf.d/biance-trade.conf
+sudo cp deploy/nginx-binance-trade.conf /etc/nginx/conf.d/binance-trade.conf
 sudo nginx -t && sudo systemctl enable --now nginx && sudo systemctl reload nginx
 ```
 
@@ -90,7 +90,7 @@ sudo certbot --nginx -d your-domain.example.com
 
 ```bash
 # 终端1：后端
-cd /opt/biance-trade && PYTHONPATH=$PWD .venv/bin/python -m web.server
+cd /opt/binance-trade && PYTHONPATH=$PWD .venv/bin/python -m web.server
 # 终端2：前端热更新（自动代理 /api、/ws 到 8000）
 cd web/frontend && npm run dev    # 打开 http://127.0.0.1:5173
 # 改完构建：

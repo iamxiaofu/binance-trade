@@ -1,19 +1,19 @@
 # 运行手册（Runbook）
 
-日常运维 biance-trade：启停、紧急熔断、看日志、复盘决策。
-假设以 systemd 托管、工作目录 `/opt/biance-trade`、运行用户 `trader`。
+日常运维 binance-trade：启停、紧急熔断、看日志、复盘决策。
+假设以 systemd 托管、工作目录 `/opt/binance-trade`、运行用户 `trader`。
 
 ---
 
 ## 启动 / 停止 / 重启
 
 ```bash
-sudo systemctl start   biance-trade     # 启动
-sudo systemctl stop    biance-trade     # 停止（优雅：先撤单+平仓再退出）
-sudo systemctl restart biance-trade     # 重启
-sudo systemctl status  biance-trade     # 查看状态
-sudo systemctl enable  biance-trade     # 开机自启
-sudo systemctl disable biance-trade     # 取消自启
+sudo systemctl start   binance-trade     # 启动
+sudo systemctl stop    binance-trade     # 停止（优雅：先撤单+平仓再退出）
+sudo systemctl restart binance-trade     # 重启
+sudo systemctl status  binance-trade     # 查看状态
+sudo systemctl enable  binance-trade     # 开机自启
+sudo systemctl disable binance-trade     # 取消自启
 ```
 
 `stop` 会向进程发 `SIGTERM`，main.py 捕获后执行撤单 + 平仓再退出，`TimeoutStopSec=60`。
@@ -24,9 +24,9 @@ sudo systemctl disable biance-trade     # 取消自启
 
 1. **代码级 kill（推荐，会撤单+平仓）**
    ```bash
-   sudo systemctl stop biance-trade          # SIGTERM → 优雅平仓
+   sudo systemctl stop binance-trade          # SIGTERM → 优雅平仓
    # 或独立执行一次性 kill 命令（不依赖主进程在跑）：
-   sudo -iu trader bash -lc 'cd /opt/biance-trade && source .venv/bin/activate && python main.py kill-switch'
+   sudo -iu trader bash -lc 'cd /opt/binance-trade && source .venv/bin/activate && python main.py kill-switch'
    ```
    `kill-switch` 子命令：撤掉所有挂单 + 平掉所有持仓 + 推送告警。
 
@@ -42,13 +42,13 @@ sudo systemctl disable biance-trade     # 取消自启
 
 ```bash
 # systemd 聚合日志（实时）
-sudo journalctl -u biance-trade -f
-sudo journalctl -u biance-trade --since "1 hour ago"
+sudo journalctl -u binance-trade -f
+sudo journalctl -u binance-trade --since "1 hour ago"
 
 # 文件日志（loguru 轮转，见 config.yaml logging.dir）
-tail -f /opt/biance-trade/logs/biance-trade_$(date +%F).log
+tail -f /opt/binance-trade/logs/binance-trade_$(date +%F).log
 # systemd 重定向的 stdout/stderr
-tail -f /var/log/biance-trade/stdout.log /var/log/biance-trade/stderr.log
+tail -f /var/log/binance-trade/stdout.log /var/log/binance-trade/stderr.log
 ```
 
 关注的关键日志：
@@ -65,7 +65,7 @@ tail -f /var/log/biance-trade/stdout.log /var/log/biance-trade/stderr.log
 所有决策、拒单、订单、快照都落在 SQLite（`config.yaml` 的 `storage.db_path`，默认 `data/trade.db`）。
 
 ```bash
-cd /opt/biance-trade
+cd /opt/binance-trade
 sqlite3 data/trade.db
 ```
 
@@ -103,10 +103,10 @@ ORDER BY id DESC LIMIT 20;
 
 ```bash
 # 进程在跑？
-systemctl is-active biance-trade
+systemctl is-active binance-trade
 
 # 最近有心跳/决策？（应每个周期都有新行）
-sqlite3 /opt/biance-trade/data/trade.db \
+sqlite3 /opt/binance-trade/data/trade.db \
   "SELECT created_at, symbol, skipped FROM decisions ORDER BY id DESC LIMIT 5;"
 
 # 时钟没漂？
