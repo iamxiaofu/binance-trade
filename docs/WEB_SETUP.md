@@ -112,7 +112,7 @@ REST/WS 接口（`web/server.py`）：
 - 只读：`/api/summary` `/api/positions` `/api/decisions[/{id}]` `/api/orders`
   `/api/rejects` `/api/pnl` `/api/equity` `/api/commands` `/api/config` `/api/klines/{symbol}`
 - 操作：`POST /api/command/{KILL_SWITCH|PAUSE|RESUME|SET_DRY_RUN}`（写命令队列，交易进程消费）
-- 实时：`WS /ws`（每 5s 推一帧聚合状态）
+- 实时：`WS /ws`（聚合状态）与 `WS /ws/market`（ticker + 最新K线，支持 mainnet/testnet）
 - 探活：`GET /healthz`（无需鉴权）
 
 ## 8. 操作命令如何生效（关键架构）
@@ -138,8 +138,8 @@ Web **不直接操作交易所**。操作面板的命令写入 SQLite 的 `contr
 - ✅ Node20/nginx/后端依赖安装成功
 - ✅ 前端 `npm run build` 通过，dist 产物 2.8M（按页面代码分割）
 - ✅ 后端 Basic Auth：无凭据/错密码 401，正确 200
-- ✅ `/api/klines` 实时拉 testnet 行情 + 指标
-- ✅ WebSocket 推送正常，无凭据被拒
+- ✅ `/api/klines` 拉 testnet/mainnet 历史行情 + 指标
+- ✅ WebSocket 聚合状态与实时行情推送正常，无凭据被拒
 - ✅ 操作命令正确入队，交易进程消费执行（单测覆盖）
 - ✅ 经 nginx 反代：SPA / API / WS 全链路通
 - ✅ Python 测试套件 115 passed

@@ -235,6 +235,84 @@ async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)
 
 
 # ---------- WebSocket：实时推送 ----------
+@app.websocket("/ws/market")
+async def ws_market(websocket: WebSocket):
+    """实时行情 WS：按 source/symbol/timeframe 推 ticker 与最新 K 线。
+
+    Query:
+      source=mainnet|testnet
+      symbol=BTCUSDT
+      timeframe=1m|5m|...
+    """
+    if not _ws_authorized(websocket):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    symbol = (websocket.query_params.get("symbol") or _settings.symbols[0]).upper()
+    if symbol not in _settings.symbols:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    timeframe = websocket.query_params.get("timeframe") or _settings.llm.kline_interval
+    source = _norm_source(websocket.query_params.get("source"))
+
+    await websocket.accept()
+    queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
+    tasks: list[asyncio.Task] = []
+
+    async def _ticker_loop():
+        feed = await _feeds.get(source)
+        async for t in feed.watch_ticker(symbol):
+            await queue.put({
+                "type": "ticker",
+                "symbol": symbol,
+                "source": source,
+                "last": t.get("last"),
+                "mark": t.get("mark") or (t.get("info") or {}).get("markPrice"),
+                "change_24h_pct": t.get("percentage"),
+                "ts": t.get("timestamp"),
+            })
+
+    async def _kline_loop():
+        feed = await _feeds.get(source)
+        async for k in feed.watch_ohlcv(symbol, timeframe):
+            await queue.put({
+                "type": "kline",
+                "symbol": symbol,
+                "source": source,
+                "timeframe": timeframe,
+                "kline": k,
+            })
+
+    async def _producer(name: str, fn):
+        try:
+            await fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await queue.put({"type": "error", "source": name, "message": str(e)})
+
+    tasks.append(asyncio.create_task(_producer("ticker", _ticker_loop)))
+    tasks.append(asyncio.create_task(_producer("kline", _kline_loop)))
+    try:
+        while True:
+            msg = await queue.get()
+            if msg.get("type") == "error":
+                raise RuntimeError(f"{msg.get('source')} stream failed: {msg.get('message')}")
+            await websocket.send_json(msg)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.warning("market ws error {} {} [{}]: {}", symbol, timeframe, source, e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @app.websocket("/ws")
 async def ws_stream(websocket: WebSocket):
     """每 push_interval 秒推送一帧聚合状态。

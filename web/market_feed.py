@@ -64,6 +64,13 @@ class MarketFeed:
         await self._ensure_markets()
         return await self._ex.fetch_ticker(_to_ccxt_symbol(symbol))
 
+    async def watch_ticker(self, symbol: str) -> AsyncIterator[dict]:
+        """WS 订阅最新 ticker。"""
+        await self._ensure_markets()
+        ccxt_sym = _to_ccxt_symbol(symbol)
+        while True:
+            yield await self._ex.watch_ticker(ccxt_sym)
+
     async def watch_ohlcv(
         self, symbol: str, timeframe: str
     ) -> AsyncIterator[list[float]]:

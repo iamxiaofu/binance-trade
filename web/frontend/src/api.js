@@ -2,6 +2,14 @@
 // 因此这里不手动管理凭据；仅做 fetch + JSON 解析 + 错误处理。
 const JSON_HEADERS = { Accept: 'application/json' }
 
+function qs(params) {
+  const q = new URLSearchParams()
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') q.set(k, v)
+  })
+  return q.toString()
+}
+
 async function req(path, opts = {}) {
   const resp = await fetch(path, { headers: JSON_HEADERS, ...opts })
   if (!resp.ok) {
@@ -26,9 +34,10 @@ export const api = {
   equity: (limit = 500) => req(`/api/equity?limit=${limit}`),
   commands: (limit = 50) => req(`/api/commands?limit=${limit}`),
   config: () => req('/api/config'),
-  klines: (symbol, timeframe = '5m', limit = 200) =>
-    req(`/api/klines/${symbol}?timeframe=${timeframe}&limit=${limit}`),
-  ticker: (symbol) => req(`/api/ticker/${symbol}`),
+  klines: (symbol, timeframe = '5m', limit = 200, source = undefined) =>
+    req(`/api/klines/${symbol}?${qs({ timeframe, limit, source })}`),
+  ticker: (symbol, source = undefined) =>
+    req(`/api/ticker/${symbol}?${qs({ source })}`),
   command: (name, arg = '') =>
     req(`/api/command/${name}?arg=${encodeURIComponent(arg)}`, { method: 'POST' }),
 }

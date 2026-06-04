@@ -1,10 +1,11 @@
 <script setup>
 import { onMounted, onUnmounted, computed } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useLiveStore } from './stores/live'
 
 const live = useLiveStore()
 const route = useRoute()
+const router = useRouter()
 
 const menu = [
   { index: '/dashboard', title: '总览', icon: 'Odometer' },
@@ -19,6 +20,11 @@ const menu = [
 const lastUpdateText = computed(() =>
   live.lastUpdate ? live.lastUpdate.toLocaleTimeString() : '—'
 )
+const activePath = computed(() => route.path)
+
+function onMenuSelect(index) {
+  if (route.path !== index) router.push(index)
+}
 
 onMounted(() => live.connect())
 onUnmounted(() => live.disconnect())
@@ -30,8 +36,8 @@ onUnmounted(() => live.disconnect())
       <div style="padding:18px 16px; font-size:18px; font-weight:600; color:#fff">
         biance-trade
       </div>
-      <el-menu :default-active="route.path" router background-color="#1f2329"
-               text-color="#cfd3dc" active-text-color="#ffd04b">
+      <el-menu :default-active="activePath" background-color="#1f2329"
+               text-color="#cfd3dc" active-text-color="#ffd04b" @select="onMenuSelect">
         <el-menu-item v-for="m in menu" :key="m.index" :index="m.index">
           <el-icon><component :is="m.icon" /></el-icon>
           <span>{{ m.title }}</span>
