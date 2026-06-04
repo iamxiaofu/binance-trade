@@ -1,7 +1,7 @@
 // 全局实时状态 store。
 //
 // 策略：优先用 WebSocket（推送高效）；WS 断开时才启动 HTTPS 轮询兜底。
-// 页面隐藏时暂停连接/轮询，避免后台标签页持续请求导致浏览器焦点被打扰。
+// 页面隐藏时跳过轮询请求，避免后台标签页持续请求。
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '../api'
@@ -23,7 +23,6 @@ export const useLiveStore = defineStore('live', () => {
   let reconnectTimer = null
   let pollTimer = null
   let staleTimer = null
-  let visibilityBound = false
 
   const balance = computed(() => summary.value.balance || {})
   const positions = computed(() => summary.value.positions || [])
@@ -75,10 +74,6 @@ export const useLiveStore = defineStore('live', () => {
   }
 
   function connect() {
-    if (!visibilityBound) {
-      document.addEventListener('visibilitychange', _handleVisibility)
-      visibilityBound = true
-    }
     if (document.hidden) return
     _connectWs()
     _pollOnce()
@@ -98,24 +93,17 @@ export const useLiveStore = defineStore('live', () => {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
     if (staleTimer) { clearTimeout(staleTimer); staleTimer = null }
     _stopPoll()
-    if (ws) { try { ws.close() } catch (_) { /* ignore */ } ws = null }
+    if (ws) {
+      ws.onclose = null
+      ws.onerror = null
+      ws.onmessage = null
+      try { ws.close() } catch (_) { /* ignore */ }
+      ws = null
+    }
     if (markDisconnected) connected.value = false
   }
 
-  function _handleVisibility() {
-    if (document.hidden) {
-      _stopTransports(false)
-      transport.value = 'paused'
-      return
-    }
-    connect()
-  }
-
   function disconnect() {
-    if (visibilityBound) {
-      document.removeEventListener('visibilitychange', _handleVisibility)
-      visibilityBound = false
-    }
     _stopTransports(true)
   }
 

@@ -21,13 +21,54 @@ const lastUpdateText = computed(() =>
   live.lastUpdate ? live.lastUpdate.toLocaleTimeString() : '—'
 )
 const activePath = computed(() => route.path)
+let resumeArmed = false
 
 function onMenuSelect(index) {
   if (route.path !== index) router.push(index)
 }
 
-onMounted(() => live.connect())
-onUnmounted(() => live.disconnect())
+function pauseLiveTransports() {
+  live.disconnect()
+  window.dispatchEvent(new Event('binance-trade-pause-live'))
+}
+
+function disarmResumeOnInteraction() {
+  if (!resumeArmed) return
+  resumeArmed = false
+  window.removeEventListener('pointerdown', resumeLiveAfterInteraction, true)
+  window.removeEventListener('keydown', resumeLiveAfterInteraction, true)
+}
+
+function resumeLiveAfterInteraction() {
+  disarmResumeOnInteraction()
+  live.connect()
+  window.dispatchEvent(new Event('binance-trade-resume-live'))
+}
+
+function armResumeOnInteraction() {
+  if (resumeArmed) return
+  resumeArmed = true
+  window.addEventListener('pointerdown', resumeLiveAfterInteraction, true)
+  window.addEventListener('keydown', resumeLiveAfterInteraction, true)
+}
+
+function onWindowBlur() {
+  pauseLiveTransports()
+  armResumeOnInteraction()
+}
+
+onMounted(() => {
+  live.connect()
+  window.addEventListener('blur', onWindowBlur)
+  window.addEventListener('pagehide', pauseLiveTransports)
+})
+
+onUnmounted(() => {
+  disarmResumeOnInteraction()
+  window.removeEventListener('blur', onWindowBlur)
+  window.removeEventListener('pagehide', pauseLiveTransports)
+  live.disconnect()
+})
 </script>
 
 <template>

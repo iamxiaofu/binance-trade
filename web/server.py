@@ -13,10 +13,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -52,7 +53,16 @@ _DEFAULT_SOURCE = os.environ.get("WEB_MARKET_SOURCE", "mainnet")
 _store: Store | None = None
 
 
-def _check_auth(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
+def _ws_auth_cookie_value() -> str:
+    if not _WEB_PASSWORD:
+        return ""
+    return hashlib.sha256(f"{_WEB_USER}:{_WEB_PASSWORD}".encode()).hexdigest()
+
+
+def _check_auth(
+    response: Response,
+    credentials: HTTPBasicCredentials = Depends(_security),
+) -> str:
     """Basic Auth 校验。用 compare_digest 防时序攻击。"""
     if not _WEB_PASSWORD:
         # 未配置密码 → 拒绝一切访问，避免裸奔
@@ -68,6 +78,13 @@ def _check_auth(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
             detail="认证失败",
             headers={"WWW-Authenticate": "Basic"},
         )
+    response.set_cookie(
+        "binance_trade_ws",
+        _ws_auth_cookie_value(),
+        httponly=True,
+        samesite="lax",
+        max_age=7 * 24 * 3600,
+    )
     return credentials.username
 
 
@@ -340,6 +357,9 @@ def _ws_authorized(websocket: WebSocket) -> bool:
     import base64
     if not _WEB_PASSWORD:
         return False
+    cookie = websocket.cookies.get("binance_trade_ws", "")
+    if cookie and secrets.compare_digest(cookie, _ws_auth_cookie_value()):
+        return True
     auth = websocket.headers.get("authorization", "")
     if not auth.startswith("Basic "):
         return False

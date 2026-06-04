@@ -169,6 +169,17 @@ function closeMarketWs() {
   marketConnected.value = false
 }
 
+function startResyncTimer() {
+  if (resyncTimer) return
+  resyncTimer = setInterval(loadKline, 300000)
+}
+
+function stopResyncTimer() {
+  if (!resyncTimer) return
+  clearInterval(resyncTimer)
+  resyncTimer = null
+}
+
 function connectMarketWs() {
   if (stopped || document.hidden) return
   closeMarketWs()
@@ -208,17 +219,19 @@ async function reloadMarket() {
   connectMarketWs()
 }
 
-function onVisibilityChange() {
-  if (document.hidden) {
-    closeMarketWs()
-    return
-  }
-  connectMarketWs()
-}
-
 function onResize() {
   if (pchart) pchart.resize()
   if (kchart) kchart.resize()
+}
+
+function pauseMarketTransport() {
+  stopResyncTimer()
+  closeMarketWs()
+}
+
+function resumeMarketTransport() {
+  startResyncTimer()
+  connectMarketWs()
 }
 
 onMounted(async () => {
@@ -228,17 +241,19 @@ onMounted(async () => {
   kchart = init(klineEl.value)
   pchart = echarts.init(priceEl.value)
   await reloadMarket()
-  resyncTimer = setInterval(loadKline, 300000)
+  startResyncTimer()
   window.addEventListener('resize', onResize)
-  document.addEventListener('visibilitychange', onVisibilityChange)
+  window.addEventListener('binance-trade-pause-live', pauseMarketTransport)
+  window.addEventListener('binance-trade-resume-live', resumeMarketTransport)
 })
 
 onUnmounted(() => {
   stopped = true
   closeMarketWs()
-  if (resyncTimer) clearInterval(resyncTimer)
-  document.removeEventListener('visibilitychange', onVisibilityChange)
+  stopResyncTimer()
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('binance-trade-pause-live', pauseMarketTransport)
+  window.removeEventListener('binance-trade-resume-live', resumeMarketTransport)
   if (kchart) dispose(klineEl.value)
   if (pchart) pchart.dispose()
 })
