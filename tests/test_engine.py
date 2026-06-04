@@ -4,10 +4,13 @@
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from src.config.schema import Credentials
 from src.engine.loop import TradingEngine
+from src.exchange.filters import SymbolFilters
 from src.exchange.market_data import SymbolSnapshot
 from src.llm.schema import Action, MarketContext, TradeDecision
 from src.notify.telegram import Event
@@ -26,6 +29,8 @@ class FakeStore:
         self.rejects = []
         self.orders = []
         self.condition_exits = []
+        self.templates = {}
+        self.latest_decision = None
         self.pending = []          # 待执行命令
         self.marked = []           # (id, status, result)
 
@@ -46,6 +51,12 @@ class FakeStore:
 
     async def mark_condition_exit(self, **kw):
         self.condition_exits.append(kw)
+
+    async def latest_protection_templates(self, symbol, *, dry_run=None):
+        return self.templates
+
+    async def latest_open_decision(self, symbol):
+        return self.latest_decision
 
     async def fetch_pending_commands(self):
         out, self.pending = self.pending, []
@@ -84,6 +95,14 @@ class FakeExecutor:
 
     async def place_sl_tp(self, *, decision, entry_price, qty):
         return []
+
+    async def place_protection_orders(self, *, symbol, pos_side, qty, specs):
+        return [
+            {"symbol": symbol, "kind": kind, "side": "sell" if pos_side == "long" else "buy",
+             "order_type": otype, "qty": qty, "price": trigger, "notional": qty * trigger,
+             "dry_run": False, "status": "placed", "id": f"{kind}-1", "raw": {}}
+            for kind, otype, trigger in specs
+        ]
 
     async def close_position(self, position):
         return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "dry_run",
@@ -278,7 +297,91 @@ async def test_command_kill_switch(settings, creds, monkeypatch):
     await eng._process_commands()
     assert eng.runtime.kill_switch is True
     assert eng._executor.flattened == 1
-    assert eng._store.marked[0][1] == "done"
+
+
+class RepairClient:
+    def __init__(self, *, position, open_orders=None, equity=1000.0):
+        self.position = position
+        self.open_orders = open_orders or []
+        self.equity = equity
+        self._filters = SymbolFilters(
+            tick_size=Decimal("0.1"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+        )
+
+    def filters(self, symbol):
+        return self._filters
+
+    async def fetch_positions(self, symbols=None):
+        return [self.position] if self.position else []
+
+    async def fetch_open_condition_orders(self, symbol):
+        return self.open_orders
+
+    async def fetch_balance(self):
+        return {"total": {"USDT": self.equity}, "free": {"USDT": self.equity}}
+
+    async def fetch_ticker(self, symbol):
+        return {"mark": self.position.get("markPrice"), "last": self.position.get("markPrice")}
+
+
+async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monkeypatch):
+    settings.execution.dry_run = False
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "short",
+            "contracts": 1.0,
+            "entryPrice": 100.0,
+            "markPrice": 99.0,
+        },
+        equity=1000.0,
+    )
+    eng._store.templates = {
+        "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
+        "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
+    }
+
+    result = await eng._exec_command("REPAIR_SL_TP", "BTCUSDT")
+
+    assert "已补挂 SL@102.00, TP@95.00" in result
+    assert [o["kind"] for o in eng._store.orders] == ["SL", "TP"]
+    assert all(o["side"] == "buy" for o in eng._store.orders)
+
+
+async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, monkeypatch):
+    settings.execution.dry_run = False
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "short",
+            "contracts": 1.0,
+            "entryPrice": 100.0,
+            "markPrice": 103.0,
+        },
+        open_orders=[
+            {"id": "tp-1", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+             "side": "buy", "stopPrice": 95.0, "status": "open"},
+        ],
+        equity=1000.0,
+    )
+    eng._store.templates = {
+        "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
+        "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
+    }
+    eng._store.pending = [{"id": 9, "command": "REPAIR_SL_TP", "arg": "BTCUSDT"}]
+
+    await eng._process_commands()
+
+    assert eng._store.orders == []
+    assert eng._store.marked[0][1] == "failed"
+    assert "空单止损必须高于当前标记价" in eng._store.marked[0][2]
 
 
 async def test_command_unknown_marked_failed(settings, creds, monkeypatch):

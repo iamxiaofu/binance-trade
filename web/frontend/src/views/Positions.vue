@@ -1,9 +1,12 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { api } from '../api'
 import { useLiveStore } from '../stores/live'
 import { orderStatusLabel } from '../labels'
 
 const live = useLiveStore()
+const repairing = ref({})
 const positions = computed(() => live.positions || [])
 const positionsSource = computed(() => live.summary?.positions_source || 'db_snapshot')
 const positionsError = computed(() => live.summary?.positions_error || '')
@@ -37,6 +40,17 @@ function protection(row, kind) {
   return kind === 'SL' ? row.protection?.sl : row.protection?.tp
 }
 
+function needsRepair(row) {
+  return Boolean(row.protection?.missing_sl || row.protection?.missing_tp)
+}
+
+function missingProtectionText(row) {
+  const missing = []
+  if (row.protection?.missing_sl) missing.push('止损')
+  if (row.protection?.missing_tp) missing.push('止盈')
+  return missing.length ? `缺少${missing.join('、')}` : '保护完整'
+}
+
 function protectionTag(order) {
   if (!order) return 'danger'
   return { placed: 'success', filled: 'primary', canceled: 'danger', expired: 'warning' }[order.status] || 'info'
@@ -46,6 +60,26 @@ function protectionText(order) {
   if (!order) return '未挂出'
   const price = order.trigger_price || order.price
   return `${orderStatusLabel({ client_kind: order.kind, status: order.status })} @ ${fmt(price, 2)}`
+}
+
+function isRepairing(row) {
+  return Boolean(repairing.value[row.symbol])
+}
+
+async function repairProtection(row) {
+  const symbol = row.symbol
+  if (!symbol) return
+  repairing.value = { ...repairing.value, [symbol]: true }
+  try {
+    const res = await api.command('REPAIR_SL_TP', symbol)
+    ElMessage.success(`${symbol} 补止盈止损命令已入队 (#${res.id})`)
+  } catch (e) {
+    ElMessage.error(`补单命令下发失败: ${e.message}`)
+  } finally {
+    const next = { ...repairing.value }
+    delete next[symbol]
+    repairing.value = next
+  }
 }
 </script>
 
@@ -146,6 +180,21 @@ function protectionText(order) {
             <el-tag :type="protectionTag(protection(row, 'TP'))" size="small">
               {{ protectionText(protection(row, 'TP')) }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="保护操作" width="170" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              v-if="needsRepair(row)"
+              type="danger"
+              size="small"
+              :icon="'CirclePlus'"
+              :loading="isRepairing(row)"
+              @click="repairProtection(row)"
+            >
+              补止盈止损
+            </el-button>
+            <el-tag v-else type="success" size="small">{{ missingProtectionText(row) }}</el-tag>
           </template>
         </el-table-column>
       </el-table>

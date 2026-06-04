@@ -364,7 +364,7 @@ async def api_ticker(symbol: str, source: str | None = None,
 
 
 # ---------- 操作类：写命令队列（不直接碰交易所）----------
-_ALLOWED_COMMANDS = {"KILL_SWITCH", "PAUSE", "RESUME", "SET_DRY_RUN"}
+_ALLOWED_COMMANDS = {"KILL_SWITCH", "PAUSE", "RESUME", "SET_DRY_RUN", "REPAIR_SL_TP"}
 
 
 @app.post("/api/command/{name}")

@@ -203,6 +203,77 @@ class Store:
                     row.status = "canceled"
             await session.commit()
 
+    async def latest_protection_templates(
+        self,
+        symbol: str,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return latest local SL/TP rows for a symbol as repair templates.
+
+        条件单在交易所侧没有仓位 id 绑定；补单只能用同 symbol 最近一次本地记录的
+        SL/TP 触发价作为模板，并在 engine 侧再做当前标记价风控校验。
+        """
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            stmt = (
+                select(OrderRow)
+                .where(OrderRow.symbol == symbol)
+                .where(OrderRow.client_kind.in_(("SL", "TP")))
+                .where(OrderRow.price > 0)
+            )
+            if dry_run is not None:
+                stmt = stmt.where(OrderRow.dry_run.is_(dry_run))
+            rows = (
+                await session.execute(stmt.order_by(OrderRow.id.desc()).limit(20))
+            ).scalars().all()
+            out: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                if row.client_kind in out:
+                    continue
+                out[row.client_kind] = {
+                    "id": row.id,
+                    "symbol": row.symbol,
+                    "kind": row.client_kind,
+                    "side": row.side,
+                    "order_type": row.order_type,
+                    "qty": row.qty,
+                    "price": row.price,
+                    "status": row.status,
+                    "dry_run": row.dry_run,
+                    "exchange_order_id": row.exchange_order_id,
+                    "ts_ms": row.ts_ms,
+                    "created_at": row.created_at,
+                }
+            return out
+
+    async def latest_open_decision(self, symbol: str) -> dict[str, Any] | None:
+        """Return latest OPEN_LONG/OPEN_SHORT decision for fallback trigger reconstruction."""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(DecisionRow)
+                    .where(DecisionRow.symbol == symbol)
+                    .where(DecisionRow.skipped.is_(False))
+                    .where(DecisionRow.action.in_(("OPEN_LONG", "OPEN_SHORT")))
+                    .order_by(DecisionRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "symbol": row.symbol,
+                "action": row.action,
+                "stop_loss_pct": row.stop_loss_pct,
+                "take_profit_pct": row.take_profit_pct,
+                "ref_price": row.ref_price,
+                "ts_ms": row.ts_ms,
+                "created_at": row.created_at,
+            }
+
     async def snapshot_balance(
         self,
         *,

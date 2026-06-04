@@ -172,9 +172,7 @@ class Executor:
             return []
         symbol = decision.symbol
         is_long = decision.action == Action.OPEN_LONG
-        close_side = "sell" if is_long else "buy"
         f = self._client.filters(symbol)
-        results: list[dict] = []
 
         def _trigger(pct: float, is_sl: bool) -> float:
             if is_sl:
@@ -190,6 +188,24 @@ class Executor:
         if decision.take_profit_pct > 0:
             specs.append(("TP", "TAKE_PROFIT_MARKET", _trigger(decision.take_profit_pct, False)))
 
+        return await self.place_protection_orders(
+            symbol=symbol,
+            pos_side="long" if is_long else "short",
+            qty=qty,
+            specs=specs,
+        )
+
+    async def place_protection_orders(
+        self,
+        *,
+        symbol: str,
+        pos_side: str,
+        qty: float,
+        specs: list[tuple[str, str, float]],
+    ) -> list[dict]:
+        """按明确触发价补挂 reduce-only 保护条件单。"""
+        close_side = "sell" if pos_side.lower() == "long" else "buy"
+        results: list[dict] = []
         for kind, otype, trigger in specs:
             if self._cfg.dry_run:
                 logger.info("[dry-run][{}] {} trigger={}", symbol, kind, trigger)

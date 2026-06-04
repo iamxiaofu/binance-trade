@@ -17,7 +17,10 @@ from loguru import logger
 
 from src.config.schema import Credentials, Settings
 from src.exchange.client import ExchangeClient
+from src.exchange.filters import round_price
 from src.exchange.market_data import MarketData
+from src.exchange.orders import normalize_condition_order
+from src.exchange.positions import normalize_position, normalize_symbol
 from src.execution.executor import Executor, realized_pnl
 from src.features.builder import build_context, build_position_snapshot
 from src.llm.client import LLMClient
@@ -162,7 +165,254 @@ class TradingEngine:
             val = arg.strip().lower() in ("1", "true", "yes", "on")
             self._settings.execution.dry_run = val
             return f"dry_run set to {val}"
+        if name == "REPAIR_SL_TP":
+            return await self._repair_sl_tp(arg)
         raise ValueError(f"unknown command: {name}")
+
+    async def _repair_sl_tp(self, arg: str) -> str:
+        """补挂当前持仓缺失的 SL/TP 条件单。
+
+        Web 只入队命令；真实交易所操作必须在 engine 中串行执行。这里每次都重新
+        查询交易所持仓和未完成条件单，避免根据过期页面数据重复补单。
+        """
+        symbol = normalize_symbol((arg or "").strip())
+        if not symbol:
+            raise ValueError("REPAIR_SL_TP requires a symbol")
+        if symbol not in self._settings.symbols:
+            raise ValueError(f"symbol not configured: {symbol}")
+
+        position = await self._fetch_exchange_position(symbol)
+        if position is None:
+            return f"{symbol}: 交易所当前无持仓，不需要补保护单"
+
+        side = position["side"]
+        qty = float(position["contracts"] or 0.0)
+        entry = float(position["entry_price"] or 0.0)
+        mark = await self._current_mark_price(symbol, position)
+        position["mark_price"] = mark
+        if side not in ("long", "short") or qty <= 0 or entry <= 0 or mark <= 0:
+            raise ValueError(
+                f"{symbol}: 持仓数据不完整，无法做补单风控 "
+                f"(side={side}, qty={qty}, entry={entry}, mark={mark})"
+            )
+
+        active_orders = await self._active_protection_orders(symbol)
+        close_side = "sell" if side == "long" else "buy"
+        missing = [
+            kind for kind in ("SL", "TP")
+            if not self._has_active_protection(active_orders, kind, close_side)
+        ]
+        if not missing:
+            return f"{symbol}: SL/TP 条件单均已在交易所挂出"
+
+        templates = await self._store.latest_protection_templates(
+            symbol, dry_run=self._settings.execution.dry_run
+        )
+        latest_decision = await self._store.latest_open_decision(symbol)
+        equity = await self._current_equity()
+
+        specs: list[tuple[str, str, float]] = []
+        accepted: list[str] = []
+        rejected: list[str] = []
+        filters = self._client.filters(symbol)
+        for kind in missing:
+            trigger, source = self._desired_protection_trigger(
+                symbol=symbol,
+                side=side,
+                entry=entry,
+                kind=kind,
+                template=templates.get(kind),
+                latest_decision=latest_decision,
+            )
+            if trigger <= 0:
+                rejected.append(f"{kind}: 缺少历史触发价模板")
+                continue
+            trigger = float(round_price(trigger, filters))
+            reason = self._validate_repair_trigger(
+                symbol=symbol,
+                side=side,
+                kind=kind,
+                trigger=trigger,
+                entry=entry,
+                mark=mark,
+                qty=qty,
+                equity=equity,
+            )
+            if reason:
+                rejected.append(f"{kind}@{trigger:.2f}: {reason}")
+                continue
+            otype = "STOP_MARKET" if kind == "SL" else "TAKE_PROFIT_MARKET"
+            specs.append((kind, otype, trigger))
+            accepted.append(f"{kind}@{trigger:.2f}({source})")
+
+        if not specs:
+            raise ValueError(f"{symbol}: 未补挂保护单；" + "；".join(rejected))
+
+        results = await self._executor.place_protection_orders(
+            symbol=symbol,
+            pos_side=side,
+            qty=qty,
+            specs=specs,
+        )
+        for order in results:
+            await self._store.log_order(order)
+
+        placed = [
+            f"{o['kind']}@{float(o.get('price') or 0.0):.2f}"
+            for o in results
+            if o.get("status") in ("placed", "dry_run")
+        ]
+        failed = [
+            f"{o.get('kind')}:{(o.get('raw') or {}).get('error') or o.get('status')}"
+            for o in results
+            if o.get("status") not in ("placed", "dry_run")
+        ]
+        self.runtime.mark_order_event(symbol)
+
+        if not placed:
+            raise ValueError(f"{symbol}: 补单下发失败；" + "；".join(failed))
+
+        parts = [f"{symbol}: 已补挂 {', '.join(placed)}"]
+        if rejected:
+            parts.append("未补: " + "；".join(rejected))
+        if failed:
+            parts.append("下发失败: " + "；".join(failed))
+        logger.warning(
+            "repair SL/TP {} side={} qty={} entry={} mark={} accepted={} rejected={} failed={}",
+            symbol, side, qty, entry, mark, accepted, rejected, failed,
+        )
+        return "；".join(parts)
+
+    async def _fetch_exchange_position(self, symbol: str) -> dict | None:
+        positions = await self._client.fetch_positions([symbol])
+        for raw in positions:
+            pos = normalize_position(raw)
+            if pos["symbol"] == symbol and pos["contracts"] > 0:
+                return pos
+        return None
+
+    async def _active_protection_orders(self, symbol: str) -> list[dict]:
+        orders = await self._client.fetch_open_condition_orders(symbol)
+        out: list[dict] = []
+        for raw in orders:
+            order = normalize_condition_order(raw)
+            if order["symbol"] == symbol and order["kind"] in ("SL", "TP"):
+                order["status"] = "placed"
+                out.append(order)
+        return out
+
+    @staticmethod
+    def _has_active_protection(orders: list[dict], kind: str, close_side: str) -> bool:
+        for order in orders:
+            if order.get("kind") != kind or order.get("status") != "placed":
+                continue
+            side = (order.get("side") or "").lower()
+            if side and side != close_side:
+                continue
+            return True
+        return False
+
+    async def _current_mark_price(self, symbol: str, position: dict) -> float:
+        mark = float(position.get("mark_price") or 0.0)
+        if mark > 0:
+            return mark
+        ticker = await self._client.fetch_ticker(symbol)
+        raw_mark = (
+            ticker.get("mark")
+            or (ticker.get("info") or {}).get("markPrice")
+            or ticker.get("last")
+        )
+        return float(raw_mark or 0.0)
+
+    async def _current_equity(self) -> float:
+        try:
+            balance = await self._client.fetch_balance()
+            total = (balance.get("total") or {}).get(self._settings.account.quote_asset)
+            equity = float(total or 0.0)
+            if equity > 0:
+                self.runtime.update_equity(equity)
+                return equity
+        except Exception as e:
+            logger.warning("fetch equity for repair failed: {}", e)
+        if self.runtime.current_equity > 0:
+            return self.runtime.current_equity
+        return float(self._settings.account.initial_capital)
+
+    def _desired_protection_trigger(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        entry: float,
+        kind: str,
+        template: dict | None,
+        latest_decision: dict | None,
+    ) -> tuple[float, str]:
+        if template and float(template.get("price") or 0.0) > 0:
+            return float(template["price"]), "历史条件单"
+
+        action = (latest_decision or {}).get("action", "")
+        expected_action = "OPEN_LONG" if side == "long" else "OPEN_SHORT"
+        if action != expected_action:
+            return 0.0, ""
+        pct_key = "stop_loss_pct" if kind == "SL" else "take_profit_pct"
+        pct = float((latest_decision or {}).get(pct_key) or 0.0)
+        if pct <= 0:
+            return 0.0, ""
+        if kind == "SL":
+            trigger = entry * (1 - pct) if side == "long" else entry * (1 + pct)
+        else:
+            trigger = entry * (1 + pct) if side == "long" else entry * (1 - pct)
+        logger.info(
+            "repair {} {} trigger reconstructed from decision {} pct={}",
+            symbol, kind, (latest_decision or {}).get("id"), pct,
+        )
+        return trigger, "最近开仓决策"
+
+    def _validate_repair_trigger(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        kind: str,
+        trigger: float,
+        entry: float,
+        mark: float,
+        qty: float,
+        equity: float,
+    ) -> str:
+        if trigger <= 0 or entry <= 0 or mark <= 0 or qty <= 0:
+            return "价格或数量无效"
+        if side == "long":
+            if kind == "SL" and not (trigger < mark and trigger < entry):
+                return f"多单止损必须低于当前标记价 {mark:.2f} 且低于开仓价 {entry:.2f}"
+            if kind == "TP" and not (trigger > mark and trigger > entry):
+                return f"多单止盈必须高于当前标记价 {mark:.2f} 且高于开仓价 {entry:.2f}"
+        elif side == "short":
+            if kind == "SL" and not (trigger > mark and trigger > entry):
+                return f"空单止损必须高于当前标记价 {mark:.2f} 且高于开仓价 {entry:.2f}"
+            if kind == "TP" and not (trigger < mark and trigger < entry):
+                return f"空单止盈必须低于当前标记价 {mark:.2f} 且低于开仓价 {entry:.2f}"
+        else:
+            return f"未知持仓方向 {side}"
+
+        if kind == "SL":
+            loss = (entry - trigger) * qty if side == "long" else (trigger - entry) * qty
+            max_loss = equity * (self._settings.risk.max_loss_per_trade_pct / 100.0)
+            if equity <= 0 or max_loss <= 0:
+                return "无法获取账户权益，不能校验止损风险"
+            if loss < 0:
+                return "止损触发价方向错误"
+            if loss > max_loss:
+                return (
+                    f"理论止损亏损 {loss:.2f} USDT 超过上限 {max_loss:.2f} USDT "
+                    f"({self._settings.risk.max_loss_per_trade_pct}% of {equity:.2f})"
+                )
+        logger.debug(
+            "repair trigger valid {} {} side={} trigger={} entry={} mark={} qty={}",
+            symbol, kind, side, trigger, entry, mark, qty,
+        )
+        return ""
 
     async def _check_circuit_breaker(self) -> bool:
         """日亏或回撤超限 → 平仓 + 停开新仓 + 告警。返回是否已熔断。"""

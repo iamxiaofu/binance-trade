@@ -102,6 +102,29 @@ async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):
     assert by_kind["SL"].status == "canceled"
 
 
+async def test_latest_protection_templates_returns_latest_sl_tp(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "sell", "order_type": "STOP_MARKET",
+        "qty": 0.01, "price": 98.0, "notional": 0.98, "dry_run": False,
+        "status": "canceled", "id": "old-sl", "raw": {},
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "sell", "order_type": "STOP_MARKET",
+        "qty": 0.01, "price": 97.0, "notional": 0.97, "dry_run": False,
+        "status": "placed", "id": "new-sl", "raw": {},
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "sell",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 0.01, "price": 104.0,
+        "notional": 1.04, "dry_run": False, "status": "canceled", "id": "tp", "raw": {},
+    })
+
+    templates = await store.latest_protection_templates("BTCUSDT", dry_run=False)
+
+    assert templates["SL"]["price"] == pytest.approx(97.0)
+    assert templates["TP"]["price"] == pytest.approx(104.0)
+
+
 async def test_snapshot_skips_zero_contracts(store):
     await store.snapshot_positions([{"symbol": "BTC/USDT:USDT", "contracts": 0}])
     assert await _count(store, PositionSnapshotRow) == 0
