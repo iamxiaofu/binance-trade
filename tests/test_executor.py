@@ -39,6 +39,12 @@ class FakeClient:
     async def cancel_all_orders(self, symbol=None):
         return None
 
+    async def cancel_all_condition_orders(self, symbol=None):
+        return None
+
+    async def fetch_open_condition_orders(self, symbol):
+        return []
+
 
 def _decision(**kw):
     base = dict(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
@@ -109,12 +115,50 @@ async def test_sl_tp_live_records_placed_status(settings):
     assert kinds["SL"]["filled"] is False
     assert client.created[0][3] == "stop_market"
     assert client.created[1][3] == "take_profit_market"
+    assert client.created[0][4]["clientAlgoId"].startswith("bt-")
 
 
 async def test_sl_tp_disabled(settings):
     settings.execution.attach_sl_tp = False
     ex = Executor(FakeClient(), settings)
     assert await ex.place_sl_tp(decision=_decision(), entry_price=100.0, qty=0.05) == []
+
+
+class TimeoutButPlacedClient(FakeClient):
+    async def create_order(self, symbol, side, amount, order_type="market", price=None, params=None):
+        self.created.append((symbol, side, amount, order_type, params))
+        raise TimeoutError("backend timeout")
+
+    async def fetch_open_condition_orders(self, symbol):
+        symbol, side, amount, order_type, params = self.created[-1]
+        order_type_upper = "STOP_MARKET" if order_type == "stop_market" else "TAKE_PROFIT_MARKET"
+        return [{
+            "id": "algo-1",
+            "symbol": "BTC/USDT:USDT",
+            "type": order_type_upper,
+            "side": side,
+            "amount": amount,
+            "stopPrice": params["stopPrice"],
+            "status": "open",
+            "reduceOnly": True,
+            "info": {"clientAlgoId": params["clientAlgoId"], "algoStatus": "NEW"},
+        }]
+
+
+async def test_sl_tp_recovers_unknown_create_status(settings):
+    settings.execution.dry_run = False
+    client = TimeoutButPlacedClient()
+    ex = Executor(client, settings)
+
+    out = await ex.place_protection_orders(
+        symbol="BTCUSDT",
+        pos_side="short",
+        qty=0.05,
+        specs=[("SL", "STOP_MARKET", 102.0)],
+    )
+
+    assert out[0]["status"] == "placed"
+    assert out[0]["id"] == "algo-1"
 
 
 async def test_close_position_dry_run(settings):

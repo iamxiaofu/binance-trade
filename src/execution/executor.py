@@ -20,6 +20,7 @@ from loguru import logger
 from src.config.schema import ExecutionConfig, Settings
 from src.exchange.client import ExchangeClient
 from src.exchange.filters import normalize_order
+from src.exchange.orders import normalize_condition_order
 from src.llm.schema import Action, TradeDecision
 
 
@@ -213,11 +214,18 @@ class Executor:
                                        order_type=otype, price=trigger,
                                        notional=qty * trigger, dry_run=True, status="dry_run"))
                 continue
+            client_algo_id = self._protection_client_algo_id(
+                symbol=symbol, kind=kind, side=close_side, qty=qty, trigger=trigger
+            )
             try:
                 order = await self._with_retry(
                     lambda otype=otype, trigger=trigger: self._client.create_order(
                         symbol, close_side, qty, otype.lower(), None,
-                        {"stopPrice": trigger, "reduceOnly": True},
+                        {
+                            "stopPrice": trigger,
+                            "reduceOnly": True,
+                            "clientAlgoId": client_algo_id,
+                        },
                     ),
                     f"{kind} {symbol}",
                 )
@@ -226,11 +234,98 @@ class Executor:
                                        notional=qty * trigger, dry_run=False, status="placed",
                                        order_id=str(order.get("id") or ""), raw=order))
             except Exception as e:
+                recovered = await self._find_matching_condition_order(
+                    symbol=symbol,
+                    kind=kind,
+                    side=close_side,
+                    qty=qty,
+                    trigger=trigger,
+                    client_algo_id=client_algo_id,
+                )
+                if recovered is not None:
+                    logger.warning(
+                        "[{}] {} placement errored but matching live condition order exists id={}",
+                        symbol, kind, recovered.get("id"),
+                    )
+                    results.append(_result(
+                        symbol=symbol,
+                        kind=kind,
+                        side=close_side,
+                        qty=qty,
+                        order_type=otype,
+                        price=trigger,
+                        notional=qty * trigger,
+                        dry_run=False,
+                        status="placed",
+                        order_id=str(recovered.get("id") or ""),
+                        raw=recovered.get("raw") or recovered,
+                    ))
+                    continue
                 logger.error("[{}] place {} failed: {}", symbol, kind, e)
                 results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
                                        order_type=otype, price=trigger, notional=0.0,
-                                       dry_run=False, status="error", raw={"error": str(e)}))
+                                       dry_run=False, status="error",
+                                       raw={"error": str(e), "clientAlgoId": client_algo_id}))
         return results
+
+    @staticmethod
+    def _protection_client_algo_id(
+        *,
+        symbol: str,
+        kind: str,
+        side: str,
+        qty: float,
+        trigger: float,
+    ) -> str:
+        import hashlib
+
+        raw = f"{symbol}:{kind}:{side}:{qty:.12g}:{trigger:.12g}"
+        digest = hashlib.sha1(raw.encode("ascii")).hexdigest()[:22]
+        return f"bt-{digest}"
+
+    async def _find_matching_condition_order(
+        self,
+        *,
+        symbol: str,
+        kind: str,
+        side: str,
+        qty: float,
+        trigger: float,
+        client_algo_id: str,
+    ) -> dict | None:
+        try:
+            orders = await self._client.fetch_open_condition_orders(symbol)
+        except Exception as e:
+            logger.warning("[{}] condition order recovery query failed: {}", symbol, e)
+            return None
+        qty_tol = max(abs(qty) * 1e-6, 1e-12)
+        px_tol = max(abs(trigger) * 1e-8, 1e-8)
+        for raw in orders:
+            order = normalize_condition_order(raw)
+            info = raw.get("info") or {}
+            if client_algo_id and order.get("client_algo_id") == client_algo_id:
+                order["raw"] = raw
+                return order
+            if order.get("kind") != kind:
+                continue
+            if (order.get("side") or "").lower() != side:
+                continue
+            if abs(float(order.get("qty") or 0.0) - qty) > qty_tol:
+                continue
+            if abs(float(order.get("trigger_price") or 0.0) - trigger) > px_tol:
+                continue
+            if str(order.get("status") or "") != "placed":
+                continue
+            if not order.get("reduce_only"):
+                continue
+            order["raw"] = raw
+            if client_algo_id and info.get("clientAlgoId") != client_algo_id:
+                logger.warning(
+                    "[{}] recovered {} by qty/trigger with different clientAlgoId {}",
+                    symbol, kind, info.get("clientAlgoId"),
+                )
+            return order
+        return None
 
     # ---------- 平仓 ----------
     async def close_position(self, position: dict) -> dict:
@@ -290,3 +385,4 @@ class Executor:
             logger.info("[dry-run] cancel_all_orders skipped")
             return
         await self._client.cancel_all_orders()
+        await self._client.cancel_all_condition_orders()

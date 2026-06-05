@@ -157,5 +157,65 @@ class ExchangeClient:
                 logger.warning("cancel_all_orders({}) failed: {}", s, e)
         return results
 
+    async def cancel_condition_order(
+        self,
+        symbol: str,
+        order_id: str,
+        *,
+        client_algo_id: str = "",
+    ) -> Any:
+        """Cancel one USD-M conditional algo order.
+
+        ccxt 的统一 cancel_order 会按 symbol+algoId 走条件单接口；Binance 文档
+        的裸接口只要求 algoId/clientAlgoId。这里保留两条路径，兼容 ccxt 与交易所
+        testnet/mainnet 的实现差异。
+        """
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        errors: list[Exception] = []
+        try:
+            return await self._exchange.cancel_order(
+                order_id, ccxt_sym, params={"conditional": True}
+            )
+        except ccxt.ExchangeError as e:
+            errors.append(e)
+
+        requests: list[dict[str, Any]] = []
+        if client_algo_id:
+            requests.append({"clientAlgoId": client_algo_id})
+            requests.append({"symbol": symbol, "clientAlgoId": client_algo_id})
+        if order_id:
+            requests.append({"algoId": order_id})
+            requests.append({"symbol": symbol, "algoId": order_id})
+        for request in requests:
+            try:
+                return await self._exchange.fapiPrivateDeleteAlgoOrder(request)
+            except ccxt.ExchangeError as e:
+                errors.append(e)
+        raise errors[-1]
+
+    async def cancel_all_condition_orders(self, symbol: str | None = None) -> Any:
+        """Cancel open USD-M conditional algo orders only."""
+        symbols = [symbol] if symbol else list(self._settings.symbols)
+        results = []
+        for s in symbols:
+            if not s:
+                continue
+            ccxt_sym = self._to_ccxt_symbol(s)
+            try:
+                results.append(
+                    await self._exchange.cancel_all_orders(
+                        ccxt_sym, params={"conditional": True}
+                    )
+                )
+            except ccxt.ExchangeError as e:
+                logger.warning("cancel_all_condition_orders({}) ccxt path failed: {}", s, e)
+            try:
+                results.append(
+                    await self._exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": s})
+                )
+            except ccxt.ExchangeError as e:
+                logger.warning("cancel_all_condition_orders({}) direct path failed: {}", s, e)
+        return results
+
     async def close(self) -> None:
         await self._exchange.close()

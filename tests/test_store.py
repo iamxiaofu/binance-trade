@@ -1,6 +1,8 @@
 """store (models+repo) 测试：真实临时 SQLite，验证落库与对账。"""
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -109,7 +111,10 @@ async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):
         rows = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
     by_kind = {r.client_kind: r for r in rows}
     assert by_kind["TP"].status == "filled"
-    assert by_kind["TP"].price == pytest.approx(94.5)
+    assert by_kind["TP"].price == pytest.approx(95.0)
+    raw = json.loads(by_kind["TP"].raw_json)
+    assert raw["trigger_price"] == pytest.approx(95.0)
+    assert raw["filled_price"] == pytest.approx(94.5)
     assert by_kind["SL"].status == "canceled"
 
 
@@ -134,6 +139,22 @@ async def test_latest_protection_templates_returns_latest_sl_tp(store):
 
     assert templates["SL"]["price"] == pytest.approx(97.0)
     assert templates["TP"]["price"] == pytest.approx(104.0)
+
+
+async def test_mark_orders_status_by_exchange_ids(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "sell",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 0.01, "price": 104.0,
+        "notional": 1.04, "dry_run": False, "status": "placed", "id": "tp", "raw": {},
+    })
+
+    changed = await store.mark_orders_status_by_exchange_ids({"tp"}, "canceled")
+
+    assert changed == 1
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        row = (await session.execute(select(OrderRow))).scalar_one()
+    assert row.status == "canceled"
 
 
 async def test_snapshot_skips_zero_contracts(store):

@@ -26,7 +26,7 @@ from src.features.builder import build_context, build_position_snapshot
 from src.llm.client import LLMClient
 from src.llm.schema import Action, MarketContext, TradeDecision
 from src.notify.telegram import Event, Notifier
-from src.risk.manager import RiskContext, validate
+from src.risk.manager import RejectCode, RiskContext, Verdict, validate
 from src.state.runtime import RuntimeState
 from src.store.repo import Store
 from src.throttle.gate import should_call_llm
@@ -284,11 +284,41 @@ class TradingEngine:
                 f"(side={side}, qty={qty}, entry={entry}, mark={mark})"
             )
 
-        active_orders = await self._active_protection_orders(symbol)
         close_side = "sell" if side == "long" else "buy"
+        active_orders = await self._active_protection_orders(symbol)
+        stale_orders = self._stale_protection_orders(
+            active_orders,
+            side=side,
+            close_side=close_side,
+            qty=qty,
+            entry=entry,
+            mark=mark,
+        )
+        if stale_orders:
+            remaining = await self._cancel_stale_condition_orders(
+                symbol=symbol,
+                orders=[order for order, _reason in stale_orders],
+                reason="repair_sl_tp",
+            )
+            if remaining:
+                details = ", ".join(
+                    self._condition_order_label(order) for order in remaining
+                )
+                await self._disable_symbol_due_stale_conditions(symbol, details)
+                raise ValueError(f"{symbol}: 存在无法撤销的陈旧条件单，已禁用该标的新开仓: {details}")
+            active_orders = await self._active_protection_orders(symbol)
+
         missing = [
             kind for kind in ("SL", "TP")
-            if not self._has_active_protection(active_orders, kind, close_side)
+            if not self._has_active_protection(
+                active_orders,
+                kind=kind,
+                close_side=close_side,
+                side=side,
+                qty=qty,
+                entry=entry,
+                mark=mark,
+            )
         ]
         if not missing:
             return f"{symbol}: SL/TP 条件单均已在交易所挂出"
@@ -371,13 +401,191 @@ class TradingEngine:
         )
         return "；".join(parts)
 
-    async def _fetch_exchange_position(self, symbol: str) -> dict | None:
+    async def _fetch_exchange_position_raw(self, symbol: str) -> dict | None:
         positions = await self._client.fetch_positions([symbol])
         for raw in positions:
             pos = normalize_position(raw)
             if pos["symbol"] == symbol and pos["contracts"] > 0:
-                return pos
+                return raw
         return None
+
+    async def _fetch_exchange_position(self, symbol: str) -> dict | None:
+        raw = await self._fetch_exchange_position_raw(symbol)
+        if raw is not None:
+            return normalize_position(raw)
+        return None
+
+    async def _handle_missing_stop_after_open(
+        self,
+        *,
+        decision: TradeDecision,
+        open_result: dict,
+        protection_orders: list[dict],
+    ) -> None:
+        if open_result.get("dry_run"):
+            return
+        if decision.stop_loss_pct <= 0:
+            return
+        has_stop = any(
+            order.get("kind") == "SL"
+            and order.get("status") in ("placed", "dry_run")
+            for order in protection_orders
+        )
+        if has_stop:
+            return
+
+        symbol = decision.symbol
+        await self._disable_symbol_due_protection_failure(
+            symbol, "SL protection was not confirmed after open"
+        )
+        await self._emergency_close_unprotected_position(
+            symbol,
+            reason="missing SL protection after open",
+        )
+
+    async def _disable_symbol_due_protection_failure(self, symbol: str, reason: str) -> None:
+        self._symbol_enabled[symbol] = False
+        await self._store.set_runtime_setting(self._symbol_enabled_key(symbol), "false")
+        logger.error("disabled {} due protection failure: {}", symbol, reason)
+        await self._notifier.send(Event.ERROR, f"{symbol} disabled: {reason}")
+
+    async def _emergency_close_unprotected_position(self, symbol: str, *, reason: str) -> None:
+        try:
+            raw = await self._fetch_exchange_position_raw(symbol)
+        except Exception as e:
+            logger.error("fetch {} position for emergency close failed: {}", symbol, e)
+            await self._notifier.send(Event.ERROR, f"{symbol} emergency close lookup failed: {e}")
+            return
+        if raw is None:
+            logger.warning("{} emergency close skipped, no live position ({})", symbol, reason)
+            return
+        result = await self._executor.close_position(raw)
+        await self._store.log_order(result)
+        if not result.get("filled"):
+            logger.error("{} emergency close failed: {}", symbol, result)
+            await self._notifier.send(Event.ERROR, f"{symbol} emergency close failed: {result}")
+            return
+        pnl = realized_pnl(
+            side=result.get("pos_side", ""),
+            entry_price=result.get("entry_price", 0.0),
+            exit_price=result.get("price", 0.0),
+            qty=result.get("qty", 0.0),
+        )
+        self.runtime.add_realized_pnl(pnl)
+        self.runtime.positions.pop(symbol, None)
+        self.runtime.mark_order_event(symbol)
+        logger.error(
+            "{} emergency closed unprotected position pnl={:.2f} reason={}",
+            symbol, pnl, reason,
+        )
+        await self._notifier.send(
+            Event.CLOSE,
+            f"{symbol} emergency closed unprotected position pnl={pnl:.2f}",
+        )
+
+    async def _stale_condition_open_block_reason(self, decision: TradeDecision) -> str:
+        symbol = decision.symbol
+        try:
+            active_orders = await self._active_protection_orders(symbol)
+        except Exception as e:
+            return f"{symbol}: 无法检查交易所条件单，拒绝新开仓: {e}"
+        if not active_orders:
+            return ""
+
+        position = await self._fetch_exchange_position(symbol)
+        if position is None:
+            details = ", ".join(self._condition_order_label(order) for order in active_orders)
+            await self._disable_symbol_due_stale_conditions(symbol, details)
+            return f"{symbol}: 交易所存在无持仓条件单，已禁用该标的新开仓: {details}"
+
+        side = position["side"]
+        qty = float(position["contracts"] or 0.0)
+        entry = float(position["entry_price"] or 0.0)
+        mark = await self._current_mark_price(symbol, position)
+        close_side = "sell" if side == "long" else "buy"
+        stale = self._stale_protection_orders(
+            active_orders,
+            side=side,
+            close_side=close_side,
+            qty=qty,
+            entry=entry,
+            mark=mark,
+        )
+        if stale:
+            details = ", ".join(
+                f"{self._condition_order_label(order)} ({reason})"
+                for order, reason in stale
+            )
+            await self._disable_symbol_due_stale_conditions(symbol, details)
+            return f"{symbol}: 存在不匹配当前持仓的条件单，已禁用该标的新开仓: {details}"
+
+        return f"{symbol}: 当前持仓已有保护条件单，暂不支持叠加开仓以避免保护数量失配"
+
+    async def _disable_symbol_due_stale_conditions(self, symbol: str, details: str) -> None:
+        self._symbol_enabled[symbol] = False
+        await self._store.set_runtime_setting(self._symbol_enabled_key(symbol), "false")
+        logger.error("disabled {} due stale condition orders: {}", symbol, details)
+        await self._notifier.send(
+            Event.ERROR,
+            f"{symbol} disabled: stale condition orders remain: {details[:180]}",
+        )
+
+    async def _cancel_stale_condition_orders(
+        self,
+        *,
+        symbol: str,
+        orders: list[dict],
+        reason: str,
+    ) -> list[dict]:
+        target_ids = {str(order.get("id") or "") for order in orders if order.get("id")}
+        if not target_ids:
+            return []
+        for order in orders:
+            order_id = str(order.get("id") or "")
+            if not order_id:
+                continue
+            try:
+                await self._client.cancel_condition_order(
+                    symbol,
+                    order_id,
+                    client_algo_id=str(order.get("client_algo_id") or ""),
+                )
+                logger.info("cancel condition order {} {} via {}", symbol, order_id, reason)
+            except Exception as e:
+                logger.warning(
+                    "cancel condition order {} {} via {} failed: {}",
+                    symbol, order_id, reason, e,
+                )
+        await asyncio.sleep(0.5)
+        after = await self._active_protection_orders(symbol)
+        remaining = [order for order in after if str(order.get("id") or "") in target_ids]
+        remaining_ids = {str(order.get("id") or "") for order in remaining}
+        canceled_ids = target_ids - remaining_ids
+        if canceled_ids:
+            await self._store.mark_orders_status_by_exchange_ids(canceled_ids, "canceled")
+        if remaining_ids:
+            await self._store.mark_orders_status_by_exchange_ids(remaining_ids, "placed")
+        return remaining
+
+    async def _cancel_symbol_condition_orders(self, symbol: str, *, reason: str) -> list[dict]:
+        before = await self._active_protection_orders(symbol)
+        before_ids = {str(order.get("id") or "") for order in before if order.get("id")}
+        if not before_ids:
+            return []
+        try:
+            await self._client.cancel_all_condition_orders(symbol)
+            logger.info("cancel all condition orders {} via {}", symbol, reason)
+        except Exception as e:
+            logger.warning("cancel all condition orders {} via {} failed: {}", symbol, reason, e)
+        await asyncio.sleep(0.5)
+        after = await self._active_protection_orders(symbol)
+        remaining_ids = {str(order.get("id") or "") for order in after if order.get("id")}
+        canceled_ids = before_ids - remaining_ids
+        if canceled_ids:
+            await self._store.mark_orders_status_by_exchange_ids(canceled_ids, "canceled")
+        if remaining_ids:
+            await self._store.mark_orders_status_by_exchange_ids(remaining_ids, "placed")
+        return [order for order in after if str(order.get("id") or "") in before_ids]
 
     async def _active_protection_orders(self, symbol: str) -> list[dict]:
         orders = await self._client.fetch_open_condition_orders(symbol)
@@ -389,16 +597,104 @@ class TradingEngine:
                 out.append(order)
         return out
 
-    @staticmethod
-    def _has_active_protection(orders: list[dict], kind: str, close_side: str) -> bool:
+    def _has_active_protection(
+        self,
+        orders: list[dict],
+        *,
+        kind: str,
+        close_side: str,
+        side: str,
+        qty: float,
+        entry: float,
+        mark: float,
+    ) -> bool:
         for order in orders:
-            if order.get("kind") != kind or order.get("status") != "placed":
-                continue
-            side = (order.get("side") or "").lower()
-            if side and side != close_side:
-                continue
-            return True
+            if not self._protection_mismatch_reason(
+                order,
+                kind=kind,
+                close_side=close_side,
+                pos_side=side,
+                qty=qty,
+                entry=entry,
+                mark=mark,
+            ):
+                return True
         return False
+
+    def _stale_protection_orders(
+        self,
+        orders: list[dict],
+        *,
+        side: str,
+        close_side: str,
+        qty: float,
+        entry: float,
+        mark: float,
+    ) -> list[tuple[dict, str]]:
+        stale: list[tuple[dict, str]] = []
+        for order in orders:
+            kind = str(order.get("kind") or "")
+            reason = self._protection_mismatch_reason(
+                order,
+                kind=kind,
+                close_side=close_side,
+                pos_side=side,
+                qty=qty,
+                entry=entry,
+                mark=mark,
+            )
+            if reason:
+                stale.append((order, reason))
+        return stale
+
+    @staticmethod
+    def _condition_order_label(order: dict) -> str:
+        return (
+            f"{order.get('symbol')}:{order.get('kind')}#{order.get('id')} "
+            f"qty={float(order.get('qty') or 0.0):g} "
+            f"trigger={float(order.get('trigger_price') or 0.0):g}"
+        )
+
+    @staticmethod
+    def _protection_mismatch_reason(
+        order: dict,
+        *,
+        kind: str,
+        close_side: str,
+        pos_side: str,
+        qty: float,
+        entry: float,
+        mark: float,
+    ) -> str:
+        if order.get("kind") != kind:
+            return "kind mismatch"
+        if order.get("status") != "placed":
+            return "not placed"
+        if not order.get("reduce_only"):
+            return "not reduceOnly"
+        side = (order.get("side") or "").lower()
+        if side and side != close_side:
+            return f"side {side} != close side {close_side}"
+        order_qty = float(order.get("qty") or 0.0)
+        qty_tol = max(abs(qty) * 1e-6, 1e-12)
+        if order_qty <= 0 or abs(order_qty - qty) > qty_tol:
+            return f"qty {order_qty:g} != position qty {qty:g}"
+        trigger = float(order.get("trigger_price") or 0.0)
+        if trigger <= 0 or entry <= 0 or mark <= 0:
+            return "invalid trigger/entry/mark"
+        if pos_side == "long":
+            if kind == "SL" and not (trigger < mark and trigger < entry):
+                return f"long SL trigger {trigger:g} not below mark/entry"
+            if kind == "TP" and not (trigger > mark and trigger > entry):
+                return f"long TP trigger {trigger:g} not above mark/entry"
+        elif pos_side == "short":
+            if kind == "SL" and not (trigger > mark and trigger > entry):
+                return f"short SL trigger {trigger:g} not above mark/entry"
+            if kind == "TP" and not (trigger < mark and trigger < entry):
+                return f"short TP trigger {trigger:g} not below mark/entry"
+        else:
+            return f"unknown position side {pos_side}"
+        return ""
 
     async def _current_mark_price(self, symbol: str, position: dict) -> float:
         mark = float(position.get("mark_price") or 0.0)
@@ -610,6 +906,14 @@ class TradingEngine:
             await self._notifier.send(Event.REJECT, f"{symbol} {verdict.reason}")
             return
 
+        stale_reason = await self._stale_condition_open_block_reason(decision)
+        if stale_reason:
+            verdict = Verdict.reject(RejectCode.STALE_CONDITION_ORDER, stale_reason)
+            logger.warning("[reject] {} {}", symbol, verdict.reason)
+            await self._store.log_reject(symbol=symbol, verdict=verdict, decision=decision)
+            await self._notifier.send(Event.REJECT, f"{symbol} {verdict.reason}")
+            return
+
         # 4. 执行（精度规整在 executor 内）
         result = await self._executor.open_position(
             decision=decision, qty=verdict.qty, price=ctx.last_price
@@ -630,6 +934,11 @@ class TradingEngine:
                 )
                 for o in sltp:
                     await self._store.log_order(o)
+                await self._handle_missing_stop_after_open(
+                    decision=decision,
+                    open_result=result,
+                    protection_orders=sltp,
+                )
 
     async def _handle_close(self, symbol: str) -> None:
         raw = self.runtime.positions.get(symbol)
@@ -650,6 +959,15 @@ class TradingEngine:
             # 已显式平仓：从运行态移除，避免 _snapshot 的差异检测重复计账
             self.runtime.positions.pop(symbol, None)
             self.runtime.mark_order_event(symbol)
+            if not result.get("dry_run"):
+                remaining = await self._cancel_symbol_condition_orders(
+                    symbol, reason="explicit_close"
+                )
+                if remaining:
+                    details = ", ".join(
+                        self._condition_order_label(order) for order in remaining
+                    )
+                    await self._disable_symbol_due_stale_conditions(symbol, details)
             await self._notifier.send(
                 Event.CLOSE,
                 f"{symbol} closed pnl={pnl:.2f} day_pnl={self.runtime.day_realized_pnl:.2f} "
@@ -715,13 +1033,17 @@ class TradingEngine:
             return []
 
     async def _fetch_open_orders_safe(self) -> list[dict]:
-        """启动对账用：拉取所有 symbol 的未完成挂单，失败返回空列表。"""
+        """启动对账用：拉取普通未完成单和条件单，失败跳过单个 symbol。"""
         out: list[dict] = []
         for sym in self._settings.symbols:
             try:
                 out.extend(await self._client.fetch_open_orders(sym))
             except Exception as e:
                 logger.warning("fetch open orders failed {}: {}", sym, e)
+            try:
+                out.extend(await self._client.fetch_open_condition_orders(sym))
+            except Exception as e:
+                logger.warning("fetch open condition orders failed {}: {}", sym, e)
         return out
 
     async def _snapshot(self) -> None:
@@ -740,7 +1062,17 @@ class TradingEngine:
         self.runtime.positions = new_positions
         await self._store.snapshot_positions(positions, symbols=self._settings.symbols)
         for exit_event in condition_exits:
+            remaining = await self._cancel_symbol_condition_orders(
+                exit_event["symbol"], reason="external_close"
+            )
             await self._store.mark_condition_exit(**exit_event)
+            if remaining:
+                remaining_ids = {
+                    str(order.get("id") or "") for order in remaining if order.get("id")
+                }
+                await self._store.mark_orders_status_by_exchange_ids(remaining_ids, "placed")
+                details = ", ".join(self._condition_order_label(order) for order in remaining)
+                await self._disable_symbol_due_stale_conditions(exit_event["symbol"], details)
         try:
             bal = await self._client.fetch_balance()
             total = (bal.get("total") or {}).get(self._settings.account.quote_asset) or 0.0

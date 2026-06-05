@@ -29,6 +29,7 @@ class RejectCode(str, Enum):
     INSUFFICIENT_MARGIN = "INSUFFICIENT_MARGIN"
     LIQ_DISTANCE = "LIQ_DISTANCE"              # 强平价距离过近
     INVALID_SIZE = "INVALID_SIZE"              # size_pct<=0 等
+    STALE_CONDITION_ORDER = "STALE_CONDITION_ORDER"  # 交易所残留陈旧条件单
 
 
 @dataclass(frozen=True)

@@ -25,6 +25,14 @@ def _float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def _bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "y")
+    return bool(val)
+
+
 def _status(order: Mapping[str, Any], info: Mapping[str, Any]) -> str:
     raw = str(_value(order, info, "status", "algoStatus") or "").lower()
     return {
@@ -72,7 +80,8 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
         "trigger_price": trigger,
         "status": _status(o, info),
         "raw_status": str(_value(o, info, "status", "algoStatus") or ""),
-        "reduce_only": bool(_value(o, info, "reduceOnly")),
+        "reduce_only": _bool(_value(o, info, "reduceOnly")),
+        "client_algo_id": str(_value(o, info, "clientAlgoId") or ""),
         "position_side": str(_value(o, info, "positionSide") or ""),
         "ts_ms": ts_ms,
     }

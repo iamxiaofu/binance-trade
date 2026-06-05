@@ -128,6 +128,26 @@ class Store:
             row.raw_json = ""
         await self._add(row)
 
+    async def mark_orders_status_by_exchange_ids(
+        self,
+        exchange_order_ids: list[str] | set[str],
+        status: str,
+    ) -> int:
+        """按交易所订单 id 批量更新本地订单状态，返回更新行数。"""
+        ids = [str(x) for x in exchange_order_ids if str(x)]
+        if not ids:
+            return 0
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(OrderRow).where(OrderRow.exchange_order_id.in_(ids))
+                )
+            ).scalars().all()
+            for row in rows:
+                row.status = status
+            await session.commit()
+            return len(rows)
+
     # ---------- 快照 ----------
     async def snapshot_positions(
         self,
@@ -193,13 +213,28 @@ class Store:
                 )
             ).scalars().all()
             for row in rows:
+                try:
+                    raw = json.loads(row.raw_json or "{}")
+                    if not isinstance(raw, dict):
+                        raw = {"raw": raw}
+                except Exception:
+                    raw = {}
                 if row.client_kind == triggered_kind:
                     row.status = "filled"
                     if qty > 0:
                         row.qty = qty
+                    raw["trigger_price"] = row.price
+                    raw["filled_price"] = price
+                    raw["filled_qty"] = qty
+                    raw["condition_exit_kind"] = triggered_kind
+                    try:
+                        row.raw_json = json.dumps(raw, default=str)[:8000]
+                    except Exception:
+                        pass
                     if price > 0:
-                        row.price = price
-                    row.notional = abs((row.qty or 0.0) * (row.price or 0.0))
+                        row.notional = abs((row.qty or 0.0) * price)
+                    else:
+                        row.notional = abs((row.qty or 0.0) * (row.price or 0.0))
                 elif row.status in ("placed", "open", "filled"):
                     row.status = "canceled"
             await session.commit()
@@ -321,6 +356,13 @@ class Store:
     # ---------- 未完成挂单 ----------
     async def snapshot_open_orders(self, orders: list[dict]) -> None:
         """落库一批未完成挂单（ccxt order dict）。"""
+        def _as_bool(val: Any) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.strip().lower() in ("1", "true", "yes", "y")
+            return bool(val)
+
         async with self._sessionmaker() as session:
             for o in orders:
                 info = o.get("info") or {}
@@ -334,7 +376,7 @@ class Store:
                         qty=float(o.get("amount") or 0),
                         price=float(o.get("price") or 0) if o.get("price") else 0.0,
                         stop_price=float(stop or 0),
-                        reduce_only=bool(o.get("reduceOnly") or info.get("reduceOnly")),
+                        reduce_only=_as_bool(o.get("reduceOnly") or info.get("reduceOnly")),
                         status=str(o.get("status") or ""),
                         raw_json=json.dumps(info, default=str)[:8000],
                     )
