@@ -64,9 +64,12 @@ function commandLabel(name) {
   }[name] || name
 }
 
+const strategyPaused = computed(() => Boolean(cfg.value?.strategy_paused))
+
 const symbolRows = computed(() => (cfg.value?.symbols || []).map((symbol) => ({
   symbol,
   enabled: cfg.value?.symbol_enabled?.[symbol] !== false,
+  strategyPaused: strategyPaused.value,
   hasPosition: (live.positions || []).some((p) =>
     p.symbol === symbol && Number(p.contracts || 0) > 0
   ),
@@ -115,12 +118,21 @@ onMounted(refreshAll)
         <el-card shadow="never">
           <template #header>策略状态</template>
           <el-space direction="vertical" :size="14" fill style="width:100%">
+            <div v-if="cfg">
+              当前：
+              <el-tag :type="strategyPaused ? 'warning' : 'success'" effect="dark">
+                {{ strategyPaused ? '已暂停' : '运行中' }}
+              </el-tag>
+              <el-tag size="small" style="margin-left:8px">
+                {{ cfg.strategy_status_source === 'runtime' ? '运行时持久化' : '默认状态' }}
+              </el-tag>
+            </div>
             <div style="display:flex; gap:12px">
-              <el-button type="warning" :loading="loading" style="flex:1"
+              <el-button type="warning" :loading="loading" :disabled="strategyPaused" style="flex:1"
                          :icon="'VideoPause'" @click="send('PAUSE')">
                 暂停策略
               </el-button>
-              <el-button type="success" :loading="loading" style="flex:1"
+              <el-button type="success" :loading="loading" :disabled="!strategyPaused" style="flex:1"
                          :icon="'VideoPlay'" @click="send('RESUME')">
                 恢复策略
               </el-button>
@@ -218,8 +230,11 @@ onMounted(refreshAll)
         </el-table-column>
         <el-table-column label="LLM 调用" width="120">
           <template #default="{ row }">
-            <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
-              {{ row.enabled ? '允许' : '禁止' }}
+            <el-tag
+              :type="row.strategyPaused ? 'warning' : row.enabled ? 'success' : 'info'"
+              size="small"
+            >
+              {{ row.strategyPaused ? '策略暂停' : row.enabled ? '允许' : '禁止' }}
             </el-tag>
           </template>
         </el-table-column>

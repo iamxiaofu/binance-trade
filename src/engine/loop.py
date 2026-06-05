@@ -158,11 +158,13 @@ class TradingEngine:
             return "kill switch executed (cancel+flatten+stop)"
         if name == "PAUSE":
             self.runtime.halt_new_entries = True
+            await self._store.set_runtime_setting("strategy.paused", "true")
             await self._notifier.send(Event.CIRCUIT_BREAK, "paused via web (no new entries)")
-            return "strategy paused"
+            return "strategy paused (persisted)"
         if name == "RESUME":
             self.runtime.halt_new_entries = False
-            return "strategy resumed"
+            await self._store.set_runtime_setting("strategy.paused", "false")
+            return "strategy resumed (persisted)"
         if name == "SET_DRY_RUN":
             val = arg.strip().lower() in ("1", "true", "yes", "on")
             self._settings.execution.dry_run = val
@@ -190,6 +192,13 @@ class TradingEngine:
             val = raw.strip().lower() in ("1", "true", "yes", "on")
             self._settings.execution.dry_run = val
             logger.info("runtime setting applied: execution.dry_run={}", val)
+        raw_paused = await self._store.get_runtime_setting("strategy.paused")
+        if raw_paused is None:
+            await self._store.set_runtime_setting("strategy.paused", "false")
+        else:
+            paused = raw_paused.strip().lower() in ("1", "true", "yes", "on")
+            self.runtime.halt_new_entries = paused
+            logger.info("runtime setting applied: strategy.paused={}", paused)
         for symbol in self._settings.symbols:
             key = self._symbol_enabled_key(symbol)
             raw_enabled = await self._store.get_runtime_setting(key)
@@ -224,6 +233,7 @@ class TradingEngine:
     async def _cancel_and_flatten(self, source: str) -> str:
         """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
         self.runtime.halt_new_entries = True
+        await self._store.set_runtime_setting("strategy.paused", "true")
         await self._executor.cancel_all_orders()
         results = await self._executor.flatten_all()
         closed = 0

@@ -284,12 +284,14 @@ async def test_command_pause_resume(settings, creds, monkeypatch):
     eng._store.pending = [{"id": 1, "command": "PAUSE", "arg": ""}]
     await eng._process_commands()
     assert eng.runtime.halt_new_entries is True
-    assert eng._store.marked == [(1, "done", "strategy paused")]
+    assert eng._store.runtime_settings["strategy.paused"] == "true"
+    assert eng._store.marked == [(1, "done", "strategy paused (persisted)")]
 
     eng._store.pending = [{"id": 2, "command": "RESUME", "arg": ""}]
     await eng._process_commands()
     assert eng.runtime.halt_new_entries is False
-    assert eng._store.marked[-1] == (2, "done", "strategy resumed")
+    assert eng._store.runtime_settings["strategy.paused"] == "false"
+    assert eng._store.marked[-1] == (2, "done", "strategy resumed (persisted)")
 
 
 async def test_command_set_dry_run(settings, creds, monkeypatch):
@@ -314,6 +316,13 @@ async def test_runtime_symbol_enabled_applied_on_startup(settings, creds, monkey
     eng._store.runtime_settings["symbol.enabled.BTCUSDT"] = "false"
     await eng._apply_runtime_settings()
     assert eng._symbol_enabled["BTCUSDT"] is False
+
+
+async def test_runtime_strategy_paused_applied_on_startup(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.runtime_settings["strategy.paused"] = "true"
+    await eng._apply_runtime_settings()
+    assert eng.runtime.halt_new_entries is True
 
 
 async def test_command_set_symbol_enabled(settings, creds, monkeypatch):
@@ -343,6 +352,7 @@ async def test_command_cancel_and_flatten_keeps_engine_running(settings, creds, 
     assert eng._executor.canceled == 1
     assert eng._executor.flattened == 1
     assert eng.runtime.halt_new_entries is True
+    assert eng._store.runtime_settings["strategy.paused"] == "true"
     assert eng.runtime.kill_switch is False
     assert eng._stopped.is_set() is False
     assert "flattened 0 positions" in eng._store.marked[0][2]

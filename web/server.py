@@ -138,6 +138,17 @@ async def _effective_dry_run() -> tuple[bool, str]:
     return _settings.execution.dry_run, "config"
 
 
+async def _effective_strategy_paused() -> tuple[bool, str]:
+    try:
+        store = await _get_store()
+        raw = await store.get_runtime_setting("strategy.paused")
+        if raw is not None:
+            return _parse_bool_setting(raw, False), "runtime"
+    except Exception as e:
+        logger.warning("runtime strategy status unavailable, fallback to running: {}", e)
+    return False, "default"
+
+
 async def _effective_symbol_enabled() -> dict[str, bool]:
     out = {symbol: True for symbol in _settings.symbols}
     try:
@@ -318,10 +329,13 @@ async def api_config(_: str = Depends(_check_auth)):
     """暴露非敏感运行配置，供前端展示风控阈值等。"""
     s = _settings
     dry_run, dry_run_source = await _effective_dry_run()
+    strategy_paused, strategy_status_source = await _effective_strategy_paused()
     symbol_enabled = await _effective_symbol_enabled()
     return {
         "mode": s.mode.value,
         "symbols": s.symbols,
+        "strategy_paused": strategy_paused,
+        "strategy_status_source": strategy_status_source,
         "symbol_enabled": symbol_enabled,
         "symbols_state": [
             {"symbol": symbol, "enabled": symbol_enabled.get(symbol, True)}
