@@ -55,6 +55,7 @@ function commandLabel(name) {
   return {
     PAUSE: '暂停策略',
     RESUME: '恢复策略',
+    RESUME_ALL_SYMBOLS: '开启全部币种策略',
     SET_DRY_RUN: '切换下单模式',
     SET_SYMBOL_ENABLED: '切换币种交易',
     REPAIR_SL_TP: '补止盈止损',
@@ -65,6 +66,10 @@ function commandLabel(name) {
 }
 
 const strategyPaused = computed(() => Boolean(cfg.value?.strategy_paused))
+const configuredSymbols = computed(() => cfg.value?.symbols || [])
+const allSymbolsEnabled = computed(() =>
+  configuredSymbols.value.every((symbol) => cfg.value?.symbol_enabled?.[symbol] !== false)
+)
 
 const symbolRows = computed(() => (cfg.value?.symbols || []).map((symbol) => ({
   symbol,
@@ -104,6 +109,23 @@ async function setSymbolEnabled(symbol, enabled) {
   }
 }
 
+async function resumeAllSymbols() {
+  const symbols = configuredSymbols.value.join(', ') || '全部配置币种'
+  try {
+    await ElMessageBox.confirm(
+      `将恢复全局策略并启用全部币种：${symbols}。交易进程会先检查交易所无持仓、无普通挂单、无条件单；检查失败则不会开启。`,
+      '确认开启全部币种策略',
+      {
+        confirmButtonText: '确认开启',
+        cancelButtonText: '取消',
+        type: 'warning',
+        confirmButtonClass: 'el-button--success',
+      }
+    )
+  } catch (_) { return }
+  await send('RESUME_ALL_SYMBOLS')
+}
+
 onMounted(refreshAll)
 </script>
 
@@ -137,6 +159,17 @@ onMounted(refreshAll)
                 恢复策略
               </el-button>
             </div>
+            <el-button
+              type="success"
+              plain
+              :loading="loading"
+              :disabled="!cfg || (!strategyPaused && allSymbolsEnabled)"
+              :icon="'CircleCheckFilled'"
+              style="width:100%"
+              @click="resumeAllSymbols"
+            >
+              开启策略并启用全部币种
+            </el-button>
           </el-space>
         </el-card>
       </el-col>

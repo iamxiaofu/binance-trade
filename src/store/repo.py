@@ -357,14 +357,21 @@ class Store:
     # ---------- 运行时设置 ----------
     async def set_runtime_setting(self, key: str, value: str) -> None:
         """持久化一项运行时设置。"""
+        await self.set_runtime_settings({key: value})
+
+    async def set_runtime_settings(self, settings: dict[str, str]) -> None:
+        """在同一事务内持久化多项运行时设置。"""
         import time as _t
+
+        now = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
         async with self._sessionmaker() as session:
-            row = await session.get(RuntimeSettingRow, key)
-            if row is None:
-                session.add(RuntimeSettingRow(key=key, value=value))
-            else:
-                row.value = value
-                row.updated_at = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
+            for key, value in settings.items():
+                row = await session.get(RuntimeSettingRow, key)
+                if row is None:
+                    session.add(RuntimeSettingRow(key=key, value=value, updated_at=now))
+                else:
+                    row.value = value
+                    row.updated_at = now
             await session.commit()
 
     async def get_runtime_setting(self, key: str) -> str | None:

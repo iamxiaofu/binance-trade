@@ -180,6 +180,8 @@ class TradingEngine:
             self.runtime.halt_new_entries = False
             await self._store.set_runtime_setting("strategy.paused", "false")
             return "strategy resumed (persisted)"
+        if name == "RESUME_ALL_SYMBOLS":
+            return await self._resume_all_symbols()
         if name == "SET_DRY_RUN":
             val = arg.strip().lower() in ("1", "true", "yes", "on")
             self._settings.execution.dry_run = val
@@ -240,6 +242,57 @@ class TradingEngine:
             self._symbol_enabled_key(symbol), str(enabled).lower()
         )
         return f"{symbol} strategy enabled set to {enabled} (persisted)"
+
+    async def _resume_all_symbols(self) -> str:
+        """Resume strategy and enable every configured symbol after a strict live precheck."""
+        await self._assert_exchange_clear_for_resume_all()
+        values = {"strategy.paused": "false"}
+        values.update({
+            self._symbol_enabled_key(symbol): "true"
+            for symbol in self._settings.symbols
+        })
+        await self._store.set_runtime_settings(values)
+        self.runtime.halt_new_entries = False
+        for symbol in self._settings.symbols:
+            self._symbol_enabled[symbol] = True
+        symbols = ", ".join(self._settings.symbols)
+        return (
+            f"strategy resumed; enabled all symbols: {symbols}; "
+            "precheck passed (no live positions/open orders/condition orders)"
+        )
+
+    async def _assert_exchange_clear_for_resume_all(self) -> None:
+        """Block bulk resume unless exchange has no positions and no live orders."""
+        positions = await self._client.fetch_positions(self._settings.symbols)
+        position_labels = []
+        for raw in positions:
+            pos = normalize_position(raw)
+            if pos["contracts"] > 0:
+                position_labels.append(self._position_label(pos))
+
+        open_order_labels = []
+        condition_order_labels = []
+        for symbol in self._settings.symbols:
+            open_orders = await self._client.fetch_open_orders(symbol)
+            open_order_labels.extend(
+                self._open_order_label(symbol, order) for order in open_orders
+            )
+            condition_orders = await self._client.fetch_open_condition_orders(symbol)
+            for raw in condition_orders:
+                order = normalize_condition_order(raw)
+                if not order["symbol"]:
+                    order["symbol"] = symbol
+                condition_order_labels.append(self._condition_order_label(order))
+
+        problems = []
+        if position_labels:
+            problems.append("持仓: " + ", ".join(position_labels))
+        if open_order_labels:
+            problems.append("普通挂单: " + ", ".join(open_order_labels))
+        if condition_order_labels:
+            problems.append("条件单: " + ", ".join(condition_order_labels))
+        if problems:
+            raise ValueError("开启全部币种前检查失败，交易所仍有" + "；".join(problems))
 
     @staticmethod
     def _symbol_enabled_key(symbol: str) -> str:
@@ -663,9 +716,41 @@ class TradingEngine:
         return stale
 
     @staticmethod
-    def _condition_order_label(order: dict) -> str:
+    def _safe_float(value: object) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _position_label(position: dict) -> str:
         return (
-            f"{order.get('symbol')}:{order.get('kind')}#{order.get('id')} "
+            f"{position.get('symbol')}:{position.get('side')} "
+            f"qty={float(position.get('contracts') or 0.0):g} "
+            f"entry={float(position.get('entry_price') or 0.0):g}"
+        )
+
+    @classmethod
+    def _open_order_label(cls, symbol: str, order: dict) -> str:
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        raw_symbol = normalize_symbol(order.get("symbol") or info.get("symbol") or symbol)
+        order_id = str(order.get("id") or info.get("orderId") or "")
+        order_type = str(order.get("type") or info.get("type") or "")
+        side = str(order.get("side") or info.get("side") or "").lower()
+        qty = cls._safe_float(
+            order.get("amount")
+            or order.get("remaining")
+            or info.get("origQty")
+            or info.get("quantity")
+        )
+        price = cls._safe_float(order.get("price") or info.get("price"))
+        return f"{raw_symbol}:{order_type}#{order_id} side={side} qty={qty:g} price={price:g}"
+
+    @staticmethod
+    def _condition_order_label(order: dict) -> str:
+        kind = order.get("kind") or order.get("order_type") or "CONDITION"
+        return (
+            f"{order.get('symbol')}:{kind}#{order.get('id')} "
             f"qty={float(order.get('qty') or 0.0):g} "
             f"trigger={float(order.get('trigger_price') or 0.0):g}"
         )

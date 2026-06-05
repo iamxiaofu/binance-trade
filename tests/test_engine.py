@@ -71,6 +71,9 @@ class FakeStore:
     async def set_runtime_setting(self, key, value):
         self.runtime_settings[key] = value
 
+    async def set_runtime_settings(self, settings):
+        self.runtime_settings.update(settings)
+
     async def get_runtime_setting(self, key):
         return self.runtime_settings.get(key)
 
@@ -548,6 +551,77 @@ async def test_command_set_symbol_enabled(settings, creds, monkeypatch):
     await eng._process_commands()
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+
+
+async def test_command_resume_all_symbols_requires_flat_exchange(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = True
+    eng._symbol_enabled["BTCUSDT"] = False
+    eng._store.runtime_settings["strategy.paused"] = "true"
+    eng._store.runtime_settings["symbol.enabled.BTCUSDT"] = "false"
+    eng._store.pending = [{"id": 1, "command": "RESUME_ALL_SYMBOLS", "arg": ""}]
+
+    await eng._process_commands()
+
+    assert eng.runtime.halt_new_entries is False
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.runtime_settings["strategy.paused"] == "false"
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "true"
+    assert eng._store.marked[0][0:2] == (1, "done")
+    assert "enabled all symbols: BTCUSDT" in eng._store.marked[0][2]
+
+
+async def test_command_resume_all_symbols_fails_with_live_position(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = True
+    eng._symbol_enabled["BTCUSDT"] = False
+    eng._store.runtime_settings["strategy.paused"] = "true"
+    eng._store.runtime_settings["symbol.enabled.BTCUSDT"] = "false"
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+    eng._store.pending = [{"id": 1, "command": "RESUME_ALL_SYMBOLS", "arg": ""}]
+
+    await eng._process_commands()
+
+    assert eng.runtime.halt_new_entries is True
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["strategy.paused"] == "true"
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+    assert eng._store.marked[0][0:2] == (1, "failed")
+    assert "交易所仍有持仓" in eng._store.marked[0][2]
+
+
+async def test_command_resume_all_symbols_fails_with_condition_order(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = True
+    eng._symbol_enabled["BTCUSDT"] = False
+    eng._store.runtime_settings["strategy.paused"] = "true"
+    eng._store.runtime_settings["symbol.enabled.BTCUSDT"] = "false"
+    eng._client.condition_orders = [{
+        "id": "algo-1",
+        "symbol": "BTC/USDT:USDT",
+        "type": "STOP_MARKET",
+        "side": "sell",
+        "amount": 1.0,
+        "stopPrice": 95.0,
+        "status": "open",
+        "reduceOnly": True,
+    }]
+    eng._store.pending = [{"id": 1, "command": "RESUME_ALL_SYMBOLS", "arg": ""}]
+
+    await eng._process_commands()
+
+    assert eng.runtime.halt_new_entries is True
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["strategy.paused"] == "true"
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+    assert eng._store.marked[0][0:2] == (1, "failed")
+    assert "条件单: BTCUSDT:SL#algo-1" in eng._store.marked[0][2]
 
 
 async def test_disabled_symbol_skips_llm(settings, creds, monkeypatch):

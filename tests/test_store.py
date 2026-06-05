@@ -94,6 +94,24 @@ async def test_runtime_settings_upsert_and_list(store):
     assert await store.runtime_settings() == {"execution.dry_run": "false"}
 
 
+async def test_runtime_settings_batch_upsert(store):
+    await store.set_runtime_settings({
+        "strategy.paused": "true",
+        "symbol.enabled.BTCUSDT": "false",
+    })
+    await store.set_runtime_settings({
+        "strategy.paused": "false",
+        "symbol.enabled.ETHUSDT": "true",
+    })
+
+    assert await _count(store, RuntimeSettingRow) == 3
+    assert await store.runtime_settings() == {
+        "strategy.paused": "false",
+        "symbol.enabled.BTCUSDT": "false",
+        "symbol.enabled.ETHUSDT": "true",
+    }
+
+
 async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):
     await store.log_order({
         "symbol": "BTCUSDT", "kind": "SL", "side": "buy", "order_type": "STOP_MARKET",
