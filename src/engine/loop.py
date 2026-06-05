@@ -34,6 +34,7 @@ from src.throttle.gate import should_call_llm
 
 _RECONCILE_ACTIVE_INTERVAL_SECONDS = 15.0
 _RECONCILE_IDLE_INTERVAL_SECONDS = 30.0
+_COMMAND_POLL_INTERVAL_SECONDS = 1.0
 
 
 class TradingEngine:
@@ -115,12 +116,23 @@ class TradingEngine:
 
     async def _sleep_to_next_cycle(self, cycle_start: float) -> None:
         interval = self._settings.cycle.interval_seconds
-        elapsed = time.monotonic() - cycle_start
-        remaining = max(0.0, interval - elapsed)
-        try:
-            await asyncio.wait_for(self._stopped.wait(), timeout=remaining)
-        except asyncio.TimeoutError:
-            pass  # 正常超时即到下一周期
+        while not self.runtime.kill_switch and not self._stopped.is_set():
+            elapsed = time.monotonic() - cycle_start
+            remaining = max(0.0, interval - elapsed)
+            if remaining <= 0:
+                return
+            timeout = min(_COMMAND_POLL_INTERVAL_SECONDS, remaining)
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=timeout)
+                return
+            except asyncio.TimeoutError:
+                pass
+            commands = await self._process_commands()
+            if self.runtime.kill_switch or self._stopped.is_set():
+                return
+            if self._commands_should_wake_strategy(commands):
+                logger.info("wake strategy cycle due command")
+                return
 
     # ---------- 单周期 ----------
     async def _run_cycle(self) -> None:
@@ -141,30 +153,72 @@ class TradingEngine:
                 await self._process_symbol(symbol)
             except Exception as e:
                 logger.exception("process {} failed: {}", symbol, e)
+            await self._process_commands()
+            if self.runtime.kill_switch or self._stopped.is_set():
+                return
+            if self.runtime.halt_new_entries:
+                await self._snapshot()
+                return
 
         # 周期收尾：余额/持仓快照
         await self._snapshot()
 
-    async def _process_commands(self) -> None:
+    async def _process_commands(self) -> list[dict[str, str]]:
         """消费 web 操作面板下发的控制命令（Q1 方案A：解耦命令队列）。
 
         web 进程只写 control_commands 表，绝不直接碰交易所；命令在这里由交易进程
-        串行执行，避免与主循环状态打架。延迟上限为一个周期。
+        串行执行，避免与主循环状态打架。
         """
         try:
             commands = await self._store.fetch_pending_commands()
         except Exception as e:
             logger.warning("fetch commands failed: {}", e)
-            return
+            return []
+        executed: list[dict[str, str]] = []
         for cmd in commands:
             name = cmd["command"]
+            arg = cmd.get("arg", "")
             try:
-                result = await self._exec_command(name, cmd.get("arg", ""))
+                result = await self._exec_command(name, arg)
                 await self._store.mark_command(cmd["id"], "done", result)
                 logger.info("command {} done: {}", name, result)
+                executed.append({
+                    "command": name,
+                    "arg": arg,
+                    "status": "done",
+                    "result": result,
+                })
             except Exception as e:
                 await self._store.mark_command(cmd["id"], "failed", str(e))
                 logger.error("command {} failed: {}", name, e)
+                executed.append({
+                    "command": name,
+                    "arg": arg,
+                    "status": "failed",
+                    "result": str(e),
+                })
+        return executed
+
+    def _commands_should_wake_strategy(self, commands: list[dict[str, str]]) -> bool:
+        for cmd in commands:
+            if cmd.get("status") != "done":
+                continue
+            name = cmd.get("command")
+            if name in ("RESUME", "RESUME_ALL_SYMBOLS"):
+                return True
+            if name == "SET_SYMBOL_ENABLED" and not self.runtime.halt_new_entries:
+                enabled = self._symbol_enabled_arg_value(cmd.get("arg", ""))
+                if enabled is True:
+                    return True
+        return False
+
+    @staticmethod
+    def _symbol_enabled_arg_value(arg: str) -> bool | None:
+        raw = (arg or "").strip()
+        if "=" not in raw:
+            return None
+        _symbol_raw, value_raw = raw.split("=", 1)
+        return value_raw.strip().lower() in ("1", "true", "yes", "on")
 
     async def _exec_command(self, name: str, arg: str) -> str:
         """执行单条命令，返回结果描述。未知命令抛错。"""

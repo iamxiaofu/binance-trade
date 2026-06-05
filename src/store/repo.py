@@ -455,7 +455,7 @@ class Store:
             return row.id
 
     async def fetch_pending_commands(self) -> list[dict]:
-        """取出所有 pending 命令（engine 每周期调用）。返回普通 dict 列表。"""
+        """取出所有 pending 命令（engine 快速轮询）。返回普通 dict 列表。"""
         async with self._sessionmaker() as session:
             rows = (
                 await session.execute(

@@ -153,9 +153,8 @@ class RuntimeSettingRow(Base):
 class ControlCommandRow(Base):
     """Web 操作面板下发的命令队列。
 
-    交易主进程每周期轮询 status='pending' 的命令并执行，执行后置 done/failed。
-    解耦设计：web 进程只写命令，绝不直接碰交易所；命令由交易进程串行消费，
-    不会与主循环状态打架。延迟上限为一个周期。
+    交易主进程轮询 status='pending' 的命令并执行，执行后置 done/failed。
+    解耦设计：web 进程只写命令，绝不直接碰交易所；命令由交易进程串行消费。
     """
     __tablename__ = "control_commands"
 

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import { api } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLiveStore } from '../stores/live'
@@ -38,13 +38,24 @@ async function send(name, arg = '', confirmText = null) {
   loading.value = true
   try {
     const r = await api.command(name, arg)
-    ElMessage.success(`命令已入队 (#${r.id})，交易进程将在下个周期执行`)
+    ElMessage.success(`命令已入队 (#${r.id})，交易进程将尽快执行`)
     await Promise.all([loadCommands(), loadCfg()])
   } catch (e) {
     ElMessage.error(`下发失败: ${e.message}`)
   } finally {
     loading.value = false
   }
+}
+
+function mergeCommands(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return
+  const byId = new Map(commands.value.map((row) => [row.id, row]))
+  rows.forEach((row) => {
+    byId.set(row.id, { ...(byId.get(row.id) || {}), ...row })
+  })
+  commands.value = Array.from(byId.values())
+    .sort((a, b) => Number(b.id || 0) - Number(a.id || 0))
+    .slice(0, 50)
 }
 
 function statusTag(s) {
@@ -127,13 +138,19 @@ async function resumeAllSymbols() {
 }
 
 onMounted(refreshAll)
+
+watch(
+  () => live.summary.recent_commands,
+  (rows) => mergeCommands(rows),
+  { deep: true }
+)
 </script>
 
 <template>
   <div class="page">
     <el-alert type="warning" :closable="false" show-icon style="margin-bottom:16px"
       title="操作说明"
-      description="所有命令写入命令队列，由交易主进程每周期消费执行（最多一个周期延迟）。Web 不直接操作交易所。" />
+      description="所有命令写入命令队列，由交易主进程快速消费执行。Web 不直接操作交易所。" />
 
     <el-row :gutter="16">
       <el-col :span="12">

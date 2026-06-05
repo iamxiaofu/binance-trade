@@ -4,10 +4,12 @@
 """
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 import pytest
 
+import src.engine.loop as engine_loop
 from src.config.schema import Credentials
 from src.engine.loop import TradingEngine
 from src.exchange.filters import SymbolFilters
@@ -512,6 +514,43 @@ async def test_command_pause_resume(settings, creds, monkeypatch):
     assert eng.runtime.halt_new_entries is False
     assert eng._store.runtime_settings["strategy.paused"] == "false"
     assert eng._store.marked[-1] == (2, "done", "strategy resumed (persisted)")
+
+
+async def test_sleep_consumes_resume_and_wakes_strategy(settings, creds, monkeypatch):
+    monkeypatch.setattr(engine_loop, "_COMMAND_POLL_INTERVAL_SECONDS", 0.01)
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = True
+    eng._store.pending = [{"id": 1, "command": "RESUME", "arg": ""}]
+    cycle_start = time.monotonic() - (settings.cycle.interval_seconds - 1.0)
+
+    started = time.monotonic()
+    await eng._sleep_to_next_cycle(cycle_start)
+
+    assert time.monotonic() - started < 0.2
+    assert eng.runtime.halt_new_entries is False
+    assert eng._store.runtime_settings["strategy.paused"] == "false"
+    assert eng._store.marked == [(1, "done", "strategy resumed (persisted)")]
+
+
+async def test_sleep_consumes_symbol_enable_and_wakes_when_running(settings, creds, monkeypatch):
+    monkeypatch.setattr(engine_loop, "_COMMAND_POLL_INTERVAL_SECONDS", 0.01)
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = False
+    eng._symbol_enabled["BTCUSDT"] = False
+    eng._store.pending = [{
+        "id": 1,
+        "command": "SET_SYMBOL_ENABLED",
+        "arg": "BTCUSDT=true",
+    }]
+    cycle_start = time.monotonic() - (settings.cycle.interval_seconds - 1.0)
+
+    started = time.monotonic()
+    await eng._sleep_to_next_cycle(cycle_start)
+
+    assert time.monotonic() - started < 0.2
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "true"
+    assert eng._store.marked[0][0:2] == (1, "done")
 
 
 async def test_command_set_dry_run(settings, creds, monkeypatch):

@@ -3,7 +3,7 @@
 安全与解耦原则：
 - 独立进程，与交易主进程分离；只读 SQLite（status.py）+ 只读交易所行情。
 - 操作类命令（Kill Switch / 暂停 / dry_run 切换）只写 control_commands 表，
-  由交易进程每周期消费执行；web 绝不直接碰交易所下单。
+  由交易进程快速消费执行；web 绝不直接碰交易所下单。
 - 全站 HTTP Basic Auth；WS 握手复用同源 Basic 凭证。
 
 启动：
@@ -431,7 +431,7 @@ _ALLOWED_COMMANDS = {
 
 @app.post("/api/command/{name}")
 async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)):
-    """下发控制命令。交易进程每周期消费执行（最多一个周期延迟）。"""
+    """下发控制命令。交易进程快速消费执行。"""
     name = name.upper()
     if name not in _ALLOWED_COMMANDS:
         raise HTTPException(status_code=400, detail=f"unknown command: {name}")
@@ -439,7 +439,7 @@ async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)
     cmd_id = await store.enqueue_command(name, arg=arg, source=f"web:{user}")
     logger.warning("web command queued: {} arg={} by={} id={}", name, arg, user, cmd_id)
     return {"queued": True, "id": cmd_id, "command": name,
-            "note": "交易进程将在下个周期内执行"}
+            "note": "交易进程将尽快消费执行"}
 
 
 # ---------- WebSocket：实时推送 ----------

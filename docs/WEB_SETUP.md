@@ -122,8 +122,10 @@ REST/WS 接口（`web/server.py`）：
 ## 8. 操作命令如何生效（关键架构）
 
 Web **不直接操作交易所**。操作面板的命令写入 SQLite 的 `control_commands` 表，
-交易主进程（engine/loop）**每周期开头**轮询并执行（`_process_commands`），
-执行后回写 done/failed。延迟上限 = 一个决策周期。Kill Switch 仍保留命令行兜底：
+交易主进程（engine/loop）快速轮询并执行（`_process_commands`），执行后回写
+done/failed。交易主循环在 5 分钟策略周期的睡眠期间会 1 秒级检查命令；
+`RESUME`、`RESUME_ALL_SYMBOLS` 以及运行中启用币种成功后会唤醒下一轮策略。
+Kill Switch 仍保留命令行兜底：
 `python main.py kill-switch`。
 
 ## 9. 排障
