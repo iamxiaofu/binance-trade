@@ -40,6 +40,9 @@ class FakeStore:
         self.runtime_settings = {}
         self.pending = []          # 待执行命令
         self.marked = []           # (id, status, result)
+        self.position_snapshots = []
+        self.balance_snapshots = []
+        self.open_order_snapshots = []
 
     async def log_decision(self, **kw):
         self.decisions.append(kw)
@@ -51,10 +54,10 @@ class FakeStore:
         self.orders.append(order)
 
     async def snapshot_positions(self, positions, symbols=None):
-        pass
+        self.position_snapshots.append((positions, symbols))
 
     async def snapshot_balance(self, **kw):
-        pass
+        self.balance_snapshots.append(kw)
 
     async def mark_condition_exit(self, **kw):
         self.condition_exits.append(kw)
@@ -81,6 +84,12 @@ class FakeStore:
     async def mark_orders_status_by_exchange_ids(self, exchange_order_ids, status):
         return 0
 
+    async def mark_symbol_conditions_not_live(self, symbol, live_exchange_order_ids, status="canceled"):
+        return 0
+
+    async def snapshot_open_orders(self, orders):
+        self.open_order_snapshots.append(orders)
+
 
 class FakeClient:
     def __init__(self):
@@ -88,6 +97,7 @@ class FakeClient:
         self.condition_orders = []
         self.positions = []
         self.canceled_condition_symbols = []
+        self.canceled_condition_orders = []
 
     async def fetch_open_orders(self, symbol=None):
         return self.open_orders
@@ -97,6 +107,15 @@ class FakeClient:
 
     async def fetch_positions(self, symbols=None):
         return self.positions
+
+    async def fetch_balance(self):
+        return {"total": {"USDT": 200.0}, "free": {"USDT": 200.0}}
+
+    async def fetch_ticker(self, symbol):
+        return {"mark": 100.0, "last": 100.0}
+
+    async def cancel_condition_order(self, symbol, order_id, *, client_algo_id=""):
+        self.canceled_condition_orders.append((symbol, order_id, client_algo_id))
 
     async def cancel_all_condition_orders(self, symbol=None):
         self.canceled_condition_symbols.append(symbol)
@@ -221,6 +240,63 @@ async def test_no_breaker_under_limits(settings, creds, monkeypatch):
     eng.runtime.drawdown_pct = 1.0
     assert await eng._check_circuit_breaker() is False
     assert eng._executor.flattened == 0
+
+
+async def test_paused_cycle_still_snapshots(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = True
+
+    async def refresh_all():
+        return None
+    monkeypatch.setattr(eng._market, "refresh_all", refresh_all)
+
+    await eng._run_cycle()
+
+    assert eng._store.position_snapshots
+    assert eng._store.balance_snapshots
+
+
+async def test_record_balance_snapshot_updates_runtime(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+
+    await eng._record_balance_snapshot({"total": {"USDT": 321.0}, "free": {"USDT": 300.0}})
+
+    assert eng.runtime.current_equity == pytest.approx(321.0)
+    assert eng._store.balance_snapshots[0]["total_equity"] == pytest.approx(321.0)
+    assert eng._store.balance_snapshots[0]["available_margin"] == pytest.approx(300.0)
+
+
+async def test_sync_open_orders_includes_condition_orders(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.open_orders = [
+        {"id": "limit-1", "symbol": "BTC/USDT:USDT", "type": "limit", "status": "open"},
+    ]
+    eng._client.condition_orders = [
+        {"id": "tp-1", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+         "side": "sell", "amount": 0.1, "stopPrice": 105.0, "status": "open",
+         "reduceOnly": True},
+    ]
+
+    await eng._sync_open_orders_snapshot()
+
+    assert len(eng.runtime.open_orders["BTCUSDT"]) == 2
+    assert len(eng._store.open_order_snapshots[0]) == 2
+
+
+async def test_reconcile_disables_symbol_when_stale_condition_remains(settings, creds, monkeypatch):
+    settings.execution.dry_run = False
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.condition_orders = [
+        {"id": "tp-old", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+         "side": "buy", "amount": 0.5, "stopPrice": 95.0, "status": "open",
+         "reduceOnly": True},
+    ]
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert eng._client.canceled_condition_orders
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
 
 
 async def test_skip_logs_decision(settings, creds, monkeypatch):

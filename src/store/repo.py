@@ -148,6 +148,32 @@ class Store:
             await session.commit()
             return len(rows)
 
+    async def mark_symbol_conditions_not_live(
+        self,
+        symbol: str,
+        live_exchange_order_ids: set[str],
+        status: str = "canceled",
+    ) -> int:
+        """无持仓对账时，把交易所已不在 open 列表的本地条件单更新为终态。"""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            stmt = (
+                select(OrderRow)
+                .where(OrderRow.symbol == symbol)
+                .where(OrderRow.client_kind.in_(("SL", "TP")))
+                .where(OrderRow.dry_run.is_(False))
+                .where(OrderRow.status.in_(("placed", "open")))
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            changed = 0
+            for row in rows:
+                if row.exchange_order_id and row.exchange_order_id in live_exchange_order_ids:
+                    continue
+                row.status = status
+                changed += 1
+            await session.commit()
+            return changed
+
     # ---------- 快照 ----------
     async def snapshot_positions(
         self,

@@ -32,6 +32,10 @@ from src.store.repo import Store
 from src.throttle.gate import should_call_llm
 
 
+_RECONCILE_ACTIVE_INTERVAL_SECONDS = 15.0
+_RECONCILE_IDLE_INTERVAL_SECONDS = 30.0
+
+
 class TradingEngine:
     def __init__(self, settings: Settings, creds: Credentials):
         self._settings = settings
@@ -47,6 +51,8 @@ class TradingEngine:
         self._symbol_enabled = {symbol: True for symbol in settings.symbols}
         self.runtime = RuntimeState()
         self._stopped = asyncio.Event()
+        self._state_sync_lock = asyncio.Lock()
+        self._reconcile_task: asyncio.Task | None = None
 
     # ---------- 生命周期 ----------
     async def startup(self) -> None:
@@ -67,16 +73,24 @@ class TradingEngine:
         # 启动即拉一次权益，确保第一个周期的风控/上限基于真实权益而非退回保证金
         try:
             bal = await self._client.fetch_balance()
-            total = (bal.get("total") or {}).get(self._settings.account.quote_asset)
-            if total is not None:
-                self.runtime.update_equity(float(total))
+            await self._record_balance_snapshot(bal)
         except Exception as e:
             logger.warning("startup equity fetch failed: {}", e)
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_loop(), name="exchange-reconciler"
+        )
         logger.info("engine started (mode={}, dry_run={}, equity={:.2f})",
                     self._settings.mode.value, self._settings.execution.dry_run,
                     self.runtime.current_equity)
 
     async def shutdown(self) -> None:
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_task = None
         await self._market.stop()
         await self._llm.close()
         await self._notifier.close()
@@ -118,6 +132,7 @@ class TradingEngine:
 
         # 0. 全局熔断（最高优先级）：日亏 / 回撤
         if await self._check_circuit_breaker():
+            await self._snapshot()
             return
 
         # 逐 symbol 处理
@@ -1046,6 +1061,115 @@ class TradingEngine:
                 logger.warning("fetch open condition orders failed {}: {}", sym, e)
         return out
 
+    async def _reconcile_loop(self) -> None:
+        """独立交易所对账循环。paused 时也运行，避免页面和 runtime 变成旧状态。"""
+        while not self.runtime.kill_switch and not self._stopped.is_set():
+            interval = (
+                _RECONCILE_ACTIVE_INTERVAL_SECONDS
+                if self.runtime.positions
+                else _RECONCILE_IDLE_INTERVAL_SECONDS
+            )
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._reconcile_exchange_state("periodic")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("periodic exchange reconcile failed: {}", e)
+
+    async def _reconcile_exchange_state(self, reason: str) -> None:
+        """同步交易所当前状态，并执行保护单不变量检查。"""
+        logger.debug("exchange reconcile start: {}", reason)
+        await self._snapshot()
+        await self._sync_open_orders_snapshot()
+        await self._enforce_exchange_invariants(reason)
+
+    async def _sync_open_orders_snapshot(self) -> None:
+        orders = await self._fetch_open_orders_safe()
+        self.runtime.open_orders = {}
+        for order in orders:
+            sym = normalize_symbol(order.get("symbol"))
+            self.runtime.open_orders.setdefault(sym, []).append(order)
+        if orders:
+            await self._store.snapshot_open_orders(orders)
+
+    async def _enforce_exchange_invariants(self, reason: str) -> None:
+        positions = {
+            normalize_position(raw)["symbol"]: normalize_position(raw)
+            for raw in await self._client.fetch_positions(self._settings.symbols)
+            if normalize_position(raw)["contracts"] > 0
+        }
+        for symbol in self._settings.symbols:
+            try:
+                active_orders = await self._active_protection_orders(symbol)
+            except Exception as e:
+                logger.warning("reconcile {} active protection query failed: {}", symbol, e)
+                continue
+            position = positions.get(symbol)
+            if position is None:
+                live_ids = {str(order.get("id") or "") for order in active_orders}
+                await self._store.mark_symbol_conditions_not_live(symbol, live_ids)
+                if active_orders and self._symbol_enabled.get(symbol, True):
+                    remaining = await self._cancel_stale_condition_orders(
+                        symbol=symbol,
+                        orders=active_orders,
+                        reason=reason,
+                    )
+                    if remaining:
+                        details = ", ".join(
+                            self._condition_order_label(order) for order in remaining
+                        )
+                        await self._disable_symbol_due_stale_conditions(symbol, details)
+                continue
+
+            side = position["side"]
+            qty = float(position["contracts"] or 0.0)
+            entry = float(position["entry_price"] or 0.0)
+            mark = await self._current_mark_price(symbol, position)
+            close_side = "sell" if side == "long" else "buy"
+            stale = self._stale_protection_orders(
+                active_orders,
+                side=side,
+                close_side=close_side,
+                qty=qty,
+                entry=entry,
+                mark=mark,
+            )
+            if stale:
+                remaining = await self._cancel_stale_condition_orders(
+                    symbol=symbol,
+                    orders=[order for order, _reason in stale],
+                    reason=reason,
+                )
+                if remaining:
+                    details = ", ".join(
+                        self._condition_order_label(order) for order in remaining
+                    )
+                    await self._disable_symbol_due_stale_conditions(symbol, details)
+                active_orders = await self._active_protection_orders(symbol)
+            has_stop = self._has_active_protection(
+                active_orders,
+                kind="SL",
+                close_side=close_side,
+                side=side,
+                qty=qty,
+                entry=entry,
+                mark=mark,
+            )
+            if not has_stop and not self._settings.execution.dry_run:
+                await self._disable_symbol_due_protection_failure(
+                    symbol,
+                    f"SL protection missing during exchange reconcile ({reason})",
+                )
+                await self._emergency_close_unprotected_position(
+                    symbol,
+                    reason=f"missing SL during exchange reconcile ({reason})",
+                )
+
     async def _snapshot(self) -> None:
         """刷新持仓/余额快照，更新运行态权益与回撤。
 
@@ -1053,6 +1177,10 @@ class TradingEngine:
         用「入场价 vs 最后已知标记价」估算其已实现盈亏并累加（驱动日亏熔断）。
         显式 CLOSE 已在 _handle_close 计账并从 runtime.positions 移除，不会重复。
         """
+        async with self._state_sync_lock:
+            await self._snapshot_unlocked()
+
+    async def _snapshot_unlocked(self) -> None:
         prev_positions = dict(self.runtime.positions)
         positions = await self._fetch_positions_safe()
         new_positions = {
@@ -1075,16 +1203,21 @@ class TradingEngine:
                 await self._disable_symbol_due_stale_conditions(exit_event["symbol"], details)
         try:
             bal = await self._client.fetch_balance()
-            total = (bal.get("total") or {}).get(self._settings.account.quote_asset) or 0.0
-            free = (bal.get("free") or {}).get(self._settings.account.quote_asset) or 0.0
-            total = float(total)
-            self.runtime.update_equity(total)
-            await self._store.snapshot_balance(
-                total_equity=total, available_margin=float(free), runtime=self.runtime,
-                quote_asset=self._settings.account.quote_asset,
-            )
+            await self._record_balance_snapshot(bal)
         except Exception as e:
             logger.warning("balance snapshot failed: {}", e)
+
+    async def _record_balance_snapshot(self, balance: dict) -> None:
+        total = (balance.get("total") or {}).get(self._settings.account.quote_asset) or 0.0
+        free = (balance.get("free") or {}).get(self._settings.account.quote_asset) or 0.0
+        total = float(total)
+        self.runtime.update_equity(total)
+        await self._store.snapshot_balance(
+            total_equity=total,
+            available_margin=float(free),
+            runtime=self.runtime,
+            quote_asset=self._settings.account.quote_asset,
+        )
 
     def _detect_external_closes(self, prev: dict[str, dict], curr: dict[str, dict]) -> list[dict]:
         """对比前后持仓，对消失的持仓估算已实现盈亏并累加。

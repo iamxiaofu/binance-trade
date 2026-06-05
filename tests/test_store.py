@@ -157,6 +157,31 @@ async def test_mark_orders_status_by_exchange_ids(store):
     assert row.status == "canceled"
 
 
+async def test_mark_symbol_conditions_not_live(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "sell",
+        "order_type": "STOP_MARKET", "qty": 0.01, "price": 98.0,
+        "notional": 0.98, "dry_run": False, "status": "placed",
+        "id": "live-sl", "raw": {},
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "sell",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 0.01, "price": 104.0,
+        "notional": 1.04, "dry_run": False, "status": "placed",
+        "id": "gone-tp", "raw": {},
+    })
+
+    changed = await store.mark_symbol_conditions_not_live("BTCUSDT", {"live-sl"})
+
+    assert changed == 1
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        rows = (await session.execute(select(OrderRow))).scalars().all()
+    by_id = {row.exchange_order_id: row for row in rows}
+    assert by_id["live-sl"].status == "placed"
+    assert by_id["gone-tp"].status == "canceled"
+
+
 async def test_snapshot_skips_zero_contracts(store):
     await store.snapshot_positions([{"symbol": "BTC/USDT:USDT", "contracts": 0}])
     assert await _count(store, PositionSnapshotRow) == 0
