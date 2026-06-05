@@ -28,6 +28,33 @@ class IndicatorSnapshot(BaseModel):
     volume: float = 0.0              # 最新一根成交量
     volume_ma: float = 0.0           # 成交量均线(20)
     volume_ratio: float = 1.0        # 当前量 / 均量，>1 放量
+    # 主周期结构化趋势特征：由完整 K 线窗口压缩而来，避免只给 LLM 最新单点值。
+    trend_direction: str = "flat"    # "up" | "down" | "flat"，多因子快速判断
+    trend_score: float = 0.0         # -1~1，越接近两端趋势一致性越强
+    ema_spread_pct: float = 0.0      # (EMA快-EMA慢)/close * 100
+    ema_spread_delta_3: float = 0.0
+    ema_spread_delta_6: float = 0.0
+    ema_spread_delta_12: float = 0.0
+    price_vs_ema_fast_pct: float = 0.0
+    price_vs_ema_slow_pct: float = 0.0
+    return_1_pct: float = 0.0
+    return_3_pct: float = 0.0
+    return_6_pct: float = 0.0
+    return_12_pct: float = 0.0
+    macd_hist: float = 0.0
+    macd_hist_delta_3: float = 0.0
+    macd_hist_delta_6: float = 0.0
+    rsi_delta_3: float = 0.0
+    rsi_delta_6: float = 0.0
+    atr_pct: float = 0.0             # ATR / close * 100，跨标的可比
+    atr_pct_delta_6: float = 0.0
+    boll_mid: float = 0.0
+    boll_percent_b: float = 0.5      # close 在布林带内的位置，0=下轨，1=上轨
+    boll_bandwidth_pct: float = 0.0  # (上轨-下轨)/中轨 * 100
+    last_range_pct: float = 0.0      # 最新 K 线 high-low / close * 100
+    last_body_pct: float = 0.0       # 最新 K 线 close-open / open * 100，有方向
+    volume_ratio_delta_3: float = 0.0
+    volume_zscore_20: float = 0.0
 
 
 class TimeframeIndicators(BaseModel):

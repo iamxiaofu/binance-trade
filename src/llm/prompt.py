@@ -92,10 +92,24 @@ def build_user_prompt(ctx: MarketContext, kline_interval: str = "5m") -> str:
 技术指标(主周期 {kline_interval}，最新值):
   EMA(12)={ind.ema_fast:.4f}  EMA(26)={ind.ema_slow:.4f}
   RSI(14)={ind.rsi:.2f}
-  MACD={ind.macd:.4f}  Signal={ind.macd_signal:.4f}
-  ATR(14)={ind.atr:.4f}
-  Boll上轨={ind.boll_upper:.4f}  Boll下轨={ind.boll_lower:.4f}
+  MACD={ind.macd:.4f}  Signal={ind.macd_signal:.4f}  Hist={ind.macd_hist:.4f}
+  ATR(14)={ind.atr:.4f}  ATR%={ind.atr_pct:.4f}
+  Boll中轨={ind.boll_mid:.4f}  上轨={ind.boll_upper:.4f}  下轨={ind.boll_lower:.4f}
   成交量={ind.volume:.2f}  20均量={ind.volume_ma:.2f}  量比={ind.volume_ratio}（>1放量）
+
+主周期结构化趋势特征（百分比字段单位均为 %，由完整K线窗口计算）:
+  趋势={ind.trend_direction}  趋势一致性score={ind.trend_score:.3f}（-1强空，+1强多）
+  EMA价差={ind.ema_spread_pct:.4f}  Δ3={ind.ema_spread_delta_3:.4f}
+  Δ6={ind.ema_spread_delta_6:.4f}  Δ12={ind.ema_spread_delta_12:.4f}
+  价格相对EMA12={ind.price_vs_ema_fast_pct:.4f}  相对EMA26={ind.price_vs_ema_slow_pct:.4f}
+  收益率: 1根={ind.return_1_pct:.4f}  3根={ind.return_3_pct:.4f}
+  6根={ind.return_6_pct:.4f}  12根={ind.return_12_pct:.4f}
+  MACD柱变化: Δ3={ind.macd_hist_delta_3:.4f}  Δ6={ind.macd_hist_delta_6:.4f}
+  RSI变化: Δ3={ind.rsi_delta_3:.2f}  Δ6={ind.rsi_delta_6:.2f}
+  波动/位置: ATR%Δ6={ind.atr_pct_delta_6:.4f}
+  Boll%B={ind.boll_percent_b:.4f}  Boll带宽={ind.boll_bandwidth_pct:.4f}
+  最新K线振幅={ind.last_range_pct:.4f}  实体={ind.last_body_pct:.4f}
+  量能变化: 量比Δ3={ind.volume_ratio_delta_3:.4f}  20量Z={ind.volume_zscore_20:.4f}
 
 多周期指标(共振参考):
 {_fmt_higher_tf(ctx.higher_timeframes)}

@@ -18,6 +18,11 @@ def _klines(n: int, start: float = 100.0, slope: float = 0.5):
     return out
 
 
+def _constant_klines(n: int, price: float = 100.0):
+    ts = int(time.time() * 1000)
+    return [[ts + i * 300_000, price, price, price, price, 10.0] for i in range(n)]
+
+
 def test_rsi_pure_uptrend_is_100():
     s = pd.Series([100 + i for i in range(40)], dtype=float)
     assert round(float(rsi(s).iloc[-1]), 1) == 100.0
@@ -40,9 +45,21 @@ def test_compute_snapshot_keys_and_finite():
         "ema_fast", "ema_slow", "rsi", "macd",
         "macd_signal", "atr", "boll_upper", "boll_lower",
         "volume", "volume_ma", "volume_ratio",
+        "trend_direction", "trend_score",
+        "ema_spread_pct", "ema_spread_delta_3", "ema_spread_delta_6",
+        "ema_spread_delta_12", "price_vs_ema_fast_pct", "price_vs_ema_slow_pct",
+        "return_1_pct", "return_3_pct", "return_6_pct", "return_12_pct",
+        "macd_hist", "macd_hist_delta_3", "macd_hist_delta_6",
+        "rsi_delta_3", "rsi_delta_6", "atr_pct", "atr_pct_delta_6",
+        "boll_mid", "boll_percent_b", "boll_bandwidth_pct",
+        "last_range_pct", "last_body_pct", "volume_ratio_delta_3",
+        "volume_zscore_20",
     }
     assert set(snap) == expected
     for k, v in snap.items():
+        if k == "trend_direction":
+            assert v in {"up", "down", "flat"}
+            continue
         assert np.isfinite(v), f"{k} not finite"
 
 
@@ -61,6 +78,39 @@ def test_volume_metrics_present():
     assert snap["volume"] == 10.0
     assert snap["volume_ma"] > 0
     assert snap["volume_ratio"] == 1.0  # 恒定量 → 量比=1
+    assert snap["volume_zscore_20"] == 0.0
+
+
+def test_enriched_trend_features_uptrend():
+    snap = compute_snapshot(_klines(100, slope=0.5))
+    assert snap["trend_direction"] == "up"
+    assert snap["trend_score"] > 0
+    assert snap["ema_spread_pct"] > 0
+    assert snap["price_vs_ema_slow_pct"] > 0
+    assert snap["return_6_pct"] > 0
+    assert snap["atr_pct"] > 0
+
+
+def test_enriched_trend_features_downtrend():
+    snap = compute_snapshot(_klines(100, start=200.0, slope=-0.5))
+    assert snap["trend_direction"] == "down"
+    assert snap["trend_score"] < 0
+    assert snap["ema_spread_pct"] < 0
+    assert snap["price_vs_ema_slow_pct"] < 0
+    assert snap["return_6_pct"] < 0
+
+
+def test_enriched_features_constant_market_are_neutral_and_finite():
+    snap = compute_snapshot(_constant_klines(100))
+    assert snap["trend_direction"] == "flat"
+    assert snap["trend_score"] == 0.0
+    assert snap["boll_percent_b"] == 0.5
+    assert snap["boll_bandwidth_pct"] == 0.0
+    assert snap["volume_zscore_20"] == 0.0
+    for k, v in snap.items():
+        if k == "trend_direction":
+            continue
+        assert np.isfinite(v), f"{k} not finite"
 
 
 def test_timeframe_brief_uptrend():
