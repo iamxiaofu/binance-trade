@@ -55,7 +55,6 @@ llm:
 
 # ===== 执行层 =====
 execution:
-  dry_run: true               # true=只模拟不下真单
   order_type: MARKET          # MARKET | LIMIT
   attach_sl_tp: true          # 是否同时挂止盈止损单
   rate_limit_backoff: 1.5     # 限频指数退避基数
@@ -64,7 +63,7 @@ execution:
 
 # ===== 持久化 =====
 storage:
-  db_path: ./data/trade.db    # SQLite
+  db_path_template: ./data/trade-{mode}.db  # SQLite，按 testnet/mainnet 隔离
   reconcile_on_start: true    # 启动与交易所对账
 
 # ===== 监控告警 =====

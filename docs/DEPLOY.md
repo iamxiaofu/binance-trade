@@ -78,7 +78,7 @@ vi .env
 `.env` 必填：`BINANCE_API_KEY` / `BINANCE_API_SECRET` / `ANTHROPIC_API_KEY`，
 启用告警再加 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`。
 
-`config.yaml` 首次保持默认：`mode: testnet`、`execution.dry_run: true`。
+`config.yaml` 首次保持默认：`mode: testnet`。SQLite 默认按 `storage.db_path_template` 解析为 `data/trade-testnet.db`。
 
 ## 6. testnet 冒烟验证
 
@@ -119,15 +119,14 @@ sudo journalctl -u binance-trade -f
 2. **换 key**：编辑 `.env`，替换为 mainnet 的 `BINANCE_API_KEY/SECRET`
    （再次确认该 key 已**关闭提现权限**）。
 3. **改配置**：`config.yaml` 设 `mode: mainnet`。
-   - 建议先保持 `execution.dry_run: true` 跑 1～2 天，验证 mainnet 行情/对账无误。
    - 风控阈值按真实账户权益重核：`max_order_margin_pct` /
      `max_symbol_margin_pct` / `max_total_margin_pct` /
      `max_loss_per_trade_pct` / `daily_max_loss_pct` / `max_drawdown_pct`。
    - 保证金字段是权益倍率小数：`0.2` 表示权益 × 20%，`0.8` 表示权益 × 80%。
      `max_loss_per_trade_pct`、`daily_max_loss_pct` 与 `max_drawdown_pct`
      是百分数：`2` 表示 2%。
-4. **开真实下单**：确认无误后设 `execution.dry_run: false`。
-   - systemd 的 `ExecStart` 带 `--yes` 跳过交互确认；**务必在此步前确认所有阈值**。
+4. **确认主网隔离库**：默认会使用 `data/trade-mainnet.db`，不得复用 testnet DB。
+   - systemd 的 `ExecStart` 带 `--yes` 跳过交互确认；**务必在启动前确认所有阈值**。
    - 手动前台启动时不带 `--yes` 会要求输入 `yes` 二次确认。
 5. **启动 + 紧盯**：`sudo systemctl start binance-trade` 并持续 `journalctl -f` 观察首轮真实周期。
 
@@ -141,4 +140,5 @@ exit
 sudo systemctl start binance-trade
 ```
 
-回滚：`git checkout <上一个稳定 tag>` 后重复上面步骤。SQLite 数据库（`data/trade.db`）向后兼容，新表自动建。
+回滚：`git checkout <上一个稳定 tag>` 后重复上面步骤。SQLite 数据库按 mode 隔离：
+`data/trade-testnet.db` 与 `data/trade-mainnet.db` 分别备份和恢复，新表自动建。

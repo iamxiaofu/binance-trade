@@ -6,7 +6,6 @@
 - 5 分钟周期按 wall-clock 对齐（扣除本周期耗时）
 - kill-switch：撤单 + 平仓 + 停机
 
-dry_run 与真实下单的差异完全封装在 Executor 内，engine 不感知。
 """
 from __future__ import annotations
 
@@ -80,8 +79,8 @@ class TradingEngine:
         self._reconcile_task = asyncio.create_task(
             self._reconcile_loop(), name="exchange-reconciler"
         )
-        logger.info("engine started (mode={}, dry_run={}, equity={:.2f})",
-                    self._settings.mode.value, self._settings.execution.dry_run,
+        logger.info("engine started (mode={}, db={}, equity={:.2f})",
+                    self._settings.mode.value, self._settings.storage.db_path,
                     self.runtime.current_equity)
 
     async def shutdown(self) -> None:
@@ -236,11 +235,6 @@ class TradingEngine:
             return "strategy resumed (persisted)"
         if name == "RESUME_ALL_SYMBOLS":
             return await self._resume_all_symbols()
-        if name == "SET_DRY_RUN":
-            val = arg.strip().lower() in ("1", "true", "yes", "on")
-            self._settings.execution.dry_run = val
-            await self._store.set_runtime_setting("execution.dry_run", str(val).lower())
-            return f"dry_run set to {val} (persisted)"
         if name == "SET_SYMBOL_ENABLED":
             return await self._set_symbol_enabled(arg)
         if name == "CANCEL_AND_FLATTEN":
@@ -254,15 +248,6 @@ class TradingEngine:
 
     async def _apply_runtime_settings(self) -> None:
         """启动时加载持久化运行态；缺省时用 config.yaml 并写入 DB。"""
-        raw = await self._store.get_runtime_setting("execution.dry_run")
-        if raw is None:
-            await self._store.set_runtime_setting(
-                "execution.dry_run", str(self._settings.execution.dry_run).lower()
-            )
-        else:
-            val = raw.strip().lower() in ("1", "true", "yes", "on")
-            self._settings.execution.dry_run = val
-            logger.info("runtime setting applied: execution.dry_run={}", val)
         raw_paused = await self._store.get_runtime_setting("strategy.paused")
         if raw_paused is None:
             await self._store.set_runtime_setting("strategy.paused", "false")
@@ -445,9 +430,7 @@ class TradingEngine:
         if not missing:
             return f"{symbol}: SL/TP 条件单均已在交易所挂出"
 
-        templates = await self._store.latest_protection_templates(
-            symbol, dry_run=self._settings.execution.dry_run
-        )
+        templates = await self._store.latest_protection_templates(symbol)
         latest_decision = await self._store.latest_open_decision(symbol)
         equity = await self._current_equity()
 
@@ -500,12 +483,12 @@ class TradingEngine:
         placed = [
             f"{o['kind']}@{float(o.get('price') or 0.0):.2f}"
             for o in results
-            if o.get("status") in ("placed", "dry_run")
+            if o.get("status") == "placed"
         ]
         failed = [
             f"{o.get('kind')}:{(o.get('raw') or {}).get('error') or o.get('status')}"
             for o in results
-            if o.get("status") not in ("placed", "dry_run")
+            if o.get("status") != "placed"
         ]
         self.runtime.mark_order_event(symbol)
 
@@ -544,13 +527,11 @@ class TradingEngine:
         open_result: dict,
         protection_orders: list[dict],
     ) -> None:
-        if open_result.get("dry_run"):
-            return
         if decision.stop_loss_pct <= 0:
             return
         has_stop = any(
             order.get("kind") == "SL"
-            and order.get("status") in ("placed", "dry_run")
+            and order.get("status") == "placed"
             for order in protection_orders
         )
         if has_stop:
@@ -1080,7 +1061,7 @@ class TradingEngine:
             self.runtime.mark_order_event(symbol)
             await self._notifier.send(
                 Event.OPEN, f"{symbol} {decision.action.value} qty={result['qty']} "
-                f"notional={result['notional']:.2f} (dry={result['dry_run']})"
+                f"notional={result['notional']:.2f}"
             )
             if self._settings.execution.attach_sl_tp:
                 sltp = await self._executor.place_sl_tp(
@@ -1119,19 +1100,17 @@ class TradingEngine:
             # 已显式平仓：从运行态移除，避免 _snapshot 的差异检测重复计账
             self.runtime.positions.pop(symbol, None)
             self.runtime.mark_order_event(symbol)
-            if not result.get("dry_run"):
-                remaining = await self._cancel_symbol_condition_orders(
-                    symbol, reason="explicit_close"
+            remaining = await self._cancel_symbol_condition_orders(
+                symbol, reason="explicit_close"
+            )
+            if remaining:
+                details = ", ".join(
+                    self._condition_order_label(order) for order in remaining
                 )
-                if remaining:
-                    details = ", ".join(
-                        self._condition_order_label(order) for order in remaining
-                    )
-                    await self._disable_symbol_due_stale_conditions(symbol, details)
+                await self._disable_symbol_due_stale_conditions(symbol, details)
             await self._notifier.send(
                 Event.CLOSE,
-                f"{symbol} closed pnl={pnl:.2f} day_pnl={self.runtime.day_realized_pnl:.2f} "
-                f"(dry={result['dry_run']})",
+                f"{symbol} closed pnl={pnl:.2f} day_pnl={self.runtime.day_realized_pnl:.2f}",
             )
 
     # ---------- 辅助 ----------
@@ -1305,7 +1284,7 @@ class TradingEngine:
                 entry=entry,
                 mark=mark,
             )
-            if not has_stop and not self._settings.execution.dry_run:
+            if not has_stop:
                 await self._disable_symbol_due_protection_failure(
                     symbol,
                     f"SL protection missing during exchange reconcile ({reason})",

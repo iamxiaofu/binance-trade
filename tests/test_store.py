@@ -67,8 +67,8 @@ async def test_log_reject(store):
 async def test_log_order_and_snapshots(store):
     await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy", "order_type": "market",
-        "qty": 0.01, "price": 100.0, "notional": 1.0, "dry_run": True,
-        "status": "dry_run", "id": "", "raw": {"a": 1},
+        "qty": 0.01, "price": 100.0, "notional": 1.0, "dry_run": False,
+        "status": "filled", "id": "open", "raw": {"a": 1},
     })
     assert await _count(store, OrderRow) == 1
 
@@ -168,13 +168,13 @@ async def test_mark_condition_exit_closes_group_with_filled_price(store):
 
 
 async def test_runtime_settings_upsert_and_list(store):
-    assert await store.get_runtime_setting("execution.dry_run") is None
-    await store.set_runtime_setting("execution.dry_run", "true")
-    await store.set_runtime_setting("execution.dry_run", "false")
+    assert await store.get_runtime_setting("strategy.paused") is None
+    await store.set_runtime_setting("strategy.paused", "true")
+    await store.set_runtime_setting("strategy.paused", "false")
 
     assert await _count(store, RuntimeSettingRow) == 1
-    assert await store.get_runtime_setting("execution.dry_run") == "false"
-    assert await store.runtime_settings() == {"execution.dry_run": "false"}
+    assert await store.get_runtime_setting("strategy.paused") == "false"
+    assert await store.runtime_settings() == {"strategy.paused": "false"}
 
 
 async def test_runtime_settings_batch_upsert(store):
@@ -341,12 +341,12 @@ async def test_command_enqueue_and_fetch(store):
 
 
 async def test_command_mark_done_removes_from_pending(store):
-    cid = await store.enqueue_command("SET_DRY_RUN", arg="false")
-    await store.mark_command(cid, "done", "dry_run set to False")
+    cid = await store.enqueue_command("SET_SYMBOL_ENABLED", arg="BTCUSDT=false")
+    await store.mark_command(cid, "done", "BTCUSDT strategy enabled set to False")
     assert await store.fetch_pending_commands() == []
     recent = await store.recent_commands()
     assert recent[0]["status"] == "done"
-    assert recent[0]["arg"] == "false"
+    assert recent[0]["arg"] == "BTCUSDT=false"
 
 
 async def test_command_fifo_order(store):

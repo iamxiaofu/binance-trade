@@ -42,7 +42,7 @@ _ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("realized_pnl", "FLOAT NOT NULL DEFAULT 0.0"),
 )
 
-_FILLED_ORDER_STATUSES = {"filled", "partial", "dry_run"}
+_FILLED_ORDER_STATUSES = {"filled", "partial"}
 _TRIGGERED_CONDITION_STATUSES = {"filled", "partial"}
 _OPEN_TRADE_STATUSES = {"open", "partial"}
 
@@ -243,7 +243,7 @@ class Store:
             qty=_safe_float(order.get("qty")),
             price=_safe_float(order.get("price")),
             notional=_safe_float(order.get("notional")),
-            dry_run=bool(order.get("dry_run", True)),
+            dry_run=bool(order.get("dry_run", False)),
             status=order.get("status", ""),
             exchange_order_id=str(order.get("id") or ""),
             leverage=_safe_int(order.get("leverage")),
@@ -598,7 +598,7 @@ class Store:
         self,
         symbol: str,
         *,
-        dry_run: bool | None = None,
+        dry_run: bool | None = False,
     ) -> dict[str, dict[str, Any]]:
         """Return latest local SL/TP rows for a symbol as repair templates.
 

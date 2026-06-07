@@ -31,12 +31,10 @@ sudo systemctl disable binance-trade     # 取消自启
    `kill-switch` 子命令：撤掉所有挂单 + 平掉所有持仓 + 推送告警。
 
 2. **配置级急停（停开新仓，不自动平仓）**
-   把 `config.yaml` 的 `execution.dry_run` 改回 `true` 后 `restart`：之后只模拟不下真单。
+   使用 Web Control 的“暂停策略”，或在库中设置 `strategy.paused=true` 后重启。
 
 3. **交易所侧兜底**：登录币安手动平仓 + 在 API 管理页**临时禁用 key**。
    这是最后防线，确保即使进程失控也能切断下单能力。
-
-> dry_run 模式下 `kill-switch` 只记录不下真单，可安全演练。
 
 ## 看日志
 
@@ -62,11 +60,11 @@ tail -f /var/log/binance-trade/stdout.log /var/log/binance-trade/stderr.log
 
 ## 复盘决策（审计）
 
-所有决策、拒单、订单、快照都落在 SQLite（`config.yaml` 的 `storage.db_path`，默认 `data/trade.db`）。
+所有决策、拒单、订单、快照都落在 SQLite（`config.yaml` 的 `storage.db_path_template`，默认按 mode 解析为 `data/trade-testnet.db` 或 `data/trade-mainnet.db`）。
 
 ```bash
 cd /opt/binance-trade
-sqlite3 data/trade.db
+sqlite3 data/trade-testnet.db
 ```
 
 常用查询：
@@ -79,8 +77,8 @@ FROM decisions ORDER BY id DESC LIMIT 20;
 -- 最近被风控拒单的记录（看拒单码与原因）
 SELECT created_at, symbol, code, reason, leverage FROM rejects ORDER BY id DESC LIMIT 20;
 
--- 实际下单（含 dry-run）
-SELECT created_at, symbol, client_kind, side, qty, price, notional, status, dry_run
+-- 实际下单
+SELECT created_at, symbol, client_kind, side, qty, price, notional, status
 FROM orders ORDER BY id DESC LIMIT 20;
 
 -- 某次决策的完整输入上下文（JSON，用于还原 LLM 看到的市场）
@@ -106,7 +104,7 @@ ORDER BY id DESC LIMIT 20;
 systemctl is-active binance-trade
 
 # 最近有心跳/决策？（应每个周期都有新行）
-sqlite3 /opt/binance-trade/data/trade.db \
+sqlite3 /opt/binance-trade/data/trade-testnet.db \
   "SELECT created_at, symbol, skipped FROM decisions ORDER BY id DESC LIMIT 5;"
 
 # 时钟没漂？
@@ -128,5 +126,5 @@ chronyc tracking | grep -E 'Leap|System time'
 
 ## 变更配置后
 
-`config.yaml` 改动需 `restart` 生效。改风控阈值前先在 testnet 或 dry_run 验证。
+`config.yaml` 改动需 `restart` 生效。改风控阈值前先在 testnet 验证。
 `.env` 密钥改动同样需 `restart`，并确认 `chmod 600 .env`。

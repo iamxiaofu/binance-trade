@@ -6,7 +6,7 @@
     python main.py kill-switch         # 紧急：撤单 + 平仓 + 停机
     python main.py backtest --symbol BTCUSDT --csv data/btc.csv
 
-mainnet + 非 dry_run 时会二次确认（除非 --yes），防止误触真实下单。
+mainnet 启动时会二次确认（除非 --yes），防止误触真实主网下单。
 SIGINT/SIGTERM 只优雅停止交易引擎；撤单+平仓需显式执行 kill-switch。
 """
 from __future__ import annotations
@@ -40,9 +40,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _confirm_mainnet(settings, yes: bool) -> bool:
-    if not settings.is_mainnet or settings.execution.dry_run or yes:
+    if not settings.is_mainnet or yes:
         return True
-    ans = input("⚠️  mainnet + 真实下单模式，确认启动？输入 yes 继续: ").strip().lower()
+    ans = input("mainnet 真实主网模式，确认启动？输入 yes 继续: ").strip().lower()
     return ans == "yes"
 
 

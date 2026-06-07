@@ -1,4 +1,4 @@
-"""engine/loop.py 测试：熔断优先级、跳过落库、开仓流水线（全 dry-run + 假 I/O）。
+"""engine/loop.py 测试：熔断优先级、跳过落库、开仓流水线（假 I/O）。
 
 不触网：构造 TradingEngine 后替换其 collaborators 为假对象，直接驱动内部方法。
 """
@@ -152,12 +152,21 @@ class FakeExecutor:
 
     async def open_position(self, *, decision, qty, price):
         self.opened.append((decision.symbol, qty))
-        return {"symbol": decision.symbol, "kind": "OPEN", "status": "dry_run",
+        return {"symbol": decision.symbol, "kind": "OPEN", "status": "filled",
                 "filled": True, "opened": True, "qty": qty, "price": price,
-                "notional": qty * price, "dry_run": True, "side": "buy", "id": ""}
+                "notional": qty * price, "dry_run": False, "side": "buy", "id": "open-1"}
 
     async def place_sl_tp(self, *, decision, entry_price, qty):
-        return []
+        return [
+            {"symbol": decision.symbol, "kind": "SL", "side": "sell",
+             "order_type": "STOP_MARKET", "qty": qty, "price": entry_price * 0.98,
+             "notional": qty * entry_price * 0.98, "dry_run": False,
+             "status": "placed", "id": "SL-1", "raw": {}},
+            {"symbol": decision.symbol, "kind": "TP", "side": "sell",
+             "order_type": "TAKE_PROFIT_MARKET", "qty": qty, "price": entry_price * 1.04,
+             "notional": qty * entry_price * 1.04, "dry_run": False,
+             "status": "placed", "id": "TP-1", "raw": {}},
+        ]
 
     async def place_protection_orders(self, *, symbol, pos_side, qty, specs):
         return [
@@ -168,12 +177,14 @@ class FakeExecutor:
         ]
 
     async def close_position(self, position):
-        return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "dry_run",
-                "filled": True, "closed": True, "dry_run": True,
+        return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "filled",
+                "filled": True, "closed": True, "dry_run": False,
                 "qty": abs(float(position.get("contracts") or 0)),
                 "price": float(position.get("markPrice") or 0),
                 "entry_price": float(position.get("entryPrice") or 0),
-                "pos_side": (position.get("side") or "").lower()}
+                "pos_side": (position.get("side") or "").lower(),
+                "side": "sell" if (position.get("side") or "").lower() == "long" else "buy",
+                "id": "close-1"}
 
 
 def _engine(settings, creds, monkeypatch):
@@ -289,7 +300,6 @@ async def test_sync_open_orders_includes_condition_orders(settings, creds, monke
 
 
 async def test_reconcile_disables_symbol_when_stale_condition_remains(settings, creds, monkeypatch):
-    settings.execution.dry_run = False
     eng = _engine(settings, creds, monkeypatch)
     eng._client.condition_orders = [
         {"id": "tp-old", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
@@ -361,7 +371,6 @@ async def test_open_pipeline_rejects_high_leverage(settings, creds, monkeypatch)
 async def test_open_rejects_stale_condition_without_position(settings, creds, monkeypatch):
     settings.risk.max_leverage = 5
     settings.risk.min_confidence = 0.6
-    settings.execution.dry_run = False
     eng = _engine(settings, creds, monkeypatch)
     eng._client.condition_orders = [
         {"id": "tp-old", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
@@ -418,7 +427,6 @@ class MissingStopExecutor(FakeExecutor):
 
 
 async def test_open_closes_position_when_stop_not_confirmed(settings, creds, monkeypatch):
-    settings.execution.dry_run = False
     settings.risk.max_leverage = 5
     settings.risk.min_confidence = 0.6
     eng = _engine(settings, creds, monkeypatch)
@@ -551,23 +559,6 @@ async def test_sleep_consumes_symbol_enable_and_wakes_when_running(settings, cre
     assert eng._symbol_enabled["BTCUSDT"] is True
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "true"
     assert eng._store.marked[0][0:2] == (1, "done")
-
-
-async def test_command_set_dry_run(settings, creds, monkeypatch):
-    settings.execution.dry_run = True
-    eng = _engine(settings, creds, monkeypatch)
-    eng._store.pending = [{"id": 1, "command": "SET_DRY_RUN", "arg": "false"}]
-    await eng._process_commands()
-    assert eng._settings.execution.dry_run is False
-    assert eng._store.runtime_settings["execution.dry_run"] == "false"
-
-
-async def test_runtime_dry_run_applied_on_startup(settings, creds, monkeypatch):
-    settings.execution.dry_run = False
-    eng = _engine(settings, creds, monkeypatch)
-    eng._store.runtime_settings["execution.dry_run"] = "true"
-    await eng._apply_runtime_settings()
-    assert eng._settings.execution.dry_run is True
 
 
 async def test_runtime_symbol_enabled_applied_on_startup(settings, creds, monkeypatch):
@@ -744,7 +735,6 @@ class RepairClient:
 
 
 async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monkeypatch):
-    settings.execution.dry_run = False
     settings.risk.max_loss_per_trade_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
@@ -770,7 +760,6 @@ async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monke
 
 
 async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, monkeypatch):
-    settings.execution.dry_run = False
     settings.risk.max_loss_per_trade_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
@@ -802,7 +791,6 @@ async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, m
 
 
 async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, creds, monkeypatch):
-    settings.execution.dry_run = False
     settings.risk.max_loss_per_trade_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(

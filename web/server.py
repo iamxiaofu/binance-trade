@@ -2,7 +2,7 @@
 
 安全与解耦原则：
 - 独立进程，与交易主进程分离；只读 SQLite（status.py）+ 只读交易所行情。
-- 操作类命令（Kill Switch / 暂停 / dry_run 切换）只写 control_commands 表，
+- 操作类命令（Kill Switch / 暂停 / 币种开关等）只写 control_commands 表，
   由交易进程快速消费执行；web 绝不直接碰交易所下单。
 - 全站 HTTP Basic Auth；WS 握手复用同源 Basic 凭证。
 
@@ -125,17 +125,6 @@ def _parse_bool_setting(raw: str | None, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-async def _effective_dry_run() -> tuple[bool, str]:
-    try:
-        store = await _get_store()
-        raw = await store.get_runtime_setting("execution.dry_run")
-        if raw is not None:
-            return _parse_bool_setting(raw, _settings.execution.dry_run), "runtime"
-    except Exception as e:
-        logger.warning("runtime dry_run unavailable, fallback to config: {}", e)
-    return _settings.execution.dry_run, "config"
 
 
 async def _effective_strategy_paused() -> tuple[bool, str]:
@@ -375,11 +364,11 @@ async def api_commands(limit: int = 50, _: str = Depends(_check_auth)):
 async def api_config(_: str = Depends(_check_auth)):
     """暴露非敏感运行配置，供前端展示风控阈值等。"""
     s = _settings
-    dry_run, dry_run_source = await _effective_dry_run()
     strategy_paused, strategy_status_source = await _effective_strategy_paused()
     symbol_enabled = await _effective_symbol_enabled()
     return {
         "mode": s.mode.value,
+        "db_path": s.storage.db_path,
         "symbols": s.symbols,
         "strategy_paused": strategy_paused,
         "strategy_status_source": strategy_status_source,
@@ -388,9 +377,6 @@ async def api_config(_: str = Depends(_check_auth)):
             {"symbol": symbol, "enabled": symbol_enabled.get(symbol, True)}
             for symbol in s.symbols
         ],
-        "dry_run": dry_run,
-        "dry_run_source": dry_run_source,
-        "dry_run_config": s.execution.dry_run,
         "cycle_interval": s.cycle.interval,
         # 看板默认行情源（mainnet 真实价 / testnet 沙盒），供前端初始化源切换
         "market_source": _DEFAULT_SOURCE,
@@ -468,7 +454,6 @@ _ALLOWED_COMMANDS = {
     "PAUSE",
     "RESUME",
     "RESUME_ALL_SYMBOLS",
-    "SET_DRY_RUN",
     "SET_SYMBOL_ENABLED",
     "REPAIR_SL_TP",
     "CANCEL_AND_FLATTEN",

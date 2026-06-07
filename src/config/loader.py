@@ -71,7 +71,7 @@ def load_config(
 
     creds = _load_credentials(settings.notify)
 
-    # mainnet + 非 dry_run 是真实下单，给一个显式提示位（调用方决定是否二次确认）
+    # mainnet 是真实主网环境，调用方负责做二次确认。
     return settings, creds
 
 

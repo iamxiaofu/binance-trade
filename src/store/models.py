@@ -68,7 +68,7 @@ class RejectRow(Base):
 
 
 class OrderRow(Base):
-    """下单结果（含 dry-run）。"""
+    """下单结果。dry_run 字段仅保留用于兼容旧库。"""
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -81,7 +81,7 @@ class OrderRow(Base):
     qty: Mapped[float] = mapped_column(Float, default=0.0)
     price: Mapped[float] = mapped_column(Float, default=0.0)
     notional: Mapped[float] = mapped_column(Float, default=0.0)
-    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(24), default="")
     exchange_order_id: Mapped[str] = mapped_column(String(64), default="")
     raw_json: Mapped[str] = mapped_column(Text, default="")
@@ -102,7 +102,7 @@ class TradeRow(Base):
     symbol: Mapped[str] = mapped_column(String(20), index=True)
     direction: Mapped[str] = mapped_column(String(8), default="")      # long/short
     status: Mapped[str] = mapped_column(String(16), default="open", index=True)
-    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
 
     opened_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
     opened_at: Mapped[str] = mapped_column(String(32), default="")
@@ -202,8 +202,8 @@ class ControlCommandRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
     created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
-    command: Mapped[str] = mapped_column(String(32), index=True)  # PAUSE/RESUME/SET_DRY_RUN/etc.
-    arg: Mapped[str] = mapped_column(String(64), default="")       # 命令参数(如 dry_run 的 true/false)
+    command: Mapped[str] = mapped_column(String(32), index=True)  # PAUSE/RESUME/etc.
+    arg: Mapped[str] = mapped_column(String(64), default="")       # 命令参数
     source: Mapped[str] = mapped_column(String(32), default="web")
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending/done/failed
     result: Mapped[str] = mapped_column(String(300), default="")

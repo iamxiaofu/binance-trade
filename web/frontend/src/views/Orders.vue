@@ -366,12 +366,6 @@ onMounted(async () => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="模式" width="80">
-          <template #default="{ row }">
-            <el-tag v-if="row.dry_run" type="info" size="small">模拟</el-tag>
-            <el-tag v-else type="danger" size="small">真实</el-tag>
-          </template>
-        </el-table-column>
       </el-table>
 
       <el-table v-else :data="rejects" stripe height="calc(100vh - 240px)" v-loading="loading">

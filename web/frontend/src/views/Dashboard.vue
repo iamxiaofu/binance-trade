@@ -97,8 +97,8 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
           <el-descriptions :column="1" border size="small">
             <el-descriptions-item label="模式">
               {{ cfg ? cfg.mode : '—' }}
-              <el-tag v-if="cfg" :type="cfg.dry_run ? 'info' : 'danger'" size="small" style="margin-left:8px">
-                {{ cfg.dry_run ? 'DRY-RUN' : '真实下单' }}
+              <el-tag v-if="cfg" :type="cfg.mode === 'mainnet' ? 'danger' : 'success'" size="small" style="margin-left:8px">
+                {{ cfg.mode === 'mainnet' ? '主网' : '测试网' }}
               </el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="标的">{{ cfg ? cfg.symbols.join(', ') : '—' }}</el-descriptions-item>

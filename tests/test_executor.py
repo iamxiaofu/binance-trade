@@ -1,4 +1,4 @@
-"""execution/executor.py 测试：dry-run 行为、精度拒单、平仓、SL/TP 触发价。"""
+"""execution/executor.py 测试：下单、精度拒单、平仓、SL/TP 触发价。"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -11,7 +11,7 @@ from src.llm.schema import Action, TradeDecision
 
 
 class FakeClient:
-    """最小 ExchangeClient 替身。dry_run 路径不会真正调用下单。"""
+    """最小 ExchangeClient 替身。"""
 
     def __init__(self):
         self.created: list[tuple] = []
@@ -54,20 +54,18 @@ def _decision(**kw):
     return TradeDecision(**base)
 
 
-async def test_open_dry_run_does_not_call_exchange(settings):
-    settings.execution.dry_run = True
+async def test_open_calls_exchange_and_sets_leverage(settings):
     client = FakeClient()
     ex = Executor(client, settings)
     res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
-    assert res["status"] == "dry_run"
+    assert res["status"] == "filled"
     assert res["filled"] is True
     assert res["opened"] is True
-    assert client.created == []          # 未真实下单
-    assert client.setup_called == []     # dry_run 不设置杠杆
+    assert client.created == [("BTCUSDT", "buy", 0.05, "market", None)]
+    assert client.setup_called == [("BTCUSDT", 3)]
 
 
 async def test_open_rejects_below_min_notional(settings):
-    settings.execution.dry_run = True
     client = FakeClient()
     ex = Executor(client, settings)
     # qty*price = 0.001*100 = 0.1 < min_notional 5 → 拒单
@@ -76,19 +74,7 @@ async def test_open_rejects_below_min_notional(settings):
     assert res["filled"] is False
 
 
-async def test_open_live_calls_exchange_and_sets_leverage(settings):
-    settings.execution.dry_run = False
-    client = FakeClient()
-    ex = Executor(client, settings)
-    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
-    assert res["status"] == "filled"
-    assert res["id"] == "oid-1"
-    assert len(client.created) == 1
-    assert client.setup_called == [("BTCUSDT", 3)]
-
-
 async def test_sl_tp_trigger_prices_for_long(settings):
-    settings.execution.dry_run = True
     settings.execution.attach_sl_tp = True
     client = FakeClient()
     ex = Executor(client, settings)
@@ -101,10 +87,10 @@ async def test_sl_tp_trigger_prices_for_long(settings):
     assert kinds["SL"]["side"] == "sell"
     assert kinds["SL"]["order_type"] == "STOP_MARKET"
     assert kinds["TP"]["order_type"] == "TAKE_PROFIT_MARKET"
+    assert [row[3] for row in client.created] == ["stop_market", "take_profit_market"]
 
 
 async def test_sl_tp_live_records_placed_status(settings):
-    settings.execution.dry_run = False
     settings.execution.attach_sl_tp = True
     client = FakeClient()
     ex = Executor(client, settings)
@@ -146,7 +132,6 @@ class TimeoutButPlacedClient(FakeClient):
 
 
 async def test_sl_tp_recovers_unknown_create_status(settings):
-    settings.execution.dry_run = False
     client = TimeoutButPlacedClient()
     ex = Executor(client, settings)
 
@@ -161,17 +146,17 @@ async def test_sl_tp_recovers_unknown_create_status(settings):
     assert out[0]["id"] == "algo-1"
 
 
-async def test_close_position_dry_run(settings):
-    settings.execution.dry_run = True
-    ex = Executor(FakeClient(), settings)
+async def test_close_position_calls_exchange(settings):
+    client = FakeClient()
+    ex = Executor(client, settings)
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0.05, "markPrice": 100.0}
     res = await ex.close_position(pos)
     assert res["closed"] is True
     assert res["side"] == "sell"
+    assert client.created == [("BTCUSDT", "sell", 0.05, "market", {"reduceOnly": True})]
 
 
 async def test_close_no_position(settings):
-    settings.execution.dry_run = True
     ex = Executor(FakeClient(), settings)
     res = await ex.close_position({"symbol": "BTC/USDT:USDT", "contracts": 0})
     assert res["status"] == "rejected"
@@ -214,7 +199,6 @@ class PartialFillClient(FakeClient):
 
 
 async def test_open_partial_fill_records_filled_qty(settings):
-    settings.execution.dry_run = False
     client = PartialFillClient(filled=0.03)  # 请求 0.05，仅成交 0.03
     ex = Executor(client, settings)
     res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
@@ -226,7 +210,6 @@ async def test_open_partial_fill_records_filled_qty(settings):
 
 
 async def test_open_full_fill_when_filled_reported(settings):
-    settings.execution.dry_run = False
     client = PartialFillClient(filled=0.05)  # 全部成交
     ex = Executor(client, settings)
     res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
@@ -236,7 +219,6 @@ async def test_open_full_fill_when_filled_reported(settings):
 
 
 async def test_close_partial_fill(settings):
-    settings.execution.dry_run = False
     client = PartialFillClient(filled=0.02, requested_average=110.0)
     ex = Executor(client, settings)
     pos = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0.05,

@@ -132,7 +132,6 @@ class LLMConfig(_Base):
 
 
 class ExecutionConfig(_Base):
-    dry_run: bool = True
     order_type: OrderType = OrderType.MARKET
     attach_sl_tp: bool = True
     rate_limit_backoff: float = Field(gt=1.0)
@@ -141,8 +140,26 @@ class ExecutionConfig(_Base):
 
 
 class StorageConfig(_Base):
-    db_path: str
+    # db_path 是最终解析后的 SQLite 路径；配置文件优先使用 db_path_template。
+    db_path: str = ""
+    db_path_template: str = ""
     reconcile_on_start: bool = True
+
+    @model_validator(mode="after")
+    def _check_path_config(self) -> "StorageConfig":
+        if self.db_path and self.db_path_template:
+            raise ValueError("storage.db_path 与 storage.db_path_template 只能配置一个")
+        if not self.db_path and not self.db_path_template:
+            raise ValueError("storage 必须配置 db_path_template 或兼容字段 db_path")
+        if self.db_path_template and "{mode}" not in self.db_path_template:
+            raise ValueError("storage.db_path_template 必须包含 {mode}")
+        return self
+
+    def resolve_db_path(self, mode: Mode | str) -> str:
+        mode_value = mode.value if isinstance(mode, Mode) else str(mode)
+        if self.db_path_template:
+            return self.db_path_template.format(mode=mode_value)
+        return self.db_path
 
 
 class NotifyConfig(_Base):
@@ -194,6 +211,14 @@ class Settings(_Base):
     @property
     def is_mainnet(self) -> bool:
         return self.mode is Mode.MAINNET
+
+    @model_validator(mode="after")
+    def _resolve_storage_path(self) -> "Settings":
+        try:
+            self.storage.db_path = self.storage.resolve_db_path(self.mode)
+        except Exception as e:
+            raise ValueError(f"storage.db_path_template 解析失败: {e}") from e
+        return self
 
 
 class Credentials(BaseModel):

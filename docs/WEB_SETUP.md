@@ -110,12 +110,12 @@ npm run build                     # 刷新 dist/，生产由 8000 直接托管
 - Decisions 决策日志（含跳过记录；详情弹窗展示喂给 LLM 的 context_json）
 - Orders 交易记录 + 风控拒单（双 tab）
 - Pnl 盈亏统计
-- Control 操作面板（Kill Switch / 暂停 / 开启全部币种 / dry_run 切换 + 命令历史）
+- Control 操作面板（Kill Switch / 暂停 / 开启全部币种 / 币种开关 + 命令历史）
 
 REST/WS 接口（`web/server.py`）：
 - 只读：`/api/summary` `/api/positions` `/api/decisions[/{id}]` `/api/orders`
   `/api/rejects` `/api/pnl` `/api/equity` `/api/commands` `/api/config` `/api/klines/{symbol}`
-- 操作：`POST /api/command/{KILL_SWITCH|PAUSE|RESUME|RESUME_ALL_SYMBOLS|SET_DRY_RUN|SET_SYMBOL_ENABLED|REPAIR_SL_TP|CANCEL_AND_FLATTEN|STOP_ENGINE}`（写命令队列，交易进程消费）
+- 操作：`POST /api/command/{KILL_SWITCH|PAUSE|RESUME|RESUME_ALL_SYMBOLS|SET_SYMBOL_ENABLED|REPAIR_SL_TP|CANCEL_AND_FLATTEN|STOP_ENGINE}`（写命令队列，交易进程消费）
 - 实时：`WS /ws`（聚合状态）与 `WS /ws/market`（ticker + 最新K线，支持 mainnet/testnet）
 - 探活：`GET /healthz`（无需鉴权）
 

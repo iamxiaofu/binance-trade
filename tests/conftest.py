@@ -54,7 +54,7 @@ def settings() -> Settings:
         execution=ExecutionConfig(
             rate_limit_backoff=1.5, max_order_retries=3, recv_window=5000
         ),
-        storage=StorageConfig(db_path="./data/trade.db"),
+        storage=StorageConfig(db_path_template="./data/trade-{mode}.db"),
         notify=NotifyConfig(),
         logging=LoggingConfig(),
     )

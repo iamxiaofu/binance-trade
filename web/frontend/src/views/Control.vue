@@ -10,7 +10,7 @@ const commands = ref([])
 const loading = ref(false)
 const symbolLoading = ref({})
 const configCommandIds = new Set()
-const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_DRY_RUN', 'SET_SYMBOL_ENABLED'])
+const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED'])
 const SYMBOL_SYNC_ATTEMPTS = 8
 const SYMBOL_SYNC_DELAY_MS = 500
 
@@ -71,7 +71,6 @@ function commandLabel(name) {
     PAUSE: '暂停策略',
     RESUME: '恢复策略',
     RESUME_ALL_SYMBOLS: '开启全部币种策略',
-    SET_DRY_RUN: '切换下单模式',
     SET_SYMBOL_ENABLED: '切换币种交易',
     REPAIR_SL_TP: '补止盈止损',
     CANCEL_AND_FLATTEN: '撤单+平仓',
@@ -252,25 +251,17 @@ watch(
 
       <el-col :span="12">
         <el-card shadow="never">
-          <template #header>下单模式</template>
-          <div v-if="cfg" style="margin-bottom:12px">
-            当前：
-            <el-tag :type="cfg.dry_run ? 'info' : 'danger'" effect="dark">
-              {{ cfg.dry_run ? 'DRY-RUN（模拟）' : '真实下单' }}
-            </el-tag>
-            <el-tag size="small" style="margin-left:8px">
-              {{ cfg.dry_run_source === 'runtime' ? '运行时持久化' : '配置文件' }}
-            </el-tag>
-          </div>
-          <div style="display:flex; gap:12px">
-            <el-button :loading="loading" style="flex:1" @click="send('SET_DRY_RUN', 'true')">
-              切到 DRY-RUN
-            </el-button>
-            <el-button type="danger" :loading="loading" style="flex:1"
-                       @click="send('SET_DRY_RUN', 'false', 'LIVE')">
-              切到真实下单
-            </el-button>
-          </div>
+          <template #header>运行环境</template>
+          <el-descriptions :column="1" border size="small" v-if="cfg">
+            <el-descriptions-item label="交易环境">
+              <el-tag :type="cfg.mode === 'mainnet' ? 'danger' : 'success'" effect="dark">
+                {{ cfg.mode }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="数据库">
+              <span class="mono">{{ cfg.db_path }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
         </el-card>
       </el-col>
     </el-row>

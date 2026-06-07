@@ -276,7 +276,7 @@ def pnl_stats(db_path: str) -> dict:
     closes = _rows(
         db_path,
         "SELECT symbol, notional, status FROM orders "
-        "WHERE client_kind IN ('CLOSE','SL','TP') AND status IN ('filled','partial','dry_run')",
+        "WHERE client_kind IN ('CLOSE','SL','TP') AND status IN ('filled','partial')",
     )
     by_symbol: dict[str, int] = {}
     for c in closes:

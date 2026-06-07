@@ -32,11 +32,11 @@ async def db(tmp_path):
     )
     await s.log_order({"symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
                        "order_type": "market", "qty": 0.01, "price": 100.0,
-                       "notional": 1.0, "dry_run": True, "status": "dry_run",
-                       "id": "", "raw": {}, "leverage": 2})
+                       "notional": 1.0, "dry_run": False, "status": "filled",
+                       "id": "open", "raw": {}, "leverage": 2})
     await s.log_order({"symbol": "BTCUSDT", "kind": "CLOSE", "side": "sell",
                        "order_type": "market", "qty": 0.01, "price": 110.0,
-                       "notional": 1.1, "dry_run": True, "status": "dry_run", "id": "", "raw": {}})
+                       "notional": 1.1, "dry_run": False, "status": "filled", "id": "close", "raw": {}})
     await s.snapshot_positions([{"symbol": "BTC/USDT:USDT", "side": "long",
                                  "contracts": 0.01, "entryPrice": 100.0, "markPrice": 101.0,
                                  "leverage": 3, "unrealizedPnl": 0.01}])

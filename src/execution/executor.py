@@ -1,9 +1,8 @@
-"""执行层：把通过风控的决策落成真实/模拟订单。
+"""执行层：把通过风控的决策落成交易所订单。
 
 职责：
 - 精度规整（调用 filters.normalize_order）；不满足 minNotional/minQty → 返回拒单结果
-- dry_run：只构造订单结构、记日志，不触碰交易所
-- 真实下单：市价/限价开仓，可选附带 STOP_MARKET / TAKE_PROFIT_MARKET
+- 市价/限价开仓，可选附带 STOP_MARKET / TAKE_PROFIT_MARKET
 - 限频与瞬时错误的指数退避重试
 - 平仓 / flatten_all / cancel_all（供 kill-switch 与熔断使用）
 
@@ -24,8 +23,8 @@ from src.exchange.orders import normalize_condition_order
 from src.llm.schema import Action, TradeDecision
 
 
-# 视为「已建/平仓成功」的状态：完全成交、部分成交、dry-run 模拟
-_FILLED_STATES = ("filled", "partial", "dry_run")
+# 视为「已建/平仓成功」的状态：完全成交、部分成交
+_FILLED_STATES = ("filled", "partial")
 
 
 def _result(
@@ -51,7 +50,7 @@ def _result(
         "price": price,
         "notional": notional,
         "dry_run": dry_run,
-        "status": status,        # filled / partial / placed / dry_run / rejected / error
+        "status": status,        # filled / partial / placed / rejected / error
         "id": order_id,
         "raw": raw or {},
         "opened": kind == "OPEN" and status in _FILLED_STATES,
@@ -132,7 +131,7 @@ class Executor:
         qty: float,
         price: float,
     ) -> dict:
-        """按已计算的 qty 开仓。精度规整后下单；dry_run 时只模拟。"""
+        """按已计算的 qty 开仓。精度规整后下单。"""
         symbol = decision.symbol
         side = _OPEN_SIDE[decision.action]
         f = self._client.filters(symbol)
@@ -140,20 +139,11 @@ class Executor:
         if norm is None:
             logger.warning("[{}] normalize below min (qty={}, price={}) → reject", symbol, qty, price)
             return _result(symbol=symbol, kind="OPEN", side=side, qty=qty, price=price,
-                           notional=0.0, dry_run=self._cfg.dry_run, status="rejected",
+                           notional=0.0, dry_run=False, status="rejected",
                            raw={"reason": "below minNotional/minQty"})
         q = float(norm.qty)
-        notional = float(norm.notional)
 
-        if self._cfg.dry_run:
-            logger.info("[dry-run][{}] OPEN {} qty={} ~notional={:.2f}", symbol, side, q, notional)
-            res = _result(symbol=symbol, kind="OPEN", side=side, qty=q, price=price,
-                          notional=notional, dry_run=True, status="dry_run")
-            res["leverage"] = decision.leverage
-            res["margin"] = notional / decision.leverage if decision.leverage > 0 else 0.0
-            return res
-
-        # 真实下单前确保保证金模式+杠杆就位
+        # 下单前确保保证金模式+杠杆就位
         await self._client.setup_symbol(symbol, decision.leverage)
         order = await self._with_retry(
             lambda: self._client.create_order(symbol, side, q, "market"),
@@ -174,7 +164,7 @@ class Executor:
 
     # ---------- 止盈止损 ----------
     async def place_sl_tp(self, *, decision: TradeDecision, entry_price: float, qty: float) -> list[dict]:
-        """挂 STOP_MARKET / TAKE_PROFIT_MARKET（reduceOnly）。dry_run 只模拟。"""
+        """挂 STOP_MARKET / TAKE_PROFIT_MARKET（reduceOnly）。"""
         if not self._cfg.attach_sl_tp:
             return []
         symbol = decision.symbol
@@ -214,12 +204,6 @@ class Executor:
         close_side = "sell" if pos_side.lower() == "long" else "buy"
         results: list[dict] = []
         for kind, otype, trigger in specs:
-            if self._cfg.dry_run:
-                logger.info("[dry-run][{}] {} trigger={}", symbol, kind, trigger)
-                results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
-                                       order_type=otype, price=trigger,
-                                       notional=qty * trigger, dry_run=True, status="dry_run"))
-                continue
             client_algo_id = self._protection_client_algo_id(
                 symbol=symbol, kind=kind, side=close_side, qty=qty, trigger=trigger
             )
@@ -345,18 +329,11 @@ class Executor:
         entry = float(position.get("entryPrice") or 0)
         if contracts == 0:
             return _result(symbol=symbol, kind="CLOSE", side="", qty=0.0, price=0.0,
-                           notional=0.0, dry_run=self._cfg.dry_run, status="rejected",
+                           notional=0.0, dry_run=False, status="rejected",
                            raw={"reason": "no position"})
         close_side = "sell" if pos_side == "long" else "buy"
         mark = float(position.get("markPrice") or position.get("entryPrice") or 0)
 
-        if self._cfg.dry_run:
-            logger.info("[dry-run][{}] CLOSE {} qty={}", symbol, close_side, contracts)
-            res = _result(symbol=symbol, kind="CLOSE", side=close_side, qty=contracts,
-                          price=mark, notional=contracts * mark, dry_run=True, status="dry_run")
-            res["entry_price"] = entry
-            res["pos_side"] = pos_side
-            return res
         order = await self._with_retry(
             lambda: self._client.create_order(
                 symbol, close_side, contracts, "market", None, {"reduceOnly": True}
@@ -387,8 +364,5 @@ class Executor:
         return results
 
     async def cancel_all_orders(self) -> None:
-        if self._cfg.dry_run:
-            logger.info("[dry-run] cancel_all_orders skipped")
-            return
         await self._client.cancel_all_orders()
         await self._client.cancel_all_condition_orders()
