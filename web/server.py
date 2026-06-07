@@ -19,7 +19,7 @@ import secrets
 import time
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -287,8 +287,28 @@ async def api_positions(_: str = Depends(_check_auth)):
 
 
 @app.get("/api/decisions")
-async def api_decisions(limit: int = 100, _: str = Depends(_check_auth)):
-    return st.recent_decisions(_DB, min(limit, 500))
+async def api_decisions(
+    symbol: list[str] = Query(default_factory=list),
+    type: list[str] = Query(default_factory=list),
+    start_ts_ms: int | None = Query(default=None),
+    end_ts_ms: int | None = Query(default=None),
+    hide_symbol_disabled: bool = Query(default=False),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    _: str = Depends(_check_auth),
+):
+    return st.search_decisions(
+        _DB,
+        st.DecisionFilters(
+            symbols=symbol,
+            types=type,
+            start_ts_ms=start_ts_ms,
+            end_ts_ms=end_ts_ms,
+            hide_symbol_disabled=hide_symbol_disabled,
+            limit=limit,
+            offset=offset,
+        ),
+    )
 
 
 @app.get("/api/decisions/{decision_id}")

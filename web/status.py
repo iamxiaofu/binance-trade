@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import sqlite3
 from typing import Any
 
@@ -28,6 +29,90 @@ def _rows(db_path: str, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
 
 def recent_decisions(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,))
+
+
+@dataclass(frozen=True)
+class DecisionFilters:
+    symbols: list[str] = field(default_factory=list)
+    types: list[str] = field(default_factory=list)
+    start_ts_ms: int | None = None
+    end_ts_ms: int | None = None
+    hide_symbol_disabled: bool = False
+    limit: int = 100
+    offset: int = 0
+
+
+def _decision_where(filters: DecisionFilters) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    args: list[Any] = []
+
+    symbols = [s.strip().upper() for s in filters.symbols if s and s.strip()]
+    if symbols:
+        placeholders = ",".join("?" for _ in symbols)
+        clauses.append(f"symbol IN ({placeholders})")
+        args.extend(symbols)
+
+    types = [t.strip().upper() for t in filters.types if t and t.strip()]
+    action_types = [t for t in types if t != "SKIPPED"]
+    include_skipped = "SKIPPED" in types
+    if include_skipped and action_types:
+        placeholders = ",".join("?" for _ in action_types)
+        clauses.append(f"(skipped = 1 OR (skipped = 0 AND action IN ({placeholders})))")
+        args.extend(action_types)
+    elif include_skipped:
+        clauses.append("skipped = 1")
+    elif action_types:
+        placeholders = ",".join("?" for _ in action_types)
+        clauses.append(f"skipped = 0 AND action IN ({placeholders})")
+        args.extend(action_types)
+
+    if filters.start_ts_ms is not None:
+        clauses.append("ts_ms >= ?")
+        args.append(filters.start_ts_ms)
+    if filters.end_ts_ms is not None:
+        clauses.append("ts_ms <= ?")
+        args.append(filters.end_ts_ms)
+    if filters.hide_symbol_disabled:
+        clauses.append("NOT (skipped = 1 AND skip_reason = ?)")
+        args.append("symbol disabled")
+
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
+
+
+def search_decisions(db_path: str, filters: DecisionFilters) -> dict[str, Any]:
+    """服务端筛选决策日志，返回分页结果。"""
+    limit = max(1, min(int(filters.limit or 100), 500))
+    offset = max(0, int(filters.offset or 0))
+    filters = DecisionFilters(
+        symbols=filters.symbols,
+        types=filters.types,
+        start_ts_ms=filters.start_ts_ms,
+        end_ts_ms=filters.end_ts_ms,
+        hide_symbol_disabled=filters.hide_symbol_disabled,
+        limit=limit,
+        offset=offset,
+    )
+    where_sql, args = _decision_where(filters)
+    items = _rows(
+        db_path,
+        f"SELECT * FROM decisions{where_sql} ORDER BY ts_ms DESC, id DESC LIMIT ? OFFSET ?",
+        tuple(args + [limit, offset]),
+    )
+    total_rows = _rows(db_path, f"SELECT COUNT(*) AS total FROM decisions{where_sql}", tuple(args))
+    total = int(total_rows[0]["total"]) if total_rows else 0
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "filters": {
+            "symbols": filters.symbols,
+            "types": filters.types,
+            "start_ts_ms": filters.start_ts_ms,
+            "end_ts_ms": filters.end_ts_ms,
+            "hide_symbol_disabled": filters.hide_symbol_disabled,
+        },
+    }
 
 
 def recent_orders(db_path: str, limit: int = 50) -> list[dict]:

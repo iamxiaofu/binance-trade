@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.llm.schema import TradeDecision
 from src.state.runtime import RuntimeState
 from src.store.repo import Store
 from web import status
@@ -14,6 +15,21 @@ async def db(tmp_path):
     s = Store(path)
     await s.connect()
     await s.log_decision(symbol="BTCUSDT", skipped=True, skip_reason="flat", ref_price=100.0)
+    await s.log_decision(symbol="BNBUSDT", skipped=True, skip_reason="symbol disabled", ref_price=600.0)
+    await s.log_decision(
+        symbol="ETHUSDT",
+        decision=TradeDecision(
+            symbol="ETHUSDT",
+            action="OPEN_LONG",
+            confidence=0.7,
+            size_pct=0.1,
+            leverage=3,
+            stop_loss_pct=0.01,
+            take_profit_pct=0.02,
+            reason="trend",
+        ),
+        ref_price=3000.0,
+    )
     await s.log_order({"symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
                        "order_type": "market", "qty": 0.01, "price": 100.0,
                        "notional": 1.0, "dry_run": True, "status": "dry_run", "id": "", "raw": {}})
@@ -27,7 +43,7 @@ async def db(tmp_path):
 
 
 async def test_recent_queries(db):
-    assert len(status.recent_decisions(db)) == 1
+    assert len(status.recent_decisions(db)) == 3
     assert len(status.recent_orders(db)) == 1
     assert status.recent_rejects(db) == []
 
@@ -71,6 +87,48 @@ async def test_decision_detail(db):
     detail = status.decision_detail(db, d0["id"])
     assert detail is not None and detail["id"] == d0["id"]
     assert status.decision_detail(db, 999999) is None
+
+
+def test_search_decisions_filters_symbol(db):
+    res = status.search_decisions(db, status.DecisionFilters(symbols=["ETHUSDT"]))
+    assert res["total"] == 1
+    assert res["items"][0]["symbol"] == "ETHUSDT"
+
+
+def test_search_decisions_filters_type(db):
+    res = status.search_decisions(db, status.DecisionFilters(types=["OPEN_LONG"]))
+    assert res["total"] == 1
+    assert res["items"][0]["action"] == "OPEN_LONG"
+
+    skipped = status.search_decisions(db, status.DecisionFilters(types=["SKIPPED"]))
+    assert skipped["total"] == 2
+    assert all(row["skipped"] for row in skipped["items"])
+
+
+def test_search_decisions_filters_time_range(db):
+    rows = status.recent_decisions(db)
+    target = next(row for row in rows if row["symbol"] == "ETHUSDT")
+    res = status.search_decisions(
+        db,
+        status.DecisionFilters(
+            start_ts_ms=target["ts_ms"],
+            end_ts_ms=target["ts_ms"],
+        ),
+    )
+    assert res["total"] >= 1
+    assert all(row["ts_ms"] == target["ts_ms"] for row in res["items"])
+
+
+def test_search_decisions_hides_symbol_disabled(db):
+    res = status.search_decisions(db, status.DecisionFilters(hide_symbol_disabled=True))
+    assert res["total"] == 2
+    assert all(row["skip_reason"] != "symbol disabled" for row in res["items"])
+
+
+def test_search_decisions_pagination(db):
+    res = status.search_decisions(db, status.DecisionFilters(limit=1, offset=1))
+    assert res["total"] == 3
+    assert len(res["items"]) == 1
 
 
 async def test_missing_table_degrades_to_empty(tmp_path):
