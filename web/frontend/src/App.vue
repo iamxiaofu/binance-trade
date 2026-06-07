@@ -1,11 +1,12 @@
 <script setup>
-import { onMounted, onUnmounted, computed } from 'vue'
+import { onMounted, onUnmounted, computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useLiveStore } from './stores/live'
 
 const live = useLiveStore()
 const route = useRoute()
 const router = useRouter()
+const theme = ref(localStorage.getItem('binance-trade-theme') || 'light')
 
 const menu = [
   { index: '/dashboard', title: '总览', icon: 'Odometer' },
@@ -21,6 +22,7 @@ const lastUpdateText = computed(() =>
   live.lastUpdate ? live.lastUpdate.toLocaleTimeString() : '—'
 )
 const activePath = computed(() => route.path)
+const isDark = computed(() => theme.value === 'dark')
 
 function onMenuSelect(index) {
   if (route.path !== index) router.push(index)
@@ -44,7 +46,20 @@ function onVisibilityChange() {
   }
 }
 
+function applyTheme(value) {
+  theme.value = value
+  document.documentElement.classList.toggle('dark', value === 'dark')
+  document.documentElement.dataset.theme = value
+  localStorage.setItem('binance-trade-theme', value)
+  window.dispatchEvent(new Event('binance-trade-theme-change'))
+}
+
+function toggleTheme() {
+  applyTheme(isDark.value ? 'light' : 'dark')
+}
+
 onMounted(() => {
+  applyTheme(theme.value)
   live.connect()
   document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('pagehide', pauseLiveTransports)
@@ -58,13 +73,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <el-container style="height: 100vh">
-    <el-aside width="200px" style="background:#1f2329; color:#fff">
-      <div style="padding:18px 16px; font-size:18px; font-weight:600; color:#fff">
-        binance-trade
+  <el-container class="app-shell">
+    <el-aside width="200px" class="app-sidebar">
+      <div class="brand-title">
+        Binance-trade
       </div>
-      <el-menu :default-active="activePath" background-color="#1f2329"
-               text-color="#cfd3dc" active-text-color="#ffd04b" @select="onMenuSelect">
+      <el-menu :default-active="activePath" class="side-menu" @select="onMenuSelect">
         <el-menu-item v-for="m in menu" :key="m.index" :index="m.index">
           <el-icon><component :is="m.icon" /></el-icon>
           <span>{{ m.title }}</span>
@@ -73,18 +87,23 @@ onUnmounted(() => {
     </el-aside>
 
     <el-container>
-      <el-header style="display:flex; align-items:center; justify-content:space-between;
-                        background:#fff; border-bottom:1px solid #e5e7eb">
+      <el-header class="app-header">
         <span style="font-size:18px; font-weight:600">{{ route.meta.title || '' }}</span>
-        <span style="font-size:13px; color:#909399">
+        <div class="header-actions">
+          <el-button
+            circle
+            size="small"
+            :icon="isDark ? 'Sunny' : 'Moon'"
+            @click="toggleTheme"
+          />
           <el-tag :type="live.connected ? 'success' : 'danger'" size="small" effect="dark">
             {{ live.connected ? (live.transport === 'ws' ? '实时(WS)' : '实时(轮询)') : '已断开' }}
           </el-tag>
           <span style="margin-left:12px">更新于 {{ lastUpdateText }}</span>
-        </span>
+        </div>
       </el-header>
 
-      <el-main style="background:#f5f7fa">
+      <el-main class="app-main">
         <router-view />
       </el-main>
     </el-container>

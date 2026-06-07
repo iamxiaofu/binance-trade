@@ -368,13 +368,60 @@ async def api_rejects(limit: int = 100, _: str = Depends(_check_auth)):
 
 
 @app.get("/api/pnl")
-async def api_pnl(_: str = Depends(_check_auth)):
-    return st.pnl_stats(_DB)
+async def api_pnl(
+    range: str | None = Query(default=None),
+    start_ts_ms: int | None = Query(default=None),
+    end_ts_ms: int | None = Query(default=None),
+    _: str = Depends(_check_auth),
+):
+    start, end, resolved_range = st.resolve_time_bounds(
+        range_key=range,
+        start_ts_ms=start_ts_ms,
+        end_ts_ms=end_ts_ms,
+    )
+    stats = st.pnl_stats(_DB, st.PnlFilters(start_ts_ms=start, end_ts_ms=end))
+    stats["range"] = {
+        "key": resolved_range,
+        "start_ts_ms": start,
+        "end_ts_ms": end,
+    }
+    try:
+        live = await _live_positions_snapshot()
+        stats["day_unrealized_pnl"] = sum(
+            float(position.get("unrealized_pnl") or 0.0)
+            for position in live.get("positions", [])
+        )
+        stats["unrealized_source"] = "exchange"
+    except Exception as e:
+        logger.warning("live unrealized pnl unavailable, fallback to db snapshot: {}", e)
+        positions = st.latest_positions(_DB)
+        stats["day_unrealized_pnl"] = sum(
+            float(position.get("unrealized_pnl") or 0.0)
+            for position in positions
+        )
+        stats["unrealized_source"] = "db_snapshot"
+    return stats
 
 
 @app.get("/api/equity")
-async def api_equity(limit: int = 500, _: str = Depends(_check_auth)):
-    return st.balance_history(_DB, min(limit, 2000))
+async def api_equity(
+    range: str | None = Query(default=None),
+    start_ts_ms: int | None = Query(default=None),
+    end_ts_ms: int | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=2000),
+    _: str = Depends(_check_auth),
+):
+    start, end, _resolved_range = st.resolve_time_bounds(
+        range_key=range,
+        start_ts_ms=start_ts_ms,
+        end_ts_ms=end_ts_ms,
+    )
+    return st.balance_history(
+        _DB,
+        min(limit, 2000),
+        start_ts_ms=start,
+        end_ts_ms=end,
+    )
 
 
 @app.get("/api/commands")

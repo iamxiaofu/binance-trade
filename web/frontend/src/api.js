@@ -43,8 +43,11 @@ export const api = {
   },
   orders: (limit = 100) => req(`/api/orders?limit=${limit}`),
   rejects: (limit = 100) => req(`/api/rejects?limit=${limit}`),
-  pnl: () => req('/api/pnl'),
-  equity: (limit = 500) => req(`/api/equity?limit=${limit}`),
+  pnl: (params = {}) => req(`/api/pnl?${qs(params)}`),
+  equity: (params = 500) => {
+    const query = typeof params === 'number' ? qs({ limit: params }) : qs(params)
+    return req(`/api/equity?${query}`)
+  },
   commands: (limit = 50) => req(`/api/commands?limit=${limit}`),
   config: () => req('/api/config'),
   klines: (symbol, timeframe = '5m', limit = 200, source = undefined) =>

@@ -2,33 +2,72 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import * as echarts from 'echarts'
 import { api } from '../api'
+import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 
 const stats = ref(null)
 const barEl = ref(null)
+const range = ref(DEFAULT_TIME_RANGE)
 let chart = null
 
+function fmt(value, digits = 2) {
+  if (value === null || value === undefined || value === '') return '—'
+  const n = Number(value)
+  return Number.isFinite(n) ? n.toFixed(digits) : '—'
+}
+
+function pnlClass(value) {
+  return Number(value || 0) >= 0 ? 'pnl-pos' : 'pnl-neg'
+}
+
+function cssVar(name, fallback) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
+}
+
 async function load() {
-  stats.value = await api.pnl().catch(() => null)
+  stats.value = await api.pnl({ range: range.value }).catch(() => null)
   if (chart && stats.value) {
     const bySym = stats.value.close_by_symbol || {}
+    const textColor = cssVar('--bt-text', '#303133')
+    const mutedColor = cssVar('--bt-muted', '#909399')
+    const gridColor = cssVar('--bt-border', '#e5e7eb')
+    const barColor = cssVar('--bt-primary', '#409eff')
     chart.setOption({
-      tooltip: {},
+      tooltip: { backgroundColor: cssVar('--bt-card', '#ffffff'), textStyle: { color: textColor } },
       grid: { left: 50, right: 20, top: 20, bottom: 30 },
-      xAxis: { type: 'category', data: Object.keys(bySym) },
-      yAxis: { type: 'value' },
+      xAxis: {
+        type: 'category',
+        data: Object.keys(bySym),
+        axisLabel: { color: mutedColor },
+        axisLine: { lineStyle: { color: gridColor } },
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: mutedColor },
+        splitLine: { lineStyle: { color: gridColor } },
+      },
       series: [{ name: '平仓笔数', type: 'bar', data: Object.values(bySym),
-                 itemStyle: { color: '#409eff' } }],
+                 itemStyle: { color: barColor } }],
     })
   }
+}
+
+function onRangeChange() {
+  load().catch(() => {})
+}
+
+function onThemeChange() {
+  load().catch(() => {})
 }
 
 onMounted(async () => {
   chart = echarts.init(barEl.value)
   await load()
   window.addEventListener('resize', resize)
+  window.addEventListener('binance-trade-theme-change', onThemeChange)
 })
 onUnmounted(() => {
   window.removeEventListener('resize', resize)
+  window.removeEventListener('binance-trade-theme-change', onThemeChange)
   if (chart) chart.dispose()
 })
 function resize() { if (chart) chart.resize() }
@@ -37,39 +76,59 @@ function resize() { if (chart) chart.resize() }
 <template>
   <div class="page">
     <el-row :gutter="16">
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card class="metric-card" shadow="never">
           <div class="label">当日已实现盈亏 (USDT)</div>
-          <div class="value" :class="Number(stats?.day_realized_pnl) >= 0 ? 'pnl-pos' : 'pnl-neg'">
-            {{ stats ? Number(stats.day_realized_pnl).toFixed(2) : '—' }}
+          <div class="value" :class="pnlClass(stats?.day_realized_pnl)">
+            {{ stats ? fmt(stats.day_realized_pnl) : '—' }}
           </div>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card class="metric-card" shadow="never">
-          <div class="label">累计平仓笔数</div>
-          <div class="value">{{ stats ? stats.close_count : '—' }}</div>
+          <div class="label">当日未实现盈亏 (USDT)</div>
+          <div class="value" :class="pnlClass(stats?.day_unrealized_pnl)">
+            {{ stats ? fmt(stats.day_unrealized_pnl) : '—' }}
+          </div>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card class="metric-card" shadow="never">
-          <div class="label">交易标的数</div>
-          <div class="value">{{ stats ? Object.keys(stats.close_by_symbol || {}).length : '—' }}</div>
+          <div class="label">范围已实现盈亏 (USDT)</div>
+          <div class="value" :class="pnlClass(stats?.range_net_realized_pnl)">
+            {{ stats ? fmt(stats.range_net_realized_pnl) : '—' }}
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <div class="label">范围交易数 / 平仓笔数</div>
+          <div class="value">{{ stats ? `${stats.range_trade_count} / ${stats.range_close_count}` : '—' }}</div>
         </el-card>
       </el-col>
     </el-row>
 
     <el-card shadow="never" style="margin-top:16px">
       <template #header>
-        <div style="display:flex; justify-content:space-between; align-items:center">
-          <span>各标的平仓笔数</span>
-          <el-button size="small" :icon="'Refresh'" @click="load">刷新</el-button>
+        <div class="card-header-row">
+          <span>各币种平仓笔数</span>
+          <div class="toolbar-row">
+            <el-radio-group v-model="range" size="small" @change="onRangeChange">
+              <el-radio-button
+                v-for="item in QUICK_TIME_RANGES"
+                :key="item.value"
+                :value="item.value"
+              >
+                {{ item.label }}
+              </el-radio-button>
+            </el-radio-group>
+            <el-button size="small" :icon="'Refresh'" @click="load">刷新</el-button>
+          </div>
         </div>
       </template>
       <div ref="barEl" style="height:320px"></div>
       <div style="color:#909399; font-size:12px; margin-top:8px">
-        说明：已实现盈亏为运行态累计（入场价 vs 标记价近似，未计手续费/资金费），用于驱动日亏熔断；
-        精确对账以交易所流水为准。
+        说明：当日已实现盈亏来自运行态余额快照；当日未实现盈亏优先来自交易所实时持仓，失败时回退到最近持仓快照。
       </div>
     </el-card>
   </div>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+import sqlite3
 
 from src.llm.schema import TradeDecision
 from src.state.runtime import RuntimeState
@@ -79,11 +80,79 @@ async def test_balance_history_ascending(db):
     assert "total_equity" in hist[0]
 
 
+async def test_balance_history_filters_time_range(db):
+    s = Store(db)
+    await s.connect()
+    rt = RuntimeState()
+    await s.snapshot_balance(total_equity=210.0, available_margin=190.0, runtime=rt)
+    await s.snapshot_balance(total_equity=220.0, available_margin=200.0, runtime=rt)
+    await s.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        ids = [row[0] for row in conn.execute("SELECT id FROM balance_snapshots ORDER BY id")]
+        for ts, row_id in zip([1000, 2000, 3000], ids, strict=True):
+            conn.execute("UPDATE balance_snapshots SET ts_ms = ? WHERE id = ?", (ts, row_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    hist = status.balance_history(db, start_ts_ms=1500, end_ts_ms=2500)
+    assert [row["ts_ms"] for row in hist] == [2000]
+
+    sampled = status.balance_history(db, limit=2, start_ts_ms=0, end_ts_ms=4000)
+    assert len(sampled) == 2
+
+
 async def test_pnl_stats(db):
     s = status.pnl_stats(db)
-    assert set(s) == {"day_realized_pnl", "close_count", "close_by_symbol"}
     assert s["close_count"] == 1
+    assert s["range_close_count"] == 1
+    assert s["trade_count"] == 1
+    assert s["range_trade_count"] == 1
     assert s["close_by_symbol"] == {"BTCUSDT": 1}
+    assert s["trade_by_symbol"] == {"BTCUSDT": 1}
+    assert "range_net_realized_pnl" in s
+
+
+def test_resolve_time_bounds_quick_range():
+    start, end, key = status.resolve_time_bounds(range_key="3h", now_ms=10_800_000)
+    assert key == "3h"
+    assert start == 0
+    assert end == 10_800_000
+
+
+def test_resolve_time_bounds_custom_range():
+    start, end, key = status.resolve_time_bounds(
+        start_ts_ms=1000,
+        end_ts_ms=2000,
+        range_key="1h",
+    )
+    assert key == "custom"
+    assert start == 1000
+    assert end == 2000
+
+
+def test_pnl_stats_filters_time_range(db):
+    rows = status.recent_orders(db)
+    close = next(row for row in rows if row["client_kind"] == "CLOSE")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE orders SET ts_ms = 1000 WHERE client_kind = 'OPEN'")
+        conn.execute("UPDATE orders SET ts_ms = 5000 WHERE client_kind = 'CLOSE'")
+        conn.execute("UPDATE trades SET opened_at_ms = 1000")
+        conn.commit()
+    finally:
+        conn.close()
+
+    empty = status.pnl_stats(db, status.PnlFilters(start_ts_ms=0, end_ts_ms=2000))
+    assert empty["range_close_count"] == 0
+    assert empty["range_trade_count"] == 1
+
+    matched = status.pnl_stats(db, status.PnlFilters(start_ts_ms=4000, end_ts_ms=6000))
+    assert matched["range_close_count"] == 1
+    assert matched["range_trade_count"] == 0
+    assert matched["close_by_symbol"] == {close["symbol"]: 1}
 
 
 async def test_decision_detail(db):

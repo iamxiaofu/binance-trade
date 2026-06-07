@@ -2,18 +2,89 @@
   color-scheme: light dark;
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
+  --bt-bg: #f5f7fa;
+  --bt-card: #ffffff;
+  --bt-header: #ffffff;
+  --bt-sidebar: #1f2329;
+  --bt-sidebar-text: #cfd3dc;
+  --bt-sidebar-active: #ffd04b;
+  --bt-text: #303133;
+  --bt-muted: #909399;
+  --bt-border: #e5e7eb;
+  --bt-primary: #409eff;
   font-family: var(--sans);
+}
+
+html.dark {
+  color-scheme: dark;
+  --bt-bg: #111827;
+  --bt-card: #1f2937;
+  --bt-header: #172033;
+  --bt-sidebar: #0f172a;
+  --bt-sidebar-text: #cbd5e1;
+  --bt-sidebar-active: #facc15;
+  --bt-text: #e5e7eb;
+  --bt-muted: #94a3b8;
+  --bt-border: #334155;
+  --bt-primary: #60a5fa;
 }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  background: #f5f7fa;
+  background: var(--bt-bg);
+  color: var(--bt-text);
 }
 
 #app {
   min-height: 100vh;
+}
+
+.app-shell {
+  height: 100vh;
+}
+
+.app-sidebar {
+  background: var(--bt-sidebar);
+  color: #fff;
+}
+
+.brand-title {
+  padding: 18px 16px;
+  font-size: 18px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.side-menu {
+  border-right: 0;
+  background: var(--bt-sidebar);
+  --el-menu-bg-color: var(--bt-sidebar);
+  --el-menu-text-color: var(--bt-sidebar-text);
+  --el-menu-hover-bg-color: rgba(255, 255, 255, 0.08);
+  --el-menu-active-color: var(--bt-sidebar-active);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bt-header);
+  border-bottom: 1px solid var(--bt-border);
+  color: var(--bt-text);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--bt-muted);
+}
+
+.app-main {
+  background: var(--bt-bg);
 }
 
 .mono { font-family: var(--mono); }
@@ -39,3 +110,28 @@ body {
 .page h2 { margin: 0 0 14px; font-size: 20px; }
 
 .chart-box { width: 100%; }
+
+.card-header-row,
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-header-row {
+  justify-content: space-between;
+}
+
+html.dark .el-card,
+html.dark .el-table,
+html.dark .el-descriptions,
+html.dark .el-pagination {
+  --el-bg-color-overlay: var(--bt-card);
+}
+
+html.dark .metric-card,
+html.dark .el-card {
+  background: var(--bt-card);
+  border-color: var(--bt-border);
+  color: var(--bt-text);
+}

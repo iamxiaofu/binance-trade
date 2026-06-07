@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import sqlite3
+import time
 from typing import Any
 
 
@@ -117,6 +118,70 @@ def search_decisions(db_path: str, filters: DecisionFilters) -> dict[str, Any]:
 
 def recent_orders(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
+
+
+RANGE_MS: dict[str, int] = {
+    "1h": 60 * 60 * 1000,
+    "3h": 3 * 60 * 60 * 1000,
+    "12h": 12 * 60 * 60 * 1000,
+    "1d": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000,
+    "30d": 30 * 24 * 60 * 60 * 1000,
+}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def resolve_time_bounds(
+    *,
+    range_key: str | None = None,
+    start_ts_ms: int | None = None,
+    end_ts_ms: int | None = None,
+    now_ms: int | None = None,
+) -> tuple[int | None, int | None, str]:
+    """Resolve quick range/custom range into timestamp bounds."""
+    end = end_ts_ms if end_ts_ms is not None else (now_ms or _now_ms())
+    if start_ts_ms is not None:
+        return start_ts_ms, end, "custom"
+    key = (range_key or "").strip().lower()
+    if key in RANGE_MS:
+        return end - RANGE_MS[key], end, key
+    return None, end_ts_ms, ""
+
+
+def _ts_where(
+    column: str,
+    *,
+    start_ts_ms: int | None = None,
+    end_ts_ms: int | None = None,
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    args: list[Any] = []
+    if start_ts_ms is not None:
+        clauses.append(f"{column} >= ?")
+        args.append(start_ts_ms)
+    if end_ts_ms is not None:
+        clauses.append(f"{column} <= ?")
+        args.append(end_ts_ms)
+    return clauses, args
+
+
+def _sample_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or len(rows) <= limit:
+        return rows
+    if limit == 1:
+        return [rows[-1]]
+    step = (len(rows) - 1) / (limit - 1)
+    picked = []
+    seen: set[int] = set()
+    for i in range(limit):
+        idx = round(i * step)
+        if idx not in seen:
+            picked.append(rows[idx])
+            seen.add(idx)
+    return picked
 
 
 @dataclass(frozen=True)
@@ -243,12 +308,35 @@ def latest_balance(db_path: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def balance_history(db_path: str, limit: int = 500) -> list[dict]:
+def balance_history(
+    db_path: str,
+    limit: int = 500,
+    *,
+    start_ts_ms: int | None = None,
+    end_ts_ms: int | None = None,
+) -> list[dict]:
     """权益曲线数据：按时间升序的余额快照。"""
+    limit = max(1, min(int(limit or 500), 2000))
+    cols = (
+        "SELECT ts_ms, created_at, total_equity, available_margin, "
+        "day_realized_pnl, drawdown_pct FROM balance_snapshots"
+    )
+    clauses, args = _ts_where(
+        "ts_ms",
+        start_ts_ms=start_ts_ms,
+        end_ts_ms=end_ts_ms,
+    )
+    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    if clauses:
+        rows = _rows(
+            db_path,
+            f"{cols}{where_sql} ORDER BY ts_ms ASC, id ASC",
+            tuple(args),
+        )
+        return _sample_rows(rows, limit)
     rows = _rows(
         db_path,
-        "SELECT ts_ms, created_at, total_equity, available_margin, day_realized_pnl, "
-        "drawdown_pct FROM balance_snapshots ORDER BY id DESC LIMIT ?",
+        f"{cols} ORDER BY id DESC LIMIT ?",
         (limit,),
     )
     return list(reversed(rows))
@@ -264,27 +352,72 @@ def decision_detail(db_path: str, decision_id: int) -> dict | None:
     return rows[0] if rows else None
 
 
-def pnl_stats(db_path: str) -> dict:
-    """盈亏统计：累计/当日已实现盈亏、平仓笔数、胜率（基于 orders 的 CLOSE/SL/TP）。
+@dataclass(frozen=True)
+class PnlFilters:
+    start_ts_ms: int | None = None
+    end_ts_ms: int | None = None
+
+
+def pnl_stats(db_path: str, filters: PnlFilters | None = None) -> dict:
+    """盈亏统计：当日盈亏、范围内平仓笔数和交易数。
 
     已实现盈亏的权威值在 balance_snapshots.day_realized_pnl（运行态累计）；
-    这里再用平仓订单数估算笔数与胜率，作为辅助展示。
+    范围统计基于 orders/trades 的时间戳过滤，作为复盘视图。
     """
+    filters = filters or PnlFilters()
     latest = latest_balance(db_path)
     day_pnl = latest["day_realized_pnl"] if latest else 0.0
-    # 平仓类订单
+    clauses, args = _ts_where(
+        "ts_ms",
+        start_ts_ms=filters.start_ts_ms,
+        end_ts_ms=filters.end_ts_ms,
+    )
+    where_sql = (" AND " + " AND ".join(clauses)) if clauses else ""
     closes = _rows(
         db_path,
-        "SELECT symbol, notional, status FROM orders "
-        "WHERE client_kind IN ('CLOSE','SL','TP') AND status IN ('filled','partial')",
+        "SELECT symbol, notional, status, realized_pnl, fee FROM orders "
+        "WHERE client_kind IN ('CLOSE','SL','TP') "
+        f"AND status IN ('filled','partial'){where_sql}",
+        tuple(args),
     )
     by_symbol: dict[str, int] = {}
+    range_realized_pnl = 0.0
+    range_fee = 0.0
     for c in closes:
         by_symbol[c["symbol"]] = by_symbol.get(c["symbol"], 0) + 1
+        range_realized_pnl += float(c.get("realized_pnl") or 0.0)
+        range_fee += float(c.get("fee") or 0.0)
+
+    trade_clauses, trade_args = _ts_where(
+        "opened_at_ms",
+        start_ts_ms=filters.start_ts_ms,
+        end_ts_ms=filters.end_ts_ms,
+    )
+    trade_where = (" WHERE " + " AND ".join(trade_clauses)) if trade_clauses else ""
+    trade_rows = _rows(
+        db_path,
+        f"SELECT symbol, status FROM trades{trade_where}",
+        tuple(trade_args),
+    )
+    trade_by_symbol: dict[str, int] = {}
+    for t in trade_rows:
+        trade_by_symbol[t["symbol"]] = trade_by_symbol.get(t["symbol"], 0) + 1
+
     return {
         "day_realized_pnl": day_pnl,
         "close_count": len(closes),
+        "range_close_count": len(closes),
+        "trade_count": len(trade_rows),
+        "range_trade_count": len(trade_rows),
+        "range_realized_pnl": range_realized_pnl,
+        "range_fee": range_fee,
+        "range_net_realized_pnl": range_realized_pnl - range_fee,
         "close_by_symbol": by_symbol,
+        "trade_by_symbol": trade_by_symbol,
+        "filters": {
+            "start_ts_ms": filters.start_ts_ms,
+            "end_ts_ms": filters.end_ts_ms,
+        },
     }
 
 

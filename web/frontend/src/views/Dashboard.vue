@@ -4,10 +4,12 @@ import * as echarts from 'echarts'
 import { useLiveStore } from '../stores/live'
 import { api } from '../api'
 import { decisionLabel, localTime } from '../labels'
+import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 
 const live = useLiveStore()
 const cfg = ref(null)
 const equityEl = ref(null)
+const equityRange = ref(DEFAULT_TIME_RANGE)
 let chart = null
 
 const bal = computed(() => live.balance || {})
@@ -20,20 +22,46 @@ function fmt(n, d = 2) {
   return Number(n).toFixed(d)
 }
 
+function cssVar(name, fallback) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
+}
+
 async function loadEquity() {
-  const data = await api.equity(500)
+  const data = await api.equity({ range: equityRange.value, limit: 800 })
   if (!chart) return
+  const textColor = cssVar('--bt-text', '#303133')
+  const mutedColor = cssVar('--bt-muted', '#909399')
+  const gridColor = cssVar('--bt-border', '#e5e7eb')
+  const lineColor = cssVar('--bt-primary', '#409eff')
   chart.setOption({
-    tooltip: { trigger: 'axis' },
+    tooltip: { trigger: 'axis', backgroundColor: cssVar('--bt-card', '#ffffff'), textStyle: { color: textColor } },
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: data.map(d => d.created_at), axisLabel: { show: false } },
-    yAxis: { type: 'value', scale: true },
+    xAxis: {
+      type: 'category',
+      data: data.map(d => d.created_at),
+      axisLabel: { show: false, color: mutedColor },
+      axisLine: { lineStyle: { color: gridColor } },
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      axisLabel: { color: mutedColor },
+      splitLine: { lineStyle: { color: gridColor } },
+    },
     series: [{
       name: '权益', type: 'line', smooth: true, showSymbol: false,
       data: data.map(d => d.total_equity), areaStyle: { opacity: 0.1 },
-      lineStyle: { color: '#409eff' }, itemStyle: { color: '#409eff' },
+      lineStyle: { color: lineColor }, itemStyle: { color: lineColor },
     }],
   })
+}
+
+function onRangeChange() {
+  loadEquity().catch(() => {})
+}
+
+function onThemeChange() {
+  loadEquity().catch(() => {})
 }
 
 onMounted(async () => {
@@ -41,9 +69,11 @@ onMounted(async () => {
   chart = echarts.init(equityEl.value)
   await loadEquity().catch(() => {})
   window.addEventListener('resize', resize)
+  window.addEventListener('binance-trade-theme-change', onThemeChange)
 })
 onUnmounted(() => {
   window.removeEventListener('resize', resize)
+  window.removeEventListener('binance-trade-theme-change', onThemeChange)
   if (chart) chart.dispose()
 })
 function resize() { if (chart) chart.resize() }
@@ -87,7 +117,20 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
     <el-row :gutter="16" style="margin-top:16px">
       <el-col :span="16">
         <el-card shadow="never">
-          <template #header>权益曲线</template>
+          <template #header>
+            <div class="card-header-row">
+              <span>权益曲线</span>
+              <el-radio-group v-model="equityRange" size="small" @change="onRangeChange">
+                <el-radio-button
+                  v-for="item in QUICK_TIME_RANGES"
+                  :key="item.value"
+                  :value="item.value"
+                >
+                  {{ item.label }}
+                </el-radio-button>
+              </el-radio-group>
+            </div>
+          </template>
           <div ref="equityEl" class="chart-box" style="height:320px"></div>
         </el-card>
       </el-col>
