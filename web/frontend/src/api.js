@@ -37,6 +37,10 @@ export const api = {
     return req(`/api/decisions?${query}`)
   },
   decisionDetail: (id) => req(`/api/decisions/${id}`),
+  trades: (params = 100) => {
+    const query = typeof params === 'number' ? qs({ limit: params }) : qs(params)
+    return req(`/api/trades?${query}`)
+  },
   orders: (limit = 100) => req(`/api/orders?limit=${limit}`),
   rejects: (limit = 100) => req(`/api/rejects?limit=${limit}`),
   pnl: () => req('/api/pnl'),

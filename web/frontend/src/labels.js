@@ -83,6 +83,43 @@ export function orderTypeLabel(type) {
   }[type] || type || '—'
 }
 
+export function tradeDirectionLabel(direction) {
+  return { long: '多单', short: '空单' }[direction] || direction || '—'
+}
+
+export function tradeDirectionTag(direction) {
+  return { long: 'success', short: 'danger' }[direction] || 'info'
+}
+
+export function tradeStatusLabel(status) {
+  return {
+    open: '持仓中',
+    closed: '已平仓',
+    partial: '部分平仓',
+    unmatched: '未匹配',
+  }[status] || status || '—'
+}
+
+export function tradeStatusTag(status) {
+  return {
+    open: 'primary',
+    closed: 'success',
+    partial: 'warning',
+    unmatched: 'info',
+  }[status] || 'info'
+}
+
+export function exitReasonLabel(reason) {
+  return {
+    CLOSE: '策略平仓',
+    TP: '止盈成交',
+    SL: '止损成交',
+    EMERGENCY: '保护平仓',
+    CIRCUIT: '熔断平仓',
+    UNKNOWN: '未知退出',
+  }[reason] || reason || '—'
+}
+
 export function rejectCodeLabel(code) {
   return {
     LOW_CONFIDENCE: '置信度不足',

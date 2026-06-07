@@ -119,6 +119,107 @@ def recent_orders(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
 
 
+@dataclass(frozen=True)
+class TradeFilters:
+    symbols: list[str] = field(default_factory=list)
+    directions: list[str] = field(default_factory=list)
+    statuses: list[str] = field(default_factory=list)
+    exit_reasons: list[str] = field(default_factory=list)
+    start_ts_ms: int | None = None
+    end_ts_ms: int | None = None
+    limit: int = 100
+    offset: int = 0
+
+
+def _trade_where(filters: TradeFilters) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    args: list[Any] = []
+
+    symbols = [s.strip().upper() for s in filters.symbols if s and s.strip()]
+    if symbols:
+        placeholders = ",".join("?" for _ in symbols)
+        clauses.append(f"symbol IN ({placeholders})")
+        args.extend(symbols)
+
+    directions = [d.strip().lower() for d in filters.directions if d and d.strip()]
+    if directions:
+        placeholders = ",".join("?" for _ in directions)
+        clauses.append(f"direction IN ({placeholders})")
+        args.extend(directions)
+
+    statuses = [s.strip().lower() for s in filters.statuses if s and s.strip()]
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        args.extend(statuses)
+
+    exit_reasons = [r.strip().upper() for r in filters.exit_reasons if r and r.strip()]
+    if exit_reasons:
+        placeholders = ",".join("?" for _ in exit_reasons)
+        clauses.append(f"exit_reason IN ({placeholders})")
+        args.extend(exit_reasons)
+
+    if filters.start_ts_ms is not None:
+        clauses.append("opened_at_ms >= ?")
+        args.append(filters.start_ts_ms)
+    if filters.end_ts_ms is not None:
+        clauses.append("opened_at_ms <= ?")
+        args.append(filters.end_ts_ms)
+
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
+
+
+def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
+    """服务端筛选交易组，返回聚合交易和明细订单。"""
+    limit = max(1, min(int(filters.limit or 100), 500))
+    offset = max(0, int(filters.offset or 0))
+    filters = TradeFilters(
+        symbols=filters.symbols,
+        directions=filters.directions,
+        statuses=filters.statuses,
+        exit_reasons=filters.exit_reasons,
+        start_ts_ms=filters.start_ts_ms,
+        end_ts_ms=filters.end_ts_ms,
+        limit=limit,
+        offset=offset,
+    )
+    where_sql, args = _trade_where(filters)
+    items = _rows(
+        db_path,
+        f"SELECT * FROM trades{where_sql} ORDER BY opened_at_ms DESC, id DESC LIMIT ? OFFSET ?",
+        tuple(args + [limit, offset]),
+    )
+    total_rows = _rows(db_path, f"SELECT COUNT(*) AS total FROM trades{where_sql}", tuple(args))
+    total = int(total_rows[0]["total"]) if total_rows else 0
+    if items:
+        ids = [int(row["id"]) for row in items]
+        placeholders = ",".join("?" for _ in ids)
+        order_rows = _rows(
+            db_path,
+            f"SELECT * FROM orders WHERE trade_id IN ({placeholders}) ORDER BY ts_ms, id",
+            tuple(ids),
+        )
+        by_trade: dict[int, list[dict[str, Any]]] = {}
+        for row in order_rows:
+            by_trade.setdefault(int(row.get("trade_id") or 0), []).append(row)
+        for item in items:
+            item["orders"] = by_trade.get(int(item["id"]), [])
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "filters": {
+            "symbols": filters.symbols,
+            "directions": filters.directions,
+            "statuses": filters.statuses,
+            "exit_reasons": filters.exit_reasons,
+            "start_ts_ms": filters.start_ts_ms,
+            "end_ts_ms": filters.end_ts_ms,
+        },
+    }
+
+
 def recent_rejects(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM rejects ORDER BY id DESC LIMIT ?", (limit,))
 

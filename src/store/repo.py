@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.exchange.positions import normalize_position, normalize_symbol
@@ -30,7 +30,87 @@ from src.store.models import (
     PositionSnapshotRow,
     RejectRow,
     RuntimeSettingRow,
+    TradeRow,
 )
+
+
+_ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("trade_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("trade_role", "VARCHAR(24) NOT NULL DEFAULT ''"),
+    ("leverage", "INTEGER NOT NULL DEFAULT 0"),
+    ("margin", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("realized_pnl", "FLOAT NOT NULL DEFAULT 0.0"),
+)
+
+_FILLED_ORDER_STATUSES = {"filled", "partial", "dry_run"}
+_TRIGGERED_CONDITION_STATUSES = {"filled", "partial"}
+_OPEN_TRADE_STATUSES = {"open", "partial"}
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _direction_from_open_side(side: str) -> str:
+    side = (side or "").lower()
+    if side == "buy":
+        return "long"
+    if side == "sell":
+        return "short"
+    return ""
+
+
+def _direction_from_close_side(side: str) -> str:
+    side = (side or "").lower()
+    if side == "sell":
+        return "long"
+    if side == "buy":
+        return "short"
+    return ""
+
+
+def _trade_role(kind: str) -> str:
+    return {
+        "OPEN": "ENTRY",
+        "CLOSE": "EXIT",
+        "SL": "PROTECTION_SL",
+        "TP": "PROTECTION_TP",
+    }.get(kind, "")
+
+
+def _realized_pnl(*, direction: str, entry_price: float, exit_price: float, qty: float) -> float:
+    if direction not in ("long", "short") or entry_price <= 0 or exit_price <= 0 or qty <= 0:
+        return 0.0
+    sign = 1.0 if direction == "long" else -1.0
+    return (exit_price - entry_price) * qty * sign
+
+
+def _margin(notional: float, leverage: int) -> float:
+    return abs(notional) / leverage if leverage > 0 else 0.0
+
+
+def _pnl_pct(pnl: float, margin: float) -> float:
+    return (pnl / margin) * 100.0 if margin > 0 else 0.0
+
+
+def _raw_number(raw_json: str, key: str) -> float:
+    try:
+        raw = json.loads(raw_json or "{}")
+    except Exception:
+        return 0.0
+    if not isinstance(raw, dict):
+        return 0.0
+    return _safe_float(raw.get(key))
 
 
 class Store:
@@ -52,7 +132,19 @@ class Store:
         """建表（幂等）。"""
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await self._upgrade_schema(conn)
+        await self.backfill_trades()
         logger.info("store connected: {}", self._db_path)
+
+    async def _upgrade_schema(self, conn) -> None:
+        """SQLite 轻量迁移：create_all 不会给既有表自动补列。"""
+        existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(orders)"))).fetchall()
+        }
+        for name, ddl in _ORDER_EXTENSION_COLUMNS:
+            if name not in existing:
+                await conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -61,6 +153,30 @@ class Store:
         async with self._sessionmaker() as session:
             session.add(row)
             await session.commit()
+
+    async def backfill_trades(self) -> int:
+        """把没有 trade_id 的历史订单按仓位生命周期归组，幂等执行。"""
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(OrderRow)
+                    .where(OrderRow.trade_id == 0)
+                    .where(OrderRow.client_kind.in_(("OPEN", "SL", "TP", "CLOSE")))
+                    .order_by(OrderRow.ts_ms, OrderRow.id)
+                )
+            ).scalars().all()
+            changed = 0
+            for row in rows:
+                before = row.trade_id
+                await self._attach_order_to_trade(
+                    session, row, source="backfill", confidence="inferred"
+                )
+                if row.trade_id != before:
+                    changed += 1
+            await session.commit()
+            if changed:
+                logger.info("backfilled {} historical orders into trades", changed)
+            return changed
 
     # ---------- 决策日志 ----------
     async def log_decision(
@@ -108,25 +224,215 @@ class Store:
         await self._add(row)
 
     # ---------- 订单 ----------
-    async def log_order(self, order: dict) -> None:
+    async def log_order(self, order: dict) -> dict[str, int]:
         """order 为 executor 产出的标准化 dict。"""
+        async with self._sessionmaker() as session:
+            row = self._order_row_from_dict(order)
+            session.add(row)
+            await session.flush()
+            await self._attach_order_to_trade(session, row, source="live", confidence="exact")
+            await session.commit()
+            return {"order_id": row.id, "trade_id": row.trade_id}
+
+    def _order_row_from_dict(self, order: dict) -> OrderRow:
         row = OrderRow(
             symbol=order.get("symbol", ""),
             client_kind=order.get("kind", ""),
             side=order.get("side", ""),
             order_type=order.get("order_type", ""),
-            qty=float(order.get("qty") or 0.0),
-            price=float(order.get("price") or 0.0),
-            notional=float(order.get("notional") or 0.0),
+            qty=_safe_float(order.get("qty")),
+            price=_safe_float(order.get("price")),
+            notional=_safe_float(order.get("notional")),
             dry_run=bool(order.get("dry_run", True)),
             status=order.get("status", ""),
             exchange_order_id=str(order.get("id") or ""),
+            leverage=_safe_int(order.get("leverage")),
+            margin=_safe_float(order.get("margin")),
+            realized_pnl=_safe_float(order.get("realized_pnl")),
         )
+        trade_id = _safe_int(order.get("trade_id"))
+        if trade_id > 0:
+            row.trade_id = trade_id
+        role = str(order.get("trade_role") or _trade_role(row.client_kind))
+        row.trade_role = role[:24]
         try:
             row.raw_json = json.dumps(order.get("raw") or {}, default=str)[:8000]
         except Exception:
             row.raw_json = ""
-        await self._add(row)
+        return row
+
+    async def _attach_order_to_trade(
+        self,
+        session: AsyncSession,
+        row: OrderRow,
+        *,
+        source: str,
+        confidence: str,
+    ) -> None:
+        kind = row.client_kind
+        status = str(row.status or "")
+        if kind == "OPEN":
+            if status in _FILLED_ORDER_STATUSES:
+                trade = await self._create_trade_from_open(
+                    session, row, source=source, confidence=confidence
+                )
+                row.trade_id = trade.id
+                row.trade_role = "ENTRY"
+                row.leverage = trade.leverage
+                row.margin = trade.entry_margin
+            return
+
+        if kind in ("SL", "TP"):
+            trade = await self._find_open_trade_for_order(session, row)
+            if trade is None:
+                trade = await self._find_recent_trade_for_condition(session, row)
+            if trade is None:
+                return
+            row.trade_id = trade.id
+            row.trade_role = _trade_role(kind)
+            row.leverage = trade.leverage
+            row.margin = _margin(row.notional, trade.leverage)
+            if status in _TRIGGERED_CONDITION_STATUSES and trade.status != "closed":
+                self._close_trade_with_order(trade, row, exit_reason=kind)
+            return
+
+        if kind == "CLOSE":
+            trade = await self._find_open_trade_for_order(session, row)
+            if trade is None:
+                return
+            row.trade_id = trade.id
+            row.trade_role = "EXIT"
+            row.leverage = trade.leverage
+            row.margin = _margin(row.notional, trade.leverage)
+            if status in _FILLED_ORDER_STATUSES:
+                self._close_trade_with_order(trade, row, exit_reason="CLOSE")
+
+    async def _create_trade_from_open(
+        self,
+        session: AsyncSession,
+        row: OrderRow,
+        *,
+        source: str,
+        confidence: str,
+    ) -> TradeRow:
+        direction = _direction_from_open_side(row.side)
+        leverage = row.leverage or await self._infer_leverage(session, row)
+        entry_margin = row.margin or _margin(row.notional, leverage)
+        trade = TradeRow(
+            ts_ms=row.ts_ms,
+            created_at=row.created_at,
+            symbol=row.symbol,
+            direction=direction,
+            status="open",
+            dry_run=row.dry_run,
+            opened_at_ms=row.ts_ms,
+            opened_at=row.created_at,
+            entry_order_id=row.id,
+            entry_price=row.price,
+            qty_opened=row.qty,
+            leverage=leverage,
+            entry_notional=row.notional,
+            entry_margin=entry_margin,
+            source=source,
+            confidence=confidence,
+        )
+        session.add(trade)
+        await session.flush()
+        return trade
+
+    async def _find_open_trade_for_order(self, session: AsyncSession, row: OrderRow) -> TradeRow | None:
+        if row.trade_id:
+            trade = await session.get(TradeRow, row.trade_id)
+            if trade is not None:
+                return trade
+
+        direction = _direction_from_close_side(row.side)
+        stmt = (
+            select(TradeRow)
+            .where(TradeRow.symbol == row.symbol)
+            .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+            .where(TradeRow.dry_run.is_(row.dry_run))
+            .where(TradeRow.opened_at_ms <= row.ts_ms)
+        )
+        if direction:
+            stmt = stmt.where(TradeRow.direction == direction)
+        rows = (
+            await session.execute(
+                stmt.order_by(TradeRow.opened_at_ms.desc(), TradeRow.id.desc())
+            )
+        ).scalars().all()
+        for trade in rows:
+            if self._qty_matches(trade.qty_opened, row.qty):
+                return trade
+        return rows[0] if rows else None
+
+    async def _find_recent_trade_for_condition(
+        self,
+        session: AsyncSession,
+        row: OrderRow,
+    ) -> TradeRow | None:
+        direction = _direction_from_close_side(row.side)
+        stmt = (
+            select(TradeRow)
+            .where(TradeRow.symbol == row.symbol)
+            .where(TradeRow.dry_run.is_(row.dry_run))
+            .where(TradeRow.opened_at_ms <= row.ts_ms)
+        )
+        if direction:
+            stmt = stmt.where(TradeRow.direction == direction)
+        rows = (
+            await session.execute(
+                stmt.order_by(TradeRow.opened_at_ms.desc(), TradeRow.id.desc()).limit(20)
+            )
+        ).scalars().all()
+        for trade in rows:
+            if self._qty_matches(trade.qty_opened, row.qty):
+                return trade
+        return None
+
+    @staticmethod
+    def _qty_matches(base_qty: float, row_qty: float) -> bool:
+        if base_qty <= 0 or row_qty <= 0:
+            return False
+        return abs(base_qty - row_qty) <= max(abs(base_qty) * 1e-6, 1e-12)
+
+    async def _infer_leverage(self, session: AsyncSession, row: OrderRow) -> int:
+        action = "OPEN_LONG" if row.side == "buy" else "OPEN_SHORT" if row.side == "sell" else ""
+        if not action:
+            return 0
+        stmt = (
+            select(DecisionRow.leverage)
+            .where(DecisionRow.symbol == row.symbol)
+            .where(DecisionRow.skipped.is_(False))
+            .where(DecisionRow.action == action)
+            .where(DecisionRow.ts_ms <= row.ts_ms)
+            .order_by(DecisionRow.ts_ms.desc(), DecisionRow.id.desc())
+            .limit(1)
+        )
+        leverage = (await session.execute(stmt)).scalar_one_or_none()
+        return _safe_int(leverage)
+
+    def _close_trade_with_order(self, trade: TradeRow, row: OrderRow, *, exit_reason: str) -> None:
+        qty = row.qty if row.qty > 0 else trade.qty_opened
+        exit_price = _raw_number(row.raw_json, "filled_price") or row.price
+        pnl = row.realized_pnl or _realized_pnl(
+            direction=trade.direction,
+            entry_price=trade.entry_price,
+            exit_price=exit_price,
+            qty=qty,
+        )
+        margin = trade.entry_margin or _margin(trade.entry_notional, trade.leverage)
+        trade.status = "closed"
+        trade.closed_at_ms = row.ts_ms
+        trade.closed_at = row.created_at
+        trade.exit_order_id = row.id
+        trade.exit_price = exit_price
+        trade.qty_closed = qty
+        trade.exit_notional = abs(qty * exit_price) if exit_price > 0 else row.notional
+        trade.realized_pnl = pnl
+        trade.pnl_pct_on_margin = _pnl_pct(pnl, margin)
+        trade.exit_reason = exit_reason
+        row.realized_pnl = pnl
 
     async def mark_orders_status_by_exchange_ids(
         self,
@@ -145,6 +451,7 @@ class Store:
             ).scalars().all()
             for row in rows:
                 row.status = status
+                await self._refresh_trade_for_existing_order(session, row)
             await session.commit()
             return len(rows)
 
@@ -170,9 +477,29 @@ class Store:
                 if row.exchange_order_id and row.exchange_order_id in live_exchange_order_ids:
                     continue
                 row.status = status
+                await self._refresh_trade_for_existing_order(session, row)
                 changed += 1
             await session.commit()
             return changed
+
+    async def _refresh_trade_for_existing_order(self, session: AsyncSession, row: OrderRow) -> None:
+        if row.client_kind not in ("SL", "TP", "CLOSE"):
+            return
+        if row.trade_id == 0:
+            await self._attach_order_to_trade(session, row, source="backfill", confidence="inferred")
+            return
+        if row.client_kind in ("SL", "TP") and str(row.status or "") not in _TRIGGERED_CONDITION_STATUSES:
+            return
+        if row.client_kind == "CLOSE" and str(row.status or "") not in _FILLED_ORDER_STATUSES:
+            return
+        trade = await session.get(TradeRow, row.trade_id)
+        if trade is None or trade.status == "closed":
+            return
+        self._close_trade_with_order(
+            trade,
+            row,
+            exit_reason=row.client_kind if row.client_kind in ("SL", "TP") else "CLOSE",
+        )
 
     # ---------- 快照 ----------
     async def snapshot_positions(
@@ -261,8 +588,10 @@ class Store:
                         row.notional = abs((row.qty or 0.0) * price)
                     else:
                         row.notional = abs((row.qty or 0.0) * (row.price or 0.0))
+                    await self._refresh_trade_for_existing_order(session, row)
                 elif row.status in ("placed", "open", "filled"):
                     row.status = "canceled"
+                    await self._refresh_trade_for_existing_order(session, row)
             await session.commit()
 
     async def latest_protection_templates(

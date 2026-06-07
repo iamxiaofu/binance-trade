@@ -85,6 +85,47 @@ class OrderRow(Base):
     status: Mapped[str] = mapped_column(String(24), default="")
     exchange_order_id: Mapped[str] = mapped_column(String(64), default="")
     raw_json: Mapped[str] = mapped_column(Text, default="")
+    trade_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    trade_role: Mapped[str] = mapped_column(String(24), default="")
+    leverage: Mapped[int] = mapped_column(Integer, default=0)
+    margin: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class TradeRow(Base):
+    """一笔完整交易/仓位生命周期，由开仓、保护单、退出单聚合而成。"""
+    __tablename__ = "trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="")      # long/short
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    opened_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    opened_at: Mapped[str] = mapped_column(String(32), default="")
+    closed_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    closed_at: Mapped[str] = mapped_column(String(32), default="")
+
+    entry_order_id: Mapped[int] = mapped_column(Integer, default=0)
+    exit_order_id: Mapped[int] = mapped_column(Integer, default=0)
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    qty_opened: Mapped[float] = mapped_column(Float, default=0.0)
+    qty_closed: Mapped[float] = mapped_column(Float, default=0.0)
+
+    leverage: Mapped[int] = mapped_column(Integer, default=0)
+    entry_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    pnl_pct_on_margin: Mapped[float] = mapped_column(Float, default=0.0)
+
+    exit_reason: Mapped[str] = mapped_column(String(24), default="")
+    source: Mapped[str] = mapped_column(String(16), default="live")
+    confidence: Mapped[str] = mapped_column(String(16), default="exact")
 
 
 class OpenOrderRow(Base):

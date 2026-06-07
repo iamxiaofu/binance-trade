@@ -324,6 +324,33 @@ async def api_orders(limit: int = 100, _: str = Depends(_check_auth)):
     return st.recent_orders(_DB, min(limit, 500))
 
 
+@app.get("/api/trades")
+async def api_trades(
+    symbol: list[str] = Query(default_factory=list),
+    direction: list[str] = Query(default_factory=list),
+    status: list[str] = Query(default_factory=list),
+    exit_reason: list[str] = Query(default_factory=list),
+    start_ts_ms: int | None = Query(default=None),
+    end_ts_ms: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    _: str = Depends(_check_auth),
+):
+    return st.search_trades(
+        _DB,
+        st.TradeFilters(
+            symbols=symbol,
+            directions=direction,
+            statuses=status,
+            exit_reasons=exit_reason,
+            start_ts_ms=start_ts_ms,
+            end_ts_ms=end_ts_ms,
+            limit=limit,
+            offset=offset,
+        ),
+    )
+
+
 @app.get("/api/rejects")
 async def api_rejects(limit: int = 100, _: str = Depends(_check_auth)):
     return st.recent_rejects(_DB, min(limit, 500))

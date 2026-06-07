@@ -32,7 +32,11 @@ async def db(tmp_path):
     )
     await s.log_order({"symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
                        "order_type": "market", "qty": 0.01, "price": 100.0,
-                       "notional": 1.0, "dry_run": True, "status": "dry_run", "id": "", "raw": {}})
+                       "notional": 1.0, "dry_run": True, "status": "dry_run",
+                       "id": "", "raw": {}, "leverage": 2})
+    await s.log_order({"symbol": "BTCUSDT", "kind": "CLOSE", "side": "sell",
+                       "order_type": "market", "qty": 0.01, "price": 110.0,
+                       "notional": 1.1, "dry_run": True, "status": "dry_run", "id": "", "raw": {}})
     await s.snapshot_positions([{"symbol": "BTC/USDT:USDT", "side": "long",
                                  "contracts": 0.01, "entryPrice": 100.0, "markPrice": 101.0,
                                  "leverage": 3, "unrealizedPnl": 0.01}])
@@ -44,7 +48,7 @@ async def db(tmp_path):
 
 async def test_recent_queries(db):
     assert len(status.recent_decisions(db)) == 3
-    assert len(status.recent_orders(db)) == 1
+    assert len(status.recent_orders(db)) == 2
     assert status.recent_rejects(db) == []
 
 
@@ -78,8 +82,8 @@ async def test_balance_history_ascending(db):
 async def test_pnl_stats(db):
     s = status.pnl_stats(db)
     assert set(s) == {"day_realized_pnl", "close_count", "close_by_symbol"}
-    # 预置只有一条 OPEN 订单，无平仓 → close_count=0
-    assert s["close_count"] == 0
+    assert s["close_count"] == 1
+    assert s["close_by_symbol"] == {"BTCUSDT": 1}
 
 
 async def test_decision_detail(db):
@@ -129,6 +133,31 @@ def test_search_decisions_pagination(db):
     res = status.search_decisions(db, status.DecisionFilters(limit=1, offset=1))
     assert res["total"] == 3
     assert len(res["items"]) == 1
+
+
+def test_search_trades_returns_grouped_orders_and_pnl(db):
+    res = status.search_trades(db, status.TradeFilters(symbols=["BTCUSDT"]))
+    assert res["total"] == 1
+    trade = res["items"][0]
+    assert trade["symbol"] == "BTCUSDT"
+    assert trade["direction"] == "long"
+    assert trade["status"] == "closed"
+    assert trade["entry_margin"] == pytest.approx(0.5)
+    assert trade["realized_pnl"] == pytest.approx(0.1)
+    assert trade["pnl_pct_on_margin"] == pytest.approx(20.0)
+    assert len(trade["orders"]) == 2
+
+
+def test_search_trades_filters_direction_and_status(db):
+    res = status.search_trades(
+        db,
+        status.TradeFilters(directions=["long"], statuses=["closed"], limit=10),
+    )
+    assert res["total"] == 1
+    assert res["items"][0]["exit_reason"] == "CLOSE"
+
+    empty = status.search_trades(db, status.TradeFilters(directions=["short"]))
+    assert empty["total"] == 0
 
 
 async def test_missing_table_degrades_to_empty(tmp_path):

@@ -18,6 +18,7 @@ from src.store.models import (
     PositionSnapshotRow,
     RejectRow,
     RuntimeSettingRow,
+    TradeRow,
 )
 from src.store.repo import Store
 
@@ -82,6 +83,88 @@ async def test_log_order_and_snapshots(store):
     rt.day_realized_pnl = -5.0
     await store.snapshot_balance(total_equity=200.0, available_margin=180.0, runtime=rt)
     assert await _count(store, BalanceSnapshotRow) == 1
+
+
+async def test_log_order_groups_short_trade_with_protection_and_close(store):
+    d = TradeDecision(symbol="ETHUSDT", action=Action.OPEN_SHORT, confidence=0.8,
+                      size_pct=0.1, leverage=5, stop_loss_pct=0.02,
+                      take_profit_pct=0.04, reason="trend down")
+    await store.log_decision(symbol="ETHUSDT", decision=d, ref_price=100.0)
+    opened = await store.log_order({
+        "symbol": "ETHUSDT", "kind": "OPEN", "side": "sell",
+        "order_type": "market", "qty": 2.0, "price": 100.0,
+        "notional": 200.0, "dry_run": False, "status": "filled",
+        "id": "open", "raw": {}, "leverage": 5,
+    })
+    await store.log_order({
+        "symbol": "ETHUSDT", "kind": "SL", "side": "buy",
+        "order_type": "STOP_MARKET", "qty": 2.0, "price": 105.0,
+        "notional": 210.0, "dry_run": False, "status": "placed",
+        "id": "sl", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await store.log_order({
+        "symbol": "ETHUSDT", "kind": "TP", "side": "buy",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 2.0, "price": 95.0,
+        "notional": 190.0, "dry_run": False, "status": "placed",
+        "id": "tp", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await store.log_order({
+        "symbol": "ETHUSDT", "kind": "CLOSE", "side": "buy",
+        "order_type": "market", "qty": 2.0, "price": 96.0,
+        "notional": 192.0, "dry_run": False, "status": "filled",
+        "id": "close", "raw": {},
+    })
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        orders = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
+
+    assert trade.direction == "short"
+    assert trade.status == "closed"
+    assert trade.leverage == 5
+    assert trade.entry_margin == pytest.approx(40.0)
+    assert trade.realized_pnl == pytest.approx(8.0)
+    assert trade.pnl_pct_on_margin == pytest.approx(20.0)
+    assert trade.exit_reason == "CLOSE"
+    assert {row.trade_id for row in orders} == {trade.id}
+    assert [row.trade_role for row in orders] == ["ENTRY", "PROTECTION_SL", "PROTECTION_TP", "EXIT"]
+
+
+async def test_mark_condition_exit_closes_group_with_filled_price(store):
+    opened = await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 1.0, "price": 100.0,
+        "notional": 100.0, "dry_run": False, "status": "filled",
+        "id": "open", "raw": {}, "leverage": 2,
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "sell",
+        "order_type": "STOP_MARKET", "qty": 1.0, "price": 95.0,
+        "notional": 95.0, "dry_run": False, "status": "placed",
+        "id": "sl", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "sell",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 1.0, "price": 110.0,
+        "notional": 110.0, "dry_run": False, "status": "placed",
+        "id": "tp", "raw": {}, "trade_id": opened["trade_id"],
+    })
+
+    await store.mark_condition_exit(symbol="BTCUSDT", triggered_kind="TP", qty=1.0, price=109.5)
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        rows = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
+    by_kind = {row.client_kind: row for row in rows}
+
+    assert trade.status == "closed"
+    assert trade.exit_reason == "TP"
+    assert trade.exit_price == pytest.approx(109.5)
+    assert trade.realized_pnl == pytest.approx(9.5)
+    assert by_kind["TP"].realized_pnl == pytest.approx(9.5)
+    assert by_kind["SL"].status == "canceled"
 
 
 async def test_runtime_settings_upsert_and_list(store):

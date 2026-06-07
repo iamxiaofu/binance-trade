@@ -147,8 +147,11 @@ class Executor:
 
         if self._cfg.dry_run:
             logger.info("[dry-run][{}] OPEN {} qty={} ~notional={:.2f}", symbol, side, q, notional)
-            return _result(symbol=symbol, kind="OPEN", side=side, qty=q, price=price,
-                           notional=notional, dry_run=True, status="dry_run")
+            res = _result(symbol=symbol, kind="OPEN", side=side, qty=q, price=price,
+                          notional=notional, dry_run=True, status="dry_run")
+            res["leverage"] = decision.leverage
+            res["margin"] = notional / decision.leverage if decision.leverage > 0 else 0.0
+            return res
 
         # 真实下单前确保保证金模式+杠杆就位
         await self._client.setup_symbol(symbol, decision.leverage)
@@ -161,10 +164,13 @@ class Executor:
             logger.warning("[{}] OPEN partial fill {}/{} id={}", symbol, fill_qty, q, order.get("id"))
         else:
             logger.info("[{}] OPEN {} qty={} id={}", symbol, side, fill_qty, order.get("id"))
-        return _result(symbol=symbol, kind="OPEN", side=side, qty=fill_qty,
-                       price=avg_px, notional=fill_qty * avg_px,
-                       dry_run=False, status=status, order_id=str(order.get("id") or ""),
-                       raw=order)
+        res = _result(symbol=symbol, kind="OPEN", side=side, qty=fill_qty,
+                      price=avg_px, notional=fill_qty * avg_px,
+                      dry_run=False, status=status, order_id=str(order.get("id") or ""),
+                      raw=order)
+        res["leverage"] = decision.leverage
+        res["margin"] = res["notional"] / decision.leverage if decision.leverage > 0 else 0.0
+        return res
 
     # ---------- 止盈止损 ----------
     async def place_sl_tp(self, *, decision: TradeDecision, entry_price: float, qty: float) -> list[dict]:

@@ -1072,7 +1072,7 @@ class TradingEngine:
         result = await self._executor.open_position(
             decision=decision, qty=verdict.qty, price=ctx.last_price
         )
-        await self._store.log_order(result)
+        logged = await self._store.log_order(result)
         if result["status"] == "rejected":
             await self._notifier.send(Event.REJECT, f"{symbol} below min order")
             return
@@ -1086,7 +1086,13 @@ class TradingEngine:
                 sltp = await self._executor.place_sl_tp(
                     decision=decision, entry_price=result["price"], qty=result["qty"]
                 )
+                trade_id = int((logged or {}).get("trade_id") or 0)
                 for o in sltp:
+                    if trade_id > 0:
+                        o["trade_id"] = trade_id
+                    if decision.leverage > 0:
+                        o["leverage"] = decision.leverage
+                        o["margin"] = float(o.get("notional") or 0.0) / decision.leverage
                     await self._store.log_order(o)
                 await self._handle_missing_stop_after_open(
                     decision=decision,
