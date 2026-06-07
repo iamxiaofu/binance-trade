@@ -9,6 +9,10 @@ const cfg = ref(null)
 const commands = ref([])
 const loading = ref(false)
 const symbolLoading = ref({})
+const configCommandIds = new Set()
+const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_DRY_RUN', 'SET_SYMBOL_ENABLED'])
+const SYMBOL_SYNC_ATTEMPTS = 8
+const SYMBOL_SYNC_DELAY_MS = 500
 
 async function loadCommands() {
   commands.value = await api.commands(50).catch(() => [])
@@ -98,6 +102,45 @@ function setSymbolLoading(symbol, val) {
   symbolLoading.value = next
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms) })
+}
+
+function applySymbolEnabled(symbol, enabled) {
+  if (!cfg.value) return
+  const symbolEnabled = { ...(cfg.value.symbol_enabled || {}), [symbol]: enabled }
+  const symbolsState = Array.isArray(cfg.value.symbols_state)
+    ? cfg.value.symbols_state.map((row) => (
+        row.symbol === symbol ? { ...row, enabled } : row
+      ))
+    : (cfg.value.symbols || []).map((s) => ({ symbol: s, enabled: symbolEnabled[s] !== false }))
+  cfg.value = { ...cfg.value, symbol_enabled: symbolEnabled, symbols_state: symbolsState }
+}
+
+function cfgSymbolEnabled(symbol) {
+  return cfg.value?.symbol_enabled?.[symbol] !== false
+}
+
+async function syncSymbolEnabledResult(commandId, symbol, enabled) {
+  for (let i = 0; i < SYMBOL_SYNC_ATTEMPTS; i += 1) {
+    await sleep(SYMBOL_SYNC_DELAY_MS)
+    const rows = await api.commands(50).catch(() => null)
+    if (Array.isArray(rows)) commands.value = rows
+    const row = rows?.find((item) => Number(item.id) === Number(commandId))
+    if (row && (row.status === 'done' || row.status === 'failed')) {
+      await loadCfg()
+      if (row.status === 'failed') {
+        ElMessage.error(`${symbol} 状态更新失败: ${row.result || '命令执行失败'}`)
+      }
+      return
+    }
+  }
+  await Promise.all([loadCommands(), loadCfg()])
+  if (cfgSymbolEnabled(symbol) !== enabled) {
+    ElMessage.warning(`${symbol} 状态尚未确认，请稍后刷新`)
+  }
+}
+
 async function setSymbolEnabled(symbol, enabled) {
   if (!enabled && symbolRows.value.find((row) => row.symbol === symbol)?.hasPosition) {
     try {
@@ -111,8 +154,10 @@ async function setSymbolEnabled(symbol, enabled) {
   setSymbolLoading(symbol, true)
   try {
     const r = await api.command('SET_SYMBOL_ENABLED', `${symbol}=${enabled ? 'true' : 'false'}`)
+    applySymbolEnabled(symbol, enabled)
     ElMessage.success(`${symbol} ${enabled ? '启用' : '停用'}命令已入队 (#${r.id})`)
     await loadCommands()
+    await syncSymbolEnabledResult(r.id, symbol, enabled)
   } catch (e) {
     ElMessage.error(`下发失败: ${e.message}`)
   } finally {
@@ -141,7 +186,21 @@ onMounted(refreshAll)
 
 watch(
   () => live.summary.recent_commands,
-  (rows) => mergeCommands(rows),
+  async (rows) => {
+    mergeCommands(rows)
+    const shouldRefresh = Array.isArray(rows) && rows.some((row) => {
+      if (!row?.id || configCommandIds.has(row.id)) return false
+      if (!CONFIG_COMMANDS.has(row.command)) return false
+      return row.status === 'done' || row.status === 'failed'
+    })
+    if (!shouldRefresh) return
+    rows.forEach((row) => {
+      if (row?.id && CONFIG_COMMANDS.has(row.command) && (row.status === 'done' || row.status === 'failed')) {
+        configCommandIds.add(row.id)
+      }
+    })
+    await loadCfg()
+  },
   { deep: true }
 )
 </script>
