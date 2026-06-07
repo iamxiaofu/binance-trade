@@ -12,7 +12,7 @@ const symbolLoading = ref({})
 const newSymbol = ref('')
 const addSymbolLoading = ref(false)
 const configCommandIds = new Set()
-const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED', 'ADD_SYMBOL'])
+const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED', 'ADD_SYMBOL', 'REVIEW_SYMBOL'])
 const SYMBOL_SYNC_ATTEMPTS = 8
 const SYMBOL_SYNC_DELAY_MS = 500
 
@@ -75,6 +75,7 @@ function commandLabel(name) {
     RESUME_ALL_SYMBOLS: '开启全部币种策略',
     SET_SYMBOL_ENABLED: '切换币种交易',
     ADD_SYMBOL: '新增币种',
+    REVIEW_SYMBOL: '复核币种',
     REPAIR_SL_TP: '补止盈止损',
     CANCEL_AND_FLATTEN: '撤单+平仓',
     STOP_ENGINE: '停止交易引擎',
@@ -215,6 +216,20 @@ async function addSymbol() {
     ElMessage.error(`新增失败: ${e.message}`)
   } finally {
     addSymbolLoading.value = false
+  }
+}
+
+async function reviewSymbol(symbol) {
+  setSymbolLoading(symbol, true)
+  try {
+    const r = await api.command('REVIEW_SYMBOL', symbol)
+    ElMessage.success(`${symbol} 复核命令已入队 (#${r.id})`)
+    await loadCommands()
+    await syncSymbolEnabledResult(r.id, symbol, false)
+  } catch (e) {
+    ElMessage.error(`复核失败: ${e.message}`)
+  } finally {
+    setSymbolLoading(symbol, false)
   }
 }
 
@@ -430,25 +445,37 @@ watch(
         </el-table-column>
         <el-table-column label="操作" min-width="160">
           <template #default="{ row }">
-            <el-button
-              v-if="row.enabled"
-              type="warning"
-              size="small"
-              :loading="Boolean(symbolLoading[row.symbol])"
-              @click="setSymbolEnabled(row.symbol, false)"
-            >
-              停用交易
-            </el-button>
-            <el-button
-              v-else
-              type="success"
-              size="small"
-              :loading="Boolean(symbolLoading[row.symbol])"
-              :disabled="row.needsReview"
-              @click="setSymbolEnabled(row.symbol, true)"
-            >
-              启用交易
-            </el-button>
+            <el-space>
+              <el-button
+                v-if="row.enabled"
+                type="warning"
+                size="small"
+                :loading="Boolean(symbolLoading[row.symbol])"
+                @click="setSymbolEnabled(row.symbol, false)"
+              >
+                停用交易
+              </el-button>
+              <el-button
+                v-else
+                type="success"
+                size="small"
+                :loading="Boolean(symbolLoading[row.symbol])"
+                :disabled="row.needsReview"
+                @click="setSymbolEnabled(row.symbol, true)"
+              >
+                启用交易
+              </el-button>
+              <el-button
+                v-if="row.needsReview"
+                type="primary"
+                plain
+                size="small"
+                :loading="Boolean(symbolLoading[row.symbol])"
+                @click="reviewSymbol(row.symbol)"
+              >
+                重新复核
+              </el-button>
+            </el-space>
           </template>
         </el-table-column>
       </el-table>

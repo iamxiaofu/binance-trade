@@ -270,6 +270,8 @@ class TradingEngine:
             return await self._set_symbol_enabled(arg)
         if name == "ADD_SYMBOL":
             return await self._add_symbol(arg)
+        if name == "REVIEW_SYMBOL":
+            return await self._review_symbol(arg)
         if name == "CANCEL_AND_FLATTEN":
             return await self._cancel_and_flatten("web")
         if name == "STOP_ENGINE":
@@ -330,17 +332,59 @@ class TradingEngine:
         if not symbol.endswith("USDT"):
             raise ValueError("only USDT-M symbols are supported")
 
+        review = await self._inspect_symbol_for_registration(symbol)
+
+        await self._store.upsert_symbol_from_exchange(
+            symbol=symbol,
+            filters=review["filters"],
+            exchange_state=review["exchange_state"],
+            source="web",
+            enabled=False,
+            sync_status=review["sync_status"],
+            needs_review=review["needs_review"],
+        )
+        await self._persist_symbol_review_snapshots(symbol, review)
+        await self._refresh_symbol_after_review(symbol)
+        await self._reload_symbols_from_store()
+
+        if review["needs_review"]:
+            return f"{symbol} added disabled; needs review: {self._review_problem_summary(review)}"
+        return f"{symbol} added disabled; exchange confirmed flat"
+
+    async def _review_symbol(self, arg: str) -> str:
+        """人工复核动态币种：重新检查交易所，干净时解除 needs_review，但仍保持停用。"""
+        symbol = normalize_symbol((arg or "").strip())
+        if not symbol:
+            raise ValueError("REVIEW_SYMBOL requires a symbol")
+        record = await self._store.get_symbol(symbol)
+        if record is None or record.get("status") != "active":
+            raise ValueError(f"symbol not registered: {symbol}")
+
+        review = await self._inspect_symbol_for_registration(symbol)
+        await self._store.upsert_symbol_from_exchange(
+            symbol=symbol,
+            filters=review["filters"],
+            exchange_state=review["exchange_state"],
+            source=str(record.get("source") or "web"),
+            enabled=False,
+            sync_status=review["sync_status"],
+            needs_review=review["needs_review"],
+        )
+        await self._persist_symbol_review_snapshots(symbol, review)
+        await self._refresh_symbol_after_review(symbol)
+        await self._reload_symbols_from_store()
+
+        if review["needs_review"]:
+            return f"{symbol} reviewed; still needs review: {self._review_problem_summary(review)}"
+        return f"{symbol} reviewed; exchange confirmed flat; review cleared; remains disabled"
+
+    async def _inspect_symbol_for_registration(self, symbol: str) -> dict:
         filters = await self._client.ensure_symbol(symbol)
         position_raw = await self._fetch_exchange_position_raw(symbol)
         position = normalize_position(position_raw) if position_raw else None
         open_orders = await self._client.fetch_open_orders(symbol)
         condition_orders = await self._client.fetch_open_condition_orders(symbol)
 
-        exchange_state = {
-            "position": position or {},
-            "open_orders": open_orders,
-            "condition_orders": condition_orders,
-        }
         has_position = bool(position and position.get("contracts", 0) > 0)
         has_open_orders = bool(open_orders)
         has_condition_orders = bool(condition_orders)
@@ -353,39 +397,52 @@ class TradingEngine:
             sync_status = "condition_orders_found"
         else:
             sync_status = "confirmed_flat"
+        return {
+            "filters": filters,
+            "position_raw": position_raw,
+            "position": position,
+            "open_orders": open_orders,
+            "condition_orders": condition_orders,
+            "exchange_state": {
+                "position": position or {},
+                "open_orders": open_orders,
+                "condition_orders": condition_orders,
+            },
+            "has_position": has_position,
+            "has_open_orders": has_open_orders,
+            "has_condition_orders": has_condition_orders,
+            "needs_review": needs_review,
+            "sync_status": sync_status,
+        }
 
-        await self._store.upsert_symbol_from_exchange(
-            symbol=symbol,
-            filters=filters,
-            exchange_state=exchange_state,
-            source="web",
-            enabled=False,
-            sync_status=sync_status,
-            needs_review=needs_review,
-        )
+    async def _persist_symbol_review_snapshots(self, symbol: str, review: dict) -> None:
+        position_raw = review.get("position_raw")
+        open_orders = list(review.get("open_orders") or [])
+        condition_orders = list(review.get("condition_orders") or [])
         await self._store.snapshot_positions(
             [position_raw] if position_raw else [],
             symbols=[symbol],
         )
         if open_orders or condition_orders:
             await self._store.snapshot_open_orders([*open_orders, *condition_orders])
+
+    async def _refresh_symbol_after_review(self, symbol: str) -> None:
         self._market.ensure_symbol(symbol)
         try:
             await self._market.refresh(symbol)
         except Exception as e:
-            logger.warning("refresh dynamic symbol {} after add failed: {}", symbol, e)
-        await self._reload_symbols_from_store()
+            logger.warning("refresh dynamic symbol {} after review failed: {}", symbol, e)
 
-        if needs_review:
-            parts = []
-            if has_position:
-                parts.append("live position")
-            if has_open_orders:
-                parts.append(f"{len(open_orders)} open orders")
-            if has_condition_orders:
-                parts.append(f"{len(condition_orders)} condition orders")
-            return f"{symbol} added disabled; needs review: {', '.join(parts)}"
-        return f"{symbol} added disabled; exchange confirmed flat"
+    @staticmethod
+    def _review_problem_summary(review: dict) -> str:
+        parts = []
+        if review.get("has_position"):
+            parts.append("live position")
+        if review.get("has_open_orders"):
+            parts.append(f"{len(review.get('open_orders') or [])} open orders")
+        if review.get("has_condition_orders"):
+            parts.append(f"{len(review.get('condition_orders') or [])} condition orders")
+        return ", ".join(parts)
 
     async def _resume_all_symbols(self) -> str:
         """Resume strategy and enable every configured symbol after a strict live precheck."""

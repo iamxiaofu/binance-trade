@@ -101,6 +101,65 @@ ADD_SYMBOL SOLUSDT
 8. 刷新该币种行情快照。
 9. Web 端刷新 `/api/config`，展示新增币种状态。
 
+## 人工复核流程
+
+新增命令：
+
+```text
+REVIEW_SYMBOL SOLUSDT
+```
+
+适用场景：
+
+- 新增币种时发现已有持仓。
+- 新增币种时发现普通挂单。
+- 新增币种时发现条件单。
+- 用户已经人工处理交易所状态，希望系统重新确认是否可以解除阻断。
+
+复核流程：
+
+1. Web 端只写命令队列，不直接查询交易所。
+2. 交易主进程消费 `REVIEW_SYMBOL`。
+3. 交易主进程重新查询交易所当前状态：
+   - 当前持仓
+   - 普通挂单
+   - 条件单
+4. 更新 `exchange_state_json`。
+5. 更新该币种持仓快照。
+6. 如果仍有普通挂单或条件单，更新未完成挂单快照。
+7. 重新刷新该币种行情快照。
+8. 根据最新交易所状态更新 `sync_status` 和 `needs_review`。
+
+复核结果：
+
+- 交易所已经无持仓、无普通挂单、无条件单：
+  - `sync_status=confirmed_flat`
+  - `needs_review=false`
+  - `enabled=false`
+  - 页面允许后续手动启用交易
+- 交易所仍有持仓：
+  - `sync_status=live_position_found`
+  - `needs_review=true`
+  - `enabled=false`
+  - 页面继续禁止启用交易
+- 交易所仍有普通挂单：
+  - `sync_status=open_orders_found`
+  - `needs_review=true`
+  - `enabled=false`
+  - 页面继续禁止启用交易
+- 交易所仍有条件单：
+  - `sync_status=condition_orders_found`
+  - `needs_review=true`
+  - `enabled=false`
+  - 页面继续禁止启用交易
+
+注意：
+
+- `REVIEW_SYMBOL` 不会自动启用交易。
+- `REVIEW_SYMBOL` 不会自动撤单、平仓或补单。
+- `REVIEW_SYMBOL` 不会把已有持仓自动接管成本地交易组。
+- 如果后续要支持已有持仓接管，应单独设计“接管持仓”流程。
+
 ## 启停规则
 
 `SET_SYMBOL_ENABLED` 从“校验 config symbols”改为“校验 symbols 注册表”。
@@ -156,6 +215,7 @@ GET /api/symbols
 
 - 新增币种输入框。
 - 新增币种按钮。
+- 重新复核按钮，仅在 `needs_review=true` 时展示。
 - 同步状态列。
 - 最小数量列。
 - 最小名义价值列。
@@ -232,6 +292,7 @@ npm run build
 ## 运维注意
 
 - 新增币种不会自动启用。
-- 如果新增时交易所存在持仓或挂单，必须人工复核后再处理，当前版本不提供自动清除 `needs_review` 的按钮。
+- 如果新增时交易所存在持仓或挂单，必须先在交易所侧人工处理，再点击“重新复核”。
+- “重新复核”只会在交易所确认干净后清除 `needs_review`，不会自动接管已有持仓。
 - 新增币种的交易所 filters 会写入 `symbols` 表，可用于后续排查精度或最小名义价值问题。
 - Web 只写命令队列，真实交易所查询仍由交易主进程串行执行。

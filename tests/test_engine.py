@@ -710,6 +710,57 @@ async def test_command_add_symbol_with_position_requires_review(settings, creds,
     assert eng._symbol_enabled["SOLUSDT"] is False
 
 
+async def test_command_review_symbol_clears_review_when_exchange_flat(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.symbols["SOLUSDT"] = {
+        "symbol": "SOLUSDT",
+        "enabled": False,
+        "status": "active",
+        "sync_status": "live_position_found",
+        "needs_review": True,
+        "source": "web",
+        "min_qty": 0.0,
+        "min_notional": 0.0,
+        "tick_size": 0.0,
+        "step_size": 0.0,
+    }
+
+    result = await eng._exec_command("REVIEW_SYMBOL", "SOLUSDT")
+
+    assert "review cleared; remains disabled" in result
+    row = eng._store.symbols["SOLUSDT"]
+    assert row["enabled"] is False
+    assert row["needs_review"] is False
+    assert row["sync_status"] == "confirmed_flat"
+    assert eng._symbol_enabled["SOLUSDT"] is False
+
+
+async def test_command_review_symbol_keeps_review_when_orders_remain(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.symbols["SOLUSDT"] = {
+        "symbol": "SOLUSDT",
+        "enabled": False,
+        "status": "active",
+        "sync_status": "open_orders_found",
+        "needs_review": True,
+        "source": "web",
+        "min_qty": 0.0,
+        "min_notional": 0.0,
+        "tick_size": 0.0,
+        "step_size": 0.0,
+    }
+    eng._client.open_orders = [{"id": "order-1", "symbol": "SOL/USDT:USDT"}]
+
+    result = await eng._exec_command("REVIEW_SYMBOL", "SOLUSDT")
+
+    assert "still needs review: 1 open orders" in result
+    row = eng._store.symbols["SOLUSDT"]
+    assert row["enabled"] is False
+    assert row["needs_review"] is True
+    assert row["sync_status"] == "open_orders_found"
+    assert eng._store.open_order_snapshots[-1] == eng._client.open_orders
+
+
 async def test_command_resume_all_symbols_requires_flat_exchange(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng.runtime.halt_new_entries = True
