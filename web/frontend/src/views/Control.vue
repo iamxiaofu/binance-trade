@@ -9,8 +9,10 @@ const cfg = ref(null)
 const commands = ref([])
 const loading = ref(false)
 const symbolLoading = ref({})
+const newSymbol = ref('')
+const addSymbolLoading = ref(false)
 const configCommandIds = new Set()
-const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED'])
+const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED', 'ADD_SYMBOL'])
 const SYMBOL_SYNC_ATTEMPTS = 8
 const SYMBOL_SYNC_DELAY_MS = 500
 
@@ -72,6 +74,7 @@ function commandLabel(name) {
     RESUME: '恢复策略',
     RESUME_ALL_SYMBOLS: '开启全部币种策略',
     SET_SYMBOL_ENABLED: '切换币种交易',
+    ADD_SYMBOL: '新增币种',
     REPAIR_SL_TP: '补止盈止损',
     CANCEL_AND_FLATTEN: '撤单+平仓',
     STOP_ENGINE: '停止交易引擎',
@@ -82,17 +85,35 @@ function commandLabel(name) {
 const strategyPaused = computed(() => Boolean(cfg.value?.strategy_paused))
 const configuredSymbols = computed(() => cfg.value?.symbols || [])
 const allSymbolsEnabled = computed(() =>
-  configuredSymbols.value.every((symbol) => cfg.value?.symbol_enabled?.[symbol] !== false)
+  symbolRows.value
+    .filter((row) => !row.needsReview)
+    .every((row) => row.enabled)
 )
 
-const symbolRows = computed(() => (cfg.value?.symbols || []).map((symbol) => ({
-  symbol,
-  enabled: cfg.value?.symbol_enabled?.[symbol] !== false,
-  strategyPaused: strategyPaused.value,
-  hasPosition: (live.positions || []).some((p) =>
-    p.symbol === symbol && Number(p.contracts || 0) > 0
-  ),
-})))
+const symbolRows = computed(() => {
+  const rows = Array.isArray(cfg.value?.symbols_state) ? cfg.value.symbols_state : []
+  const fallback = rows.length > 0
+    ? rows
+    : (cfg.value?.symbols || []).map((symbol) => ({ symbol, enabled: cfg.value?.symbol_enabled?.[symbol] !== false }))
+  return fallback.map((item) => {
+    const symbol = item.symbol
+    return {
+      symbol,
+      enabled: cfg.value?.symbol_enabled?.[symbol] !== false && item.enabled !== false,
+      strategyPaused: strategyPaused.value,
+      hasPosition: (live.positions || []).some((p) =>
+        p.symbol === symbol && Number(p.contracts || 0) > 0
+      ),
+      needsReview: Boolean(item.needs_review),
+      syncStatus: item.sync_status || '',
+      source: item.source || '',
+      minQty: Number(item.min_qty || 0),
+      minNotional: Number(item.min_notional || 0),
+      tickSize: Number(item.tick_size || 0),
+      stepSize: Number(item.step_size || 0),
+    }
+  })
+})
 
 function setSymbolLoading(symbol, val) {
   const next = { ...symbolLoading.value }
@@ -120,6 +141,10 @@ function cfgSymbolEnabled(symbol) {
   return cfg.value?.symbol_enabled?.[symbol] !== false
 }
 
+function normalizedNewSymbol() {
+  return String(newSymbol.value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
 async function syncSymbolEnabledResult(commandId, symbol, enabled) {
   for (let i = 0; i < SYMBOL_SYNC_ATTEMPTS; i += 1) {
     await sleep(SYMBOL_SYNC_DELAY_MS)
@@ -141,6 +166,11 @@ async function syncSymbolEnabledResult(commandId, symbol, enabled) {
 }
 
 async function setSymbolEnabled(symbol, enabled) {
+  const row = symbolRows.value.find((item) => item.symbol === symbol)
+  if (enabled && row?.needsReview) {
+    ElMessage.warning(`${symbol} 需要人工复核后才能启用`)
+    return
+  }
   if (!enabled && symbolRows.value.find((row) => row.symbol === symbol)?.hasPosition) {
     try {
       await ElMessageBox.confirm(
@@ -161,6 +191,30 @@ async function setSymbolEnabled(symbol, enabled) {
     ElMessage.error(`下发失败: ${e.message}`)
   } finally {
     setSymbolLoading(symbol, false)
+  }
+}
+
+async function addSymbol() {
+  const symbol = normalizedNewSymbol()
+  if (!symbol) {
+    ElMessage.warning('请输入币种，例如 SOLUSDT')
+    return
+  }
+  if (!symbol.endsWith('USDT')) {
+    ElMessage.warning('当前仅支持 USDT-M 合约币种，例如 SOLUSDT')
+    return
+  }
+  addSymbolLoading.value = true
+  try {
+    const r = await api.command('ADD_SYMBOL', symbol)
+    ElMessage.success(`${symbol} 新增命令已入队 (#${r.id})`)
+    newSymbol.value = ''
+    await loadCommands()
+    await syncSymbolEnabledResult(r.id, symbol, false)
+  } catch (e) {
+    ElMessage.error(`新增失败: ${e.message}`)
+  } finally {
+    addSymbolLoading.value = false
   }
 }
 
@@ -312,6 +366,23 @@ watch(
 
     <el-card shadow="never" style="margin-top:16px">
       <template #header>币种交易开关</template>
+      <div class="symbol-add">
+        <el-input
+          v-model="newSymbol"
+          placeholder="输入币种，例如 SOLUSDT"
+          clearable
+          style="max-width:260px"
+          @keyup.enter="addSymbol"
+        />
+        <el-button
+          type="primary"
+          :loading="addSymbolLoading"
+          :disabled="!normalizedNewSymbol()"
+          @click="addSymbol"
+        >
+          新增币种
+        </el-button>
+      </div>
       <el-table :data="symbolRows" stripe>
         <el-table-column prop="symbol" label="币种" width="120" />
         <el-table-column label="状态" width="110">
@@ -338,6 +409,25 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="同步状态" width="150">
+          <template #default="{ row }">
+            <el-tag
+              :type="row.needsReview ? 'warning' : row.syncStatus === 'confirmed_flat' ? 'success' : 'info'"
+              size="small"
+            >
+              {{ row.needsReview ? '需复核' : row.syncStatus || '未同步' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="最小数量" width="110">
+          <template #default="{ row }">{{ row.minQty || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="最小名义价值" width="130">
+          <template #default="{ row }">{{ row.minNotional || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="来源" width="90">
+          <template #default="{ row }">{{ row.source || '-' }}</template>
+        </el-table-column>
         <el-table-column label="操作" min-width="160">
           <template #default="{ row }">
             <el-button
@@ -354,6 +444,7 @@ watch(
               type="success"
               size="small"
               :loading="Boolean(symbolLoading[row.symbol])"
+              :disabled="row.needsReview"
               @click="setSymbolEnabled(row.symbol, true)"
             >
               启用交易
@@ -388,3 +479,12 @@ watch(
     </el-card>
   </div>
 </template>
+
+<style scoped>
+.symbol-add {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+</style>

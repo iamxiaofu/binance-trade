@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.llm.schema import Action, TradeDecision
 from src.risk.manager import RejectCode, Verdict
 from src.state.runtime import RuntimeState
+from src.exchange.filters import SymbolFilters
 from src.store.models import (
     BalanceSnapshotRow,
     DecisionRow,
@@ -18,6 +20,7 @@ from src.store.models import (
     PositionSnapshotRow,
     RejectRow,
     RuntimeSettingRow,
+    SymbolRow,
     TradeRow,
 )
 from src.store.repo import Store
@@ -193,6 +196,66 @@ async def test_runtime_settings_batch_upsert(store):
         "symbol.enabled.BTCUSDT": "false",
         "symbol.enabled.ETHUSDT": "true",
     }
+
+
+async def test_sync_config_symbols_seeds_registry_from_runtime_setting(store):
+    await store.set_runtime_setting("symbol.enabled.BTCUSDT", "false")
+    await store.sync_config_symbols(["BTCUSDT", "ETHUSDT"])
+
+    rows = {row["symbol"]: row for row in await store.list_symbols()}
+    assert rows["BTCUSDT"]["source"] == "config"
+    assert rows["BTCUSDT"]["enabled"] is False
+    assert rows["ETHUSDT"]["enabled"] is True
+    assert await _count(store, SymbolRow) == 2
+
+
+async def test_upsert_dynamic_symbol_from_exchange_defaults_disabled(store):
+    filters = SymbolFilters(
+        tick_size=Decimal("0.01"),
+        step_size=Decimal("0.001"),
+        min_qty=Decimal("0.001"),
+        min_notional=Decimal("5"),
+    )
+    row = await store.upsert_symbol_from_exchange(
+        symbol="solusdt",
+        filters=filters,
+        exchange_state={"position": {}, "open_orders": [], "condition_orders": []},
+        sync_status="confirmed_flat",
+        needs_review=False,
+    )
+
+    assert row["symbol"] == "SOLUSDT"
+    assert row["enabled"] is False
+    assert row["sync_status"] == "confirmed_flat"
+    assert row["min_notional"] == 5.0
+    assert await store.get_runtime_setting("symbol.enabled.SOLUSDT") == "false"
+
+
+async def test_set_symbol_enabled_updates_registry_and_runtime(store):
+    await store.sync_config_symbols(["BTCUSDT"])
+    await store.set_symbol_enabled("BTCUSDT", False)
+
+    row = await store.get_symbol("BTCUSDT")
+    assert row["enabled"] is False
+    assert await store.get_runtime_setting("symbol.enabled.BTCUSDT") == "false"
+
+
+async def test_update_symbol_filters_keeps_enabled_state(store):
+    await store.set_runtime_setting("symbol.enabled.BTCUSDT", "false")
+    await store.sync_config_symbols(["BTCUSDT"])
+    filters = SymbolFilters(
+        tick_size=Decimal("0.1"),
+        step_size=Decimal("0.01"),
+        min_qty=Decimal("0.01"),
+        min_notional=Decimal("10"),
+    )
+
+    await store.update_symbol_filters("BTCUSDT", filters)
+
+    row = await store.get_symbol("BTCUSDT")
+    assert row["enabled"] is False
+    assert row["tick_size"] == 0.1
+    assert row["min_notional"] == 10.0
 
 
 async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):

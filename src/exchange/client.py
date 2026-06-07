@@ -44,6 +44,7 @@ class ExchangeClient:
             self._exchange.set_sandbox_mode(True)
         self._filters: dict[str, SymbolFilters] = {}
         self._markets_loaded = False
+        self._markets: dict[str, Any] = {}
 
     @property
     def raw(self) -> ccxt.binanceusdm:
@@ -52,13 +53,28 @@ class ExchangeClient:
     async def load_markets(self, reload: bool = False) -> None:
         """加载市场元数据并解析每个交易标的的精度过滤器。"""
         markets = await self._exchange.load_markets(reload)
+        self._markets = markets
         self._markets_loaded = True
         for sym in self._settings.symbols:
-            market = markets.get(self._to_ccxt_symbol(sym))
-            if market is None:
-                raise RuntimeError(f"交易所不支持 symbol：{sym}")
-            self._filters[sym] = SymbolFilters.from_ccxt_market(market)
+            self._filters[sym] = self._filters_from_markets(sym, markets)
         logger.info("markets loaded, filters for {} symbols", len(self._filters))
+
+    def _filters_from_markets(self, symbol: str, markets: dict[str, Any]) -> SymbolFilters:
+        symbol = symbol.upper().strip()
+        market = markets.get(self._to_ccxt_symbol(symbol))
+        if market is None:
+            raise RuntimeError(f"交易所不支持 symbol：{symbol}")
+        return SymbolFilters.from_ccxt_market(market)
+
+    async def ensure_symbol(self, symbol: str) -> SymbolFilters:
+        """验证交易所支持该币种，并确保本地已缓存其 filters。"""
+        symbol = symbol.upper().strip()
+        if not self._markets_loaded:
+            await self.load_markets()
+        if symbol not in self._filters:
+            self._filters[symbol] = self._filters_from_markets(symbol, self._markets)
+            logger.info("market filters loaded for dynamic symbol {}", symbol)
+        return self._filters[symbol]
 
     def filters(self, symbol: str) -> SymbolFilters:
         if symbol not in self._filters:
@@ -101,7 +117,8 @@ class ExchangeClient:
         return float(free) if free is not None else 0.0
 
     async def fetch_positions(self, symbols: list[str] | None = None) -> list[dict]:
-        syms = [self._to_ccxt_symbol(s) for s in (symbols or self._settings.symbols)]
+        active = symbols or list(self._filters) or self._settings.symbols
+        syms = [self._to_ccxt_symbol(s) for s in active]
         positions = await self._exchange.fetch_positions(syms)
         # 只保留有实际仓位的
         return [p for p in positions if p.get("contracts") and float(p["contracts"]) != 0]
@@ -146,11 +163,17 @@ class ExchangeClient:
             self._to_ccxt_symbol(symbol), order_type, side, amount, price, params or {}
         )
 
-    async def cancel_all_orders(self, symbol: str | None = None) -> Any:
+    async def cancel_all_orders(
+        self,
+        symbol: str | None = None,
+        symbols: list[str] | None = None,
+    ) -> Any:
         if symbol:
             return await self._exchange.cancel_all_orders(self._to_ccxt_symbol(symbol))
+        if symbols is None:
+            symbols = list(self._filters) or list(self._settings.symbols)
         results = []
-        for s in self._settings.symbols:
+        for s in symbols:
             try:
                 results.append(await self._exchange.cancel_all_orders(self._to_ccxt_symbol(s)))
             except ccxt.ExchangeError as e:
@@ -193,9 +216,13 @@ class ExchangeClient:
                 errors.append(e)
         raise errors[-1]
 
-    async def cancel_all_condition_orders(self, symbol: str | None = None) -> Any:
+    async def cancel_all_condition_orders(
+        self,
+        symbol: str | None = None,
+        symbols: list[str] | None = None,
+    ) -> Any:
         """Cancel open USD-M conditional algo orders only."""
-        symbols = [symbol] if symbol else list(self._settings.symbols)
+        symbols = [symbol] if symbol else (symbols or list(self._filters) or list(self._settings.symbols))
         results = []
         for s in symbols:
             if not s:

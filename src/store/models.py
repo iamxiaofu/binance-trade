@@ -178,6 +178,31 @@ class BalanceSnapshotRow(Base):
     drawdown_pct: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class SymbolRow(Base):
+    """动态交易币种注册表。
+
+    业务表不按币种拆表，仍通过各表已有 symbol 字段关联；这里仅保存币种是否纳入
+    当前交易环境、是否允许策略交易，以及交易所预检/过滤器结果。
+    """
+    __tablename__ = "symbols"
+
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    sync_status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    source: Mapped[str] = mapped_column(String(16), default="web")
+    min_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    min_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    tick_size: Mapped[float] = mapped_column(Float, default=0.0)
+    step_size: Mapped[float] = mapped_column(Float, default=0.0)
+    raw_filters_json: Mapped[str] = mapped_column(Text, default="")
+    exchange_state_json: Mapped[str] = mapped_column(Text, default="")
+    added_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    last_filter_sync_at: Mapped[str] = mapped_column(String(32), default="")
+
+
 class RuntimeSettingRow(Base):
     """运行时设置。
 

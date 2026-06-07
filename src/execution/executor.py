@@ -352,10 +352,10 @@ class Executor:
         return res
 
     # ---------- 批量（熔断 / kill-switch）----------
-    async def flatten_all(self) -> list[dict]:
+    async def flatten_all(self, symbols: list[str] | None = None) -> list[dict]:
         """平掉所有持仓。"""
         results: list[dict] = []
-        positions = await self._client.fetch_positions(self._settings.symbols)
+        positions = await self._client.fetch_positions(symbols or self._settings.symbols)
         for p in positions:
             try:
                 results.append(await self.close_position(p))
@@ -363,6 +363,6 @@ class Executor:
                 logger.error("flatten_all close failed: {}", e)
         return results
 
-    async def cancel_all_orders(self) -> None:
-        await self._client.cancel_all_orders()
-        await self._client.cancel_all_condition_orders()
+    async def cancel_all_orders(self, symbols: list[str] | None = None) -> None:
+        await self._client.cancel_all_orders(symbols=symbols)
+        await self._client.cancel_all_condition_orders(symbols=symbols)

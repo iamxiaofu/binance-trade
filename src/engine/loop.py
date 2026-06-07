@@ -49,6 +49,8 @@ class TradingEngine:
             settings.notify, creds.telegram_bot_token, creds.telegram_chat_id
         )
         self._symbol_enabled = {symbol: True for symbol in settings.symbols}
+        self._symbols = list(settings.symbols)
+        self._symbol_needs_review: set[str] = set()
         self.runtime = RuntimeState()
         self._stopped = asyncio.Event()
         self._state_sync_lock = asyncio.Lock()
@@ -57,16 +59,21 @@ class TradingEngine:
     # ---------- 生命周期 ----------
     async def startup(self) -> None:
         await self._store.connect()
+        await self._store.sync_config_symbols(self._settings.symbols)
         await self._apply_runtime_settings()
         await self._client.load_markets()
-        await self._market.start()
+        for symbol in self._symbols:
+            filters = await self._client.ensure_symbol(symbol)
+            await self._store.update_symbol_filters(symbol, filters)
+            self._market.ensure_symbol(symbol)
+        await self._market.refresh_all(self._symbols)
         self.runtime.roll_day_if_needed()
         if self._settings.storage.reconcile_on_start:
             try:
-                positions = await self._client.fetch_positions()
+                positions = await self._client.fetch_positions(self._symbols)
                 open_orders = await self._fetch_open_orders_safe()
                 await self._store.reconcile(
-                    positions, self.runtime, open_orders, symbols=self._settings.symbols
+                    positions, self.runtime, open_orders, symbols=self._symbols
                 )
             except Exception as e:
                 logger.warning("startup reconcile failed: {}", e)
@@ -139,7 +146,8 @@ class TradingEngine:
         await self._process_commands()
         if self.runtime.kill_switch or self._stopped.is_set():
             return
-        await self._market.refresh_all()
+        symbols = self._tracked_symbols()
+        await self._market.refresh_all(symbols)
 
         # 0. 全局熔断（最高优先级）：日亏 / 回撤
         if await self._check_circuit_breaker():
@@ -147,7 +155,7 @@ class TradingEngine:
             return
 
         # 逐 symbol 处理
-        for symbol in self._settings.symbols:
+        for symbol in symbols:
             try:
                 await self._process_symbol(symbol)
             except Exception as e:
@@ -211,6 +219,29 @@ class TradingEngine:
                     return True
         return False
 
+    def _tracked_symbols(self) -> list[str]:
+        return list(self._symbols or self._settings.symbols)
+
+    async def _reload_symbols_from_store(self) -> list[str]:
+        rows = await self._store.list_symbols()
+        symbols = [normalize_symbol(row["symbol"]) for row in rows if row.get("status") == "active"]
+        if not symbols:
+            symbols = list(self._settings.symbols)
+        self._symbols = symbols
+        self._symbol_needs_review = {
+            normalize_symbol(row["symbol"]) for row in rows if row.get("needs_review")
+        }
+        self._symbol_enabled = {
+            symbol: bool(row.get("enabled")) and not bool(row.get("needs_review"))
+            for row in rows
+            if row.get("status") == "active"
+            for symbol in [normalize_symbol(row["symbol"])]
+        }
+        for symbol in symbols:
+            self._symbol_enabled.setdefault(symbol, True)
+            self._market.ensure_symbol(symbol)
+        return symbols
+
     @staticmethod
     def _symbol_enabled_arg_value(arg: str) -> bool | None:
         raw = (arg or "").strip()
@@ -237,6 +268,8 @@ class TradingEngine:
             return await self._resume_all_symbols()
         if name == "SET_SYMBOL_ENABLED":
             return await self._set_symbol_enabled(arg)
+        if name == "ADD_SYMBOL":
+            return await self._add_symbol(arg)
         if name == "CANCEL_AND_FLATTEN":
             return await self._cancel_and_flatten("web")
         if name == "STOP_ENGINE":
@@ -248,6 +281,7 @@ class TradingEngine:
 
     async def _apply_runtime_settings(self) -> None:
         """启动时加载持久化运行态；缺省时用 config.yaml 并写入 DB。"""
+        await self._reload_symbols_from_store()
         raw_paused = await self._store.get_runtime_setting("strategy.paused")
         if raw_paused is None:
             await self._store.set_runtime_setting("strategy.paused", "false")
@@ -255,14 +289,18 @@ class TradingEngine:
             paused = raw_paused.strip().lower() in ("1", "true", "yes", "on")
             self.runtime.halt_new_entries = paused
             logger.info("runtime setting applied: strategy.paused={}", paused)
-        for symbol in self._settings.symbols:
+        for symbol in self._tracked_symbols():
             key = self._symbol_enabled_key(symbol)
             raw_enabled = await self._store.get_runtime_setting(key)
             if raw_enabled is None:
-                await self._store.set_runtime_setting(key, "true")
-                self._symbol_enabled[symbol] = True
+                default = self._symbol_enabled.get(symbol, symbol in self._settings.symbols)
+                await self._store.set_runtime_setting(key, str(default).lower())
+                self._symbol_enabled[symbol] = default
                 continue
-            enabled = raw_enabled.strip().lower() in ("1", "true", "yes", "on")
+            enabled = (
+                raw_enabled.strip().lower() in ("1", "true", "yes", "on")
+                and symbol not in self._symbol_needs_review
+            )
             self._symbol_enabled[symbol] = enabled
             logger.info("runtime setting applied: {}={}", key, enabled)
 
@@ -273,28 +311,104 @@ class TradingEngine:
             raise ValueError("SET_SYMBOL_ENABLED requires SYMBOL=true|false")
         symbol_raw, value_raw = raw.split("=", 1)
         symbol = normalize_symbol(symbol_raw)
-        if symbol not in self._settings.symbols:
-            raise ValueError(f"symbol not configured: {symbol}")
+        record = await self._store.get_symbol(symbol)
+        if record is None or record.get("status") != "active":
+            raise ValueError(f"symbol not registered: {symbol}")
         enabled = value_raw.strip().lower() in ("1", "true", "yes", "on")
+        if enabled and record.get("needs_review"):
+            raise ValueError(f"{symbol} needs manual review before enable")
         self._symbol_enabled[symbol] = enabled
-        await self._store.set_runtime_setting(
-            self._symbol_enabled_key(symbol), str(enabled).lower()
-        )
+        await self._store.set_symbol_enabled(symbol, enabled)
+        await self._reload_symbols_from_store()
         return f"{symbol} strategy enabled set to {enabled} (persisted)"
+
+    async def _add_symbol(self, arg: str) -> str:
+        """动态新增币种：交易所验证 + 当前状态同步 + 默认停用。"""
+        symbol = normalize_symbol((arg or "").strip())
+        if not symbol:
+            raise ValueError("ADD_SYMBOL requires a symbol")
+        if not symbol.endswith("USDT"):
+            raise ValueError("only USDT-M symbols are supported")
+
+        filters = await self._client.ensure_symbol(symbol)
+        position_raw = await self._fetch_exchange_position_raw(symbol)
+        position = normalize_position(position_raw) if position_raw else None
+        open_orders = await self._client.fetch_open_orders(symbol)
+        condition_orders = await self._client.fetch_open_condition_orders(symbol)
+
+        exchange_state = {
+            "position": position or {},
+            "open_orders": open_orders,
+            "condition_orders": condition_orders,
+        }
+        has_position = bool(position and position.get("contracts", 0) > 0)
+        has_open_orders = bool(open_orders)
+        has_condition_orders = bool(condition_orders)
+        needs_review = has_position or has_open_orders or has_condition_orders
+        if has_position:
+            sync_status = "live_position_found"
+        elif has_open_orders:
+            sync_status = "open_orders_found"
+        elif has_condition_orders:
+            sync_status = "condition_orders_found"
+        else:
+            sync_status = "confirmed_flat"
+
+        await self._store.upsert_symbol_from_exchange(
+            symbol=symbol,
+            filters=filters,
+            exchange_state=exchange_state,
+            source="web",
+            enabled=False,
+            sync_status=sync_status,
+            needs_review=needs_review,
+        )
+        await self._store.snapshot_positions(
+            [position_raw] if position_raw else [],
+            symbols=[symbol],
+        )
+        if open_orders or condition_orders:
+            await self._store.snapshot_open_orders([*open_orders, *condition_orders])
+        self._market.ensure_symbol(symbol)
+        try:
+            await self._market.refresh(symbol)
+        except Exception as e:
+            logger.warning("refresh dynamic symbol {} after add failed: {}", symbol, e)
+        await self._reload_symbols_from_store()
+
+        if needs_review:
+            parts = []
+            if has_position:
+                parts.append("live position")
+            if has_open_orders:
+                parts.append(f"{len(open_orders)} open orders")
+            if has_condition_orders:
+                parts.append(f"{len(condition_orders)} condition orders")
+            return f"{symbol} added disabled; needs review: {', '.join(parts)}"
+        return f"{symbol} added disabled; exchange confirmed flat"
 
     async def _resume_all_symbols(self) -> str:
         """Resume strategy and enable every configured symbol after a strict live precheck."""
         await self._assert_exchange_clear_for_resume_all()
+        rows = await self._store.list_symbols()
+        eligible = [
+            normalize_symbol(row["symbol"])
+            for row in rows
+            if row.get("status") == "active" and not row.get("needs_review")
+        ]
         values = {"strategy.paused": "false"}
         values.update({
             self._symbol_enabled_key(symbol): "true"
-            for symbol in self._settings.symbols
+            for symbol in eligible
         })
         await self._store.set_runtime_settings(values)
+        for symbol in eligible:
+            await self._store.set_symbol_enabled(symbol, True)
         self.runtime.halt_new_entries = False
-        for symbol in self._settings.symbols:
+        for symbol in eligible:
             self._symbol_enabled[symbol] = True
-        symbols = ", ".join(self._settings.symbols)
+        await self._reload_symbols_from_store()
+        symbols = ", ".join(eligible)
         return (
             f"strategy resumed; enabled all symbols: {symbols}; "
             "precheck passed (no live positions/open orders/condition orders)"
@@ -302,7 +416,8 @@ class TradingEngine:
 
     async def _assert_exchange_clear_for_resume_all(self) -> None:
         """Block bulk resume unless exchange has no positions and no live orders."""
-        positions = await self._client.fetch_positions(self._settings.symbols)
+        symbols = self._tracked_symbols()
+        positions = await self._client.fetch_positions(symbols)
         position_labels = []
         for raw in positions:
             pos = normalize_position(raw)
@@ -311,7 +426,7 @@ class TradingEngine:
 
         open_order_labels = []
         condition_order_labels = []
-        for symbol in self._settings.symbols:
+        for symbol in symbols:
             open_orders = await self._client.fetch_open_orders(symbol)
             open_order_labels.extend(
                 self._open_order_label(symbol, order) for order in open_orders
@@ -341,8 +456,9 @@ class TradingEngine:
         """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
         self.runtime.halt_new_entries = True
         await self._store.set_runtime_setting("strategy.paused", "true")
-        await self._executor.cancel_all_orders()
-        results = await self._executor.flatten_all()
+        symbols = self._tracked_symbols()
+        await self._executor.cancel_all_orders(symbols=symbols)
+        results = await self._executor.flatten_all(symbols=symbols)
         closed = 0
         for result in results:
             await self._store.log_order(result)
@@ -373,8 +489,8 @@ class TradingEngine:
         symbol = normalize_symbol((arg or "").strip())
         if not symbol:
             raise ValueError("REPAIR_SL_TP requires a symbol")
-        if symbol not in self._settings.symbols:
-            raise ValueError(f"symbol not configured: {symbol}")
+        if symbol not in self._tracked_symbols():
+            raise ValueError(f"symbol not registered: {symbol}")
 
         position = await self._fetch_exchange_position(symbol)
         if position is None:
@@ -950,7 +1066,7 @@ class TradingEngine:
             logger.warning("CIRCUIT BREAKER: {}", breached)
             rt.trip_breaker()
             try:
-                await self._executor.flatten_all()
+                await self._executor.flatten_all(symbols=self._tracked_symbols())
             except Exception as e:
                 logger.error("circuit-breaker flatten failed: {}", e)
             await self._notifier.send(Event.CIRCUIT_BREAK, breached)
@@ -1022,7 +1138,7 @@ class TradingEngine:
     async def _handle_open(self, decision: TradeDecision, ctx: MarketContext) -> None:
         symbol = decision.symbol
         sym_margin = self._position_margin(symbol)
-        total_margin = sum(self._position_margin(s) for s in self._settings.symbols)
+        total_margin = sum(self._position_margin(s) for s in self._tracked_symbols())
         rctx = RiskContext(
             last_price=ctx.last_price,
             available_margin=ctx.available_margin,
@@ -1166,7 +1282,7 @@ class TradingEngine:
 
     async def _fetch_positions_safe(self) -> list[dict]:
         try:
-            return await self._client.fetch_positions()
+            return await self._client.fetch_positions(self._tracked_symbols())
         except Exception as e:
             logger.warning("fetch positions failed: {}", e)
             return []
@@ -1174,7 +1290,7 @@ class TradingEngine:
     async def _fetch_open_orders_safe(self) -> list[dict]:
         """启动对账用：拉取普通未完成单和条件单，失败跳过单个 symbol。"""
         out: list[dict] = []
-        for sym in self._settings.symbols:
+        for sym in self._tracked_symbols():
             try:
                 out.extend(await self._client.fetch_open_orders(sym))
             except Exception as e:
@@ -1224,10 +1340,10 @@ class TradingEngine:
     async def _enforce_exchange_invariants(self, reason: str) -> None:
         positions = {
             normalize_position(raw)["symbol"]: normalize_position(raw)
-            for raw in await self._client.fetch_positions(self._settings.symbols)
+            for raw in await self._client.fetch_positions(self._tracked_symbols())
             if normalize_position(raw)["contracts"] > 0
         }
-        for symbol in self._settings.symbols:
+        for symbol in self._tracked_symbols():
             try:
                 active_orders = await self._active_protection_orders(symbol)
             except Exception as e:
@@ -1312,7 +1428,7 @@ class TradingEngine:
         }
         condition_exits = self._detect_external_closes(prev_positions, new_positions)
         self.runtime.positions = new_positions
-        await self._store.snapshot_positions(positions, symbols=self._settings.symbols)
+        await self._store.snapshot_positions(positions, symbols=self._tracked_symbols())
         for exit_event in condition_exits:
             remaining = await self._cancel_symbol_condition_orders(
                 exit_event["symbol"], reason="external_close"
@@ -1404,8 +1520,9 @@ class TradingEngine:
         self.runtime.trigger_kill()
         self._stopped.set()
         try:
-            await self._executor.cancel_all_orders()
-            await self._executor.flatten_all()
+            symbols = self._tracked_symbols()
+            await self._executor.cancel_all_orders(symbols=symbols)
+            await self._executor.flatten_all(symbols=symbols)
         except Exception as e:
             logger.error("kill switch flatten failed: {}", e)
         await self._notifier.send(Event.KILL_SWITCH, reason)

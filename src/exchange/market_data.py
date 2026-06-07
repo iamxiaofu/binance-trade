@@ -57,14 +57,24 @@ class MarketData:
         return None
 
     def snapshot(self, symbol: str) -> SymbolSnapshot:
+        self.ensure_symbol(symbol)
         return self._snapshots[symbol]
 
-    async def refresh_all(self) -> None:
-        await asyncio.gather(*(self.refresh(s) for s in self._settings.symbols))
+    def ensure_symbol(self, symbol: str) -> SymbolSnapshot:
+        symbol = symbol.upper().strip()
+        if symbol not in self._snapshots:
+            self._snapshots[symbol] = SymbolSnapshot(symbol=symbol)
+        return self._snapshots[symbol]
+
+    async def refresh_all(self, symbols: list[str] | None = None) -> None:
+        target = symbols or self._settings.symbols
+        for symbol in target:
+            self.ensure_symbol(symbol)
+        await asyncio.gather(*(self.refresh(s) for s in target))
 
     async def refresh(self, symbol: str) -> None:
         """刷新单个 symbol。任一子项失败保留旧值，不中断其它字段。"""
-        snap = self._snapshots[symbol]
+        snap = self.ensure_symbol(symbol)
         tf = self._settings.llm.kline_interval
         limit = self._settings.llm.kline_lookback
         try:

@@ -28,7 +28,7 @@ from loguru import logger
 from src.config.loader import load_config
 from src.exchange.client import ExchangeClient
 from src.exchange.orders import normalize_condition_order
-from src.exchange.positions import normalize_position
+from src.exchange.positions import normalize_position, normalize_symbol
 from src.features.indicators import compute_snapshot
 from src.store.repo import Store
 from web import status as st
@@ -108,6 +108,7 @@ async def _get_store() -> Store:
     if _store is None:
         _store = Store(_DB)
         await _store.connect()
+        await _store.sync_config_symbols(_settings.symbols)
     return _store
 
 
@@ -139,15 +140,46 @@ async def _effective_strategy_paused() -> tuple[bool, str]:
 
 
 async def _effective_symbol_enabled() -> dict[str, bool]:
-    out = {symbol: True for symbol in _settings.symbols}
     try:
         store = await _get_store()
-        for symbol in _settings.symbols:
-            raw = await store.get_runtime_setting(f"symbol.enabled.{symbol}")
-            out[symbol] = _parse_bool_setting(raw, True)
+        rows = await store.list_symbols()
+        return {
+            row["symbol"]: bool(row["enabled"]) and not bool(row["needs_review"])
+            for row in rows
+            if row["status"] == "active"
+        }
     except Exception as e:
         logger.warning("runtime symbol settings unavailable, fallback to enabled: {}", e)
-    return out
+    return {symbol: True for symbol in _settings.symbols}
+
+
+async def _symbol_rows() -> list[dict[str, Any]]:
+    try:
+        store = await _get_store()
+        rows = await store.list_symbols()
+        return [row for row in rows if row["status"] == "active"]
+    except Exception as e:
+        logger.warning("symbol registry unavailable, fallback to config symbols: {}", e)
+        return [
+            {
+                "symbol": symbol,
+                "enabled": True,
+                "status": "active",
+                "sync_status": "config_fallback",
+                "needs_review": False,
+                "source": "config",
+                "min_qty": 0.0,
+                "min_notional": 0.0,
+                "tick_size": 0.0,
+                "step_size": 0.0,
+            }
+            for symbol in _settings.symbols
+        ]
+
+
+async def _registered_symbols() -> list[str]:
+    rows = await _symbol_rows()
+    return [normalize_symbol(row["symbol"]) for row in rows]
 
 
 async def _live_positions_snapshot() -> dict[str, Any]:
@@ -160,7 +192,7 @@ async def _live_positions_snapshot() -> dict[str, Any]:
 
         try:
             client = await _get_market()
-            raw_positions = await client.fetch_positions(_settings.symbols)
+            raw_positions = await client.fetch_positions(await _registered_symbols())
             positions = []
             for raw in raw_positions:
                 pos = normalize_position(raw)
@@ -366,17 +398,16 @@ async def api_config(_: str = Depends(_check_auth)):
     s = _settings
     strategy_paused, strategy_status_source = await _effective_strategy_paused()
     symbol_enabled = await _effective_symbol_enabled()
+    symbols_state = await _symbol_rows()
+    symbols = [row["symbol"] for row in symbols_state]
     return {
         "mode": s.mode.value,
         "db_path": s.storage.db_path,
-        "symbols": s.symbols,
+        "symbols": symbols,
         "strategy_paused": strategy_paused,
         "strategy_status_source": strategy_status_source,
         "symbol_enabled": symbol_enabled,
-        "symbols_state": [
-            {"symbol": symbol, "enabled": symbol_enabled.get(symbol, True)}
-            for symbol in s.symbols
-        ],
+        "symbols_state": symbols_state,
         "cycle_interval": s.cycle.interval,
         # 看板默认行情源（mainnet 真实价 / testnet 沙盒），供前端初始化源切换
         "market_source": _DEFAULT_SOURCE,
@@ -394,6 +425,11 @@ async def api_config(_: str = Depends(_check_auth)):
     }
 
 
+@app.get("/api/symbols")
+async def api_symbols(_: str = Depends(_check_auth)):
+    return await _symbol_rows()
+
+
 # ---------- REST：行情（K线 + 指标，只读交易所）----------
 def _norm_source(source: str | None) -> str:
     """归一化行情源；非法值回落到默认源。"""
@@ -408,9 +444,9 @@ async def api_klines(symbol: str, timeframe: str = "5m", limit: int = 200,
 
     source=mainnet|testnet：选择行情数据源。默认主网（真实价）。
     """
-    symbol = symbol.upper()
-    if symbol not in _settings.symbols:
-        raise HTTPException(status_code=400, detail=f"symbol not configured: {symbol}")
+    symbol = normalize_symbol(symbol)
+    if symbol not in await _registered_symbols():
+        raise HTTPException(status_code=400, detail=f"symbol not registered: {symbol}")
     src = _norm_source(source)
     try:
         feed = await _feeds.get(src)
@@ -429,9 +465,9 @@ async def api_klines(symbol: str, timeframe: str = "5m", limit: int = 200,
 async def api_ticker(symbol: str, source: str | None = None,
                      _: str = Depends(_check_auth)):
     """轻量最新价/标记价。WS 不可用时的回退；正常实时价走 /ws/market。"""
-    symbol = symbol.upper()
-    if symbol not in _settings.symbols:
-        raise HTTPException(status_code=400, detail=f"symbol not configured: {symbol}")
+    symbol = normalize_symbol(symbol)
+    if symbol not in await _registered_symbols():
+        raise HTTPException(status_code=400, detail=f"symbol not registered: {symbol}")
     src = _norm_source(source)
     try:
         feed = await _feeds.get(src)
@@ -455,6 +491,7 @@ _ALLOWED_COMMANDS = {
     "RESUME",
     "RESUME_ALL_SYMBOLS",
     "SET_SYMBOL_ENABLED",
+    "ADD_SYMBOL",
     "REPAIR_SL_TP",
     "CANCEL_AND_FLATTEN",
     "STOP_ENGINE",
@@ -488,8 +525,9 @@ async def ws_market(websocket: WebSocket):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    symbol = (websocket.query_params.get("symbol") or _settings.symbols[0]).upper()
-    if symbol not in _settings.symbols:
+    symbols = await _registered_symbols()
+    symbol = normalize_symbol(websocket.query_params.get("symbol") or (symbols[0] if symbols else ""))
+    if symbol not in symbols:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     timeframe = websocket.query_params.get("timeframe") or _settings.llm.kline_interval

@@ -45,6 +45,20 @@ class FakeStore:
         self.position_snapshots = []
         self.balance_snapshots = []
         self.open_order_snapshots = []
+        self.symbols = {
+            "BTCUSDT": {
+                "symbol": "BTCUSDT",
+                "enabled": True,
+                "status": "active",
+                "sync_status": "config_seed",
+                "needs_review": False,
+                "source": "config",
+                "min_qty": 0.0,
+                "min_notional": 0.0,
+                "tick_size": 0.0,
+                "step_size": 0.0,
+            }
+        }
 
     async def log_decision(self, **kw):
         self.decisions.append(kw)
@@ -95,6 +109,71 @@ class FakeStore:
     async def snapshot_open_orders(self, orders):
         self.open_order_snapshots.append(orders)
 
+    async def sync_config_symbols(self, symbols):
+        for symbol in symbols:
+            self.symbols.setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "enabled": True,
+                    "status": "active",
+                    "sync_status": "config_seed",
+                    "needs_review": False,
+                    "source": "config",
+                    "min_qty": 0.0,
+                    "min_notional": 0.0,
+                    "tick_size": 0.0,
+                    "step_size": 0.0,
+                },
+            )
+
+    async def list_symbols(self, include_archived=False):
+        rows = list(self.symbols.values())
+        if not include_archived:
+            rows = [row for row in rows if row.get("status") != "archived"]
+        return rows
+
+    async def get_symbol(self, symbol):
+        return self.symbols.get(symbol)
+
+    async def set_symbol_enabled(self, symbol, enabled):
+        self.symbols[symbol]["enabled"] = enabled
+        self.runtime_settings[f"symbol.enabled.{symbol}"] = str(enabled).lower()
+
+    async def update_symbol_filters(self, symbol, filters):
+        if symbol not in self.symbols:
+            return
+        self.symbols[symbol]["min_qty"] = float(filters.min_qty)
+        self.symbols[symbol]["min_notional"] = float(filters.min_notional)
+        self.symbols[symbol]["tick_size"] = float(filters.tick_size)
+        self.symbols[symbol]["step_size"] = float(filters.step_size)
+
+    async def upsert_symbol_from_exchange(
+        self,
+        *,
+        symbol,
+        filters,
+        exchange_state,
+        source="web",
+        enabled=False,
+        sync_status="confirmed_flat",
+        needs_review=False,
+    ):
+        self.symbols[symbol] = {
+            "symbol": symbol,
+            "enabled": enabled,
+            "status": "active",
+            "sync_status": sync_status,
+            "needs_review": needs_review,
+            "source": source,
+            "min_qty": float(filters.min_qty),
+            "min_notional": float(filters.min_notional),
+            "tick_size": float(filters.tick_size),
+            "step_size": float(filters.step_size),
+        }
+        self.runtime_settings[f"symbol.enabled.{symbol}"] = str(enabled).lower()
+        return self.symbols[symbol]
+
 
 class FakeClient:
     def __init__(self):
@@ -118,6 +197,20 @@ class FakeClient:
 
     async def fetch_ticker(self, symbol):
         return {"mark": 100.0, "last": 100.0}
+
+    async def fetch_ohlcv(self, symbol, timeframe, limit):
+        return [[i * 60000, 100.0, 101.0, 99.0, 100.0, 1.0] for i in range(limit)]
+
+    async def fetch_funding_rate(self, symbol):
+        return {"fundingRate": 0.0}
+
+    async def ensure_symbol(self, symbol):
+        return SymbolFilters(
+            tick_size=Decimal("0.01"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+        )
 
     async def cancel_condition_order(self, symbol, order_id, *, client_algo_id=""):
         self.canceled_condition_orders.append((symbol, order_id, client_algo_id))
@@ -143,11 +236,11 @@ class FakeExecutor:
         self.canceled = 0
         self.opened = []
 
-    async def flatten_all(self):
+    async def flatten_all(self, symbols=None):
         self.flattened += 1
         return []
 
-    async def cancel_all_orders(self):
+    async def cancel_all_orders(self, symbols=None):
         self.canceled += 1
 
     async def open_position(self, *, decision, qty, price):
@@ -262,7 +355,7 @@ async def test_paused_cycle_still_snapshots(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng.runtime.halt_new_entries = True
 
-    async def refresh_all():
+    async def refresh_all(symbols=None):
         return None
     monkeypatch.setattr(eng._market, "refresh_all", refresh_all)
 
@@ -581,6 +674,40 @@ async def test_command_set_symbol_enabled(settings, creds, monkeypatch):
     await eng._process_commands()
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+
+
+async def test_command_add_symbol_confirmed_flat_defaults_disabled(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+
+    result = await eng._exec_command("ADD_SYMBOL", "solusdt")
+
+    assert "SOLUSDT added disabled; exchange confirmed flat" in result
+    row = eng._store.symbols["SOLUSDT"]
+    assert row["enabled"] is False
+    assert row["needs_review"] is False
+    assert row["sync_status"] == "confirmed_flat"
+    assert eng._symbol_enabled["SOLUSDT"] is False
+    assert eng._store.position_snapshots[-1][1] == ["SOLUSDT"]
+
+
+async def test_command_add_symbol_with_position_requires_review(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "SOL/USDT:USDT",
+        "side": "long",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    result = await eng._exec_command("ADD_SYMBOL", "SOLUSDT")
+
+    assert "needs review: live position" in result
+    row = eng._store.symbols["SOLUSDT"]
+    assert row["enabled"] is False
+    assert row["needs_review"] is True
+    assert row["sync_status"] == "live_position_found"
+    assert eng._symbol_enabled["SOLUSDT"] is False
 
 
 async def test_command_resume_all_symbols_requires_flat_exchange(settings, creds, monkeypatch):

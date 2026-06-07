@@ -30,6 +30,7 @@ from src.store.models import (
     PositionSnapshotRow,
     RejectRow,
     RuntimeSettingRow,
+    SymbolRow,
     TradeRow,
 )
 
@@ -40,6 +41,22 @@ _ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("leverage", "INTEGER NOT NULL DEFAULT 0"),
     ("margin", "FLOAT NOT NULL DEFAULT 0.0"),
     ("realized_pnl", "FLOAT NOT NULL DEFAULT 0.0"),
+)
+_SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("status", "VARCHAR(16) NOT NULL DEFAULT 'active'"),
+    ("sync_status", "VARCHAR(32) NOT NULL DEFAULT 'new'"),
+    ("needs_review", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("source", "VARCHAR(16) NOT NULL DEFAULT 'web'"),
+    ("min_qty", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("min_notional", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("tick_size", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("step_size", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("raw_filters_json", "TEXT NOT NULL DEFAULT ''"),
+    ("exchange_state_json", "TEXT NOT NULL DEFAULT ''"),
+    ("added_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("updated_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("last_filter_sync_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
 )
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
@@ -59,6 +76,18 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _parse_bool(raw: str | None, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _now_iso_utc() -> str:
+    import time as _t
+
+    return _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
 
 
 def _direction_from_open_side(side: str) -> str:
@@ -145,6 +174,13 @@ class Store:
         for name, ddl in _ORDER_EXTENSION_COLUMNS:
             if name not in existing:
                 await conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
+        symbol_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(symbols)"))).fetchall()
+        }
+        for name, ddl in _SYMBOL_COLUMNS:
+            if symbol_existing and name not in symbol_existing:
+                await conn.execute(text(f"ALTER TABLE symbols ADD COLUMN {name} {ddl}"))
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -152,6 +188,197 @@ class Store:
     async def _add(self, row: Any) -> None:
         async with self._sessionmaker() as session:
             session.add(row)
+            await session.commit()
+
+    # ---------- 币种注册表 ----------
+    @staticmethod
+    def _symbol_row_dict(row: SymbolRow) -> dict[str, Any]:
+        return {
+            "symbol": row.symbol,
+            "enabled": bool(row.enabled),
+            "status": row.status,
+            "sync_status": row.sync_status,
+            "needs_review": bool(row.needs_review),
+            "source": row.source,
+            "min_qty": row.min_qty,
+            "min_notional": row.min_notional,
+            "tick_size": row.tick_size,
+            "step_size": row.step_size,
+            "raw_filters_json": row.raw_filters_json,
+            "exchange_state_json": row.exchange_state_json,
+            "added_at": row.added_at,
+            "updated_at": row.updated_at,
+            "last_filter_sync_at": row.last_filter_sync_at,
+        }
+
+    async def sync_config_symbols(self, symbols: list[str]) -> None:
+        """把 config.yaml 中的静态币种 seed 到注册表，保留既有运行态开关。"""
+        now = _now_iso_utc()
+        normalized = []
+        seen: set[str] = set()
+        for raw in symbols:
+            symbol = normalize_symbol(raw)
+            if symbol and symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+
+        async with self._sessionmaker() as session:
+            for symbol in normalized:
+                row = await session.get(SymbolRow, symbol)
+                runtime = await session.get(RuntimeSettingRow, f"symbol.enabled.{symbol}")
+                enabled = (
+                    _parse_bool(runtime.value, True) if runtime is not None else True
+                )
+                if row is None:
+                    session.add(
+                        SymbolRow(
+                            symbol=symbol,
+                            enabled=enabled,
+                            status="active",
+                            sync_status="config_seed",
+                            needs_review=False,
+                            source="config",
+                            added_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    continue
+                row.status = "active" if row.status != "archived" else row.status
+                row.source = "config" if row.source in ("", "web") else row.source
+                if runtime is not None:
+                    row.enabled = enabled
+                row.updated_at = now
+            await session.commit()
+
+    async def list_symbols(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        async with self._sessionmaker() as session:
+            stmt = select(SymbolRow)
+            if not include_archived:
+                stmt = stmt.where(SymbolRow.status != "archived")
+            rows = (
+                await session.execute(stmt.order_by(SymbolRow.added_at, SymbolRow.symbol))
+            ).scalars().all()
+            return [self._symbol_row_dict(row) for row in rows]
+
+    async def active_symbols(self) -> list[str]:
+        rows = await self.list_symbols(include_archived=False)
+        return [row["symbol"] for row in rows if row["status"] == "active"]
+
+    async def enabled_symbols(self) -> list[str]:
+        rows = await self.list_symbols(include_archived=False)
+        return [
+            row["symbol"]
+            for row in rows
+            if row["status"] == "active" and row["enabled"] and not row["needs_review"]
+        ]
+
+    async def get_symbol(self, symbol: str) -> dict[str, Any] | None:
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            row = await session.get(SymbolRow, symbol)
+            return self._symbol_row_dict(row) if row is not None else None
+
+    async def upsert_symbol_from_exchange(
+        self,
+        *,
+        symbol: str,
+        filters: Any,
+        exchange_state: dict[str, Any],
+        source: str = "web",
+        enabled: bool = False,
+        sync_status: str = "confirmed_flat",
+        needs_review: bool = False,
+    ) -> dict[str, Any]:
+        symbol = normalize_symbol(symbol)
+        if not symbol:
+            raise ValueError("symbol is required")
+        now = _now_iso_utc()
+
+        raw_filters = {
+            "tick_size": str(getattr(filters, "tick_size", "")),
+            "step_size": str(getattr(filters, "step_size", "")),
+            "min_qty": str(getattr(filters, "min_qty", "")),
+            "min_notional": str(getattr(filters, "min_notional", "")),
+        }
+        state_json = json.dumps(exchange_state or {}, ensure_ascii=False, default=str)[:12000]
+        filters_json = json.dumps(raw_filters, ensure_ascii=False, default=str)
+        async with self._sessionmaker() as session:
+            row = await session.get(SymbolRow, symbol)
+            if row is None:
+                row = SymbolRow(symbol=symbol, added_at=now)
+                session.add(row)
+            row.enabled = enabled
+            row.status = "active"
+            row.sync_status = sync_status
+            row.needs_review = needs_review
+            row.source = source[:16]
+            row.min_qty = float(getattr(filters, "min_qty", 0) or 0)
+            row.min_notional = float(getattr(filters, "min_notional", 0) or 0)
+            row.tick_size = float(getattr(filters, "tick_size", 0) or 0)
+            row.step_size = float(getattr(filters, "step_size", 0) or 0)
+            row.raw_filters_json = filters_json
+            row.exchange_state_json = state_json
+            row.updated_at = now
+            row.last_filter_sync_at = now
+            runtime = await session.get(RuntimeSettingRow, f"symbol.enabled.{symbol}")
+            if runtime is None:
+                session.add(
+                    RuntimeSettingRow(
+                        key=f"symbol.enabled.{symbol}",
+                        value=str(enabled).lower(),
+                        updated_at=now,
+                    )
+                )
+            else:
+                runtime.value = str(enabled).lower()
+                runtime.updated_at = now
+            await session.commit()
+            return self._symbol_row_dict(row)
+
+    async def update_symbol_filters(self, symbol: str, filters: Any) -> None:
+        """只更新交易所 filters，不改变启停状态和复核状态。"""
+        symbol = normalize_symbol(symbol)
+        now = _now_iso_utc()
+        raw_filters = {
+            "tick_size": str(getattr(filters, "tick_size", "")),
+            "step_size": str(getattr(filters, "step_size", "")),
+            "min_qty": str(getattr(filters, "min_qty", "")),
+            "min_notional": str(getattr(filters, "min_notional", "")),
+        }
+        async with self._sessionmaker() as session:
+            row = await session.get(SymbolRow, symbol)
+            if row is None:
+                return
+            row.min_qty = float(getattr(filters, "min_qty", 0) or 0)
+            row.min_notional = float(getattr(filters, "min_notional", 0) or 0)
+            row.tick_size = float(getattr(filters, "tick_size", 0) or 0)
+            row.step_size = float(getattr(filters, "step_size", 0) or 0)
+            row.raw_filters_json = json.dumps(raw_filters, ensure_ascii=False, default=str)
+            row.updated_at = now
+            row.last_filter_sync_at = now
+            await session.commit()
+
+    async def set_symbol_enabled(self, symbol: str, enabled: bool) -> None:
+        symbol = normalize_symbol(symbol)
+        now = _now_iso_utc()
+        async with self._sessionmaker() as session:
+            row = await session.get(SymbolRow, symbol)
+            if row is None or row.status == "archived":
+                raise ValueError(f"symbol not registered: {symbol}")
+            row.enabled = enabled
+            row.updated_at = now
+            runtime = await session.get(RuntimeSettingRow, f"symbol.enabled.{symbol}")
+            if runtime is None:
+                session.add(
+                    RuntimeSettingRow(
+                        key=f"symbol.enabled.{symbol}",
+                        value=str(enabled).lower(),
+                        updated_at=now,
+                    )
+                )
+            else:
+                runtime.value = str(enabled).lower()
+                runtime.updated_at = now
             await session.commit()
 
     async def backfill_trades(self) -> int:
