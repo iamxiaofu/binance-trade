@@ -45,6 +45,7 @@ class FakeStore:
         self.position_snapshots = []
         self.balance_snapshots = []
         self.open_order_snapshots = []
+        self.open_trades = set()
         self.symbols = {
             "BTCUSDT": {
                 "symbol": "BTCUSDT",
@@ -108,6 +109,9 @@ class FakeStore:
 
     async def snapshot_open_orders(self, orders):
         self.open_order_snapshots.append(orders)
+
+    async def has_open_trade(self, symbol):
+        return symbol in self.open_trades
 
     async def sync_config_symbols(self, symbols):
         for symbol in symbols:
@@ -405,6 +409,60 @@ async def test_reconcile_disables_symbol_when_stale_condition_remains(settings, 
     assert eng._client.canceled_condition_orders
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+
+
+async def test_reconcile_skips_disabled_unmanaged_position_auto_close(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = False
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert eng._store.orders == []
+    assert eng._symbol_enabled["BTCUSDT"] is False
+
+
+async def test_reconcile_disables_enabled_unmanaged_position_without_auto_close(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert eng._store.orders == []
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+    assert any("no local open trade" in msg for _event, msg in eng._notifier.events)
+
+
+async def test_reconcile_enforces_managed_position_missing_stop(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.open_trades.add("BTCUSDT")
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert eng._store.orders
+    assert eng._store.orders[-1]["kind"] == "CLOSE"
+    assert eng._symbol_enabled["BTCUSDT"] is False
 
 
 async def test_skip_logs_decision(settings, creds, monkeypatch):

@@ -892,6 +892,20 @@ class Store:
                 "created_at": row.created_at,
             }
 
+    async def has_open_trade(self, symbol: str) -> bool:
+        """Return whether this symbol has a local open trade lifecycle."""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(TradeRow.id)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return row is not None
+
     async def snapshot_balance(
         self,
         *,

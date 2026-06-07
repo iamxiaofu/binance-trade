@@ -134,6 +134,18 @@ async def test_log_order_groups_short_trade_with_protection_and_close(store):
     assert [row.trade_role for row in orders] == ["ENTRY", "PROTECTION_SL", "PROTECTION_TP", "EXIT"]
 
 
+async def test_has_open_trade_detects_local_managed_position(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 0.01, "price": 100.0,
+        "notional": 1.0, "dry_run": False, "status": "filled",
+        "id": "open-managed", "raw": {},
+    })
+
+    assert await store.has_open_trade("BTCUSDT") is True
+    assert await store.has_open_trade("ETHUSDT") is False
+
+
 async def test_mark_condition_exit_closes_group_with_filled_price(store):
     opened = await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",

@@ -1423,6 +1423,9 @@ class TradingEngine:
                         await self._disable_symbol_due_stale_conditions(symbol, details)
                 continue
 
+            if not await self._should_enforce_position_protection(symbol, reason):
+                continue
+
             side = position["side"]
             qty = float(position["contracts"] or 0.0)
             entry = float(position["entry_price"] or 0.0)
@@ -1466,6 +1469,37 @@ class TradingEngine:
                     symbol,
                     reason=f"missing SL during exchange reconcile ({reason})",
                 )
+
+    async def _should_enforce_position_protection(self, symbol: str, reason: str) -> bool:
+        """Only auto-fix/close positions that are both enabled and locally managed."""
+        if not self._symbol_enabled.get(symbol, False):
+            logger.warning(
+                "{} live position detected during {}, but symbol is disabled; "
+                "skip auto protection enforcement",
+                symbol, reason,
+            )
+            return False
+        try:
+            managed = await self._store.has_open_trade(symbol)
+        except Exception as e:
+            logger.warning(
+                "{} live position detected during {}, but local trade ownership check failed: {}; "
+                "skip auto protection enforcement",
+                symbol, reason, e,
+            )
+            return False
+        if managed:
+            return True
+
+        self._symbol_enabled[symbol] = False
+        await self._store.set_symbol_enabled(symbol, False)
+        message = (
+            f"{symbol} live position detected during {reason}, but no local open trade "
+            "exists; symbol disabled and auto close skipped"
+        )
+        logger.error(message)
+        await self._notifier.send(Event.ERROR, message)
+        return False
 
     async def _snapshot(self) -> None:
         """刷新持仓/余额快照，更新运行态权益与回撤。
