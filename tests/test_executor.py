@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from src.exchange.filters import SymbolFilters
+from src.config.schema import ExecutionMode
 from src.execution.executor import Executor, realized_pnl
 from src.llm.schema import Action, TradeDecision
 
@@ -61,7 +62,11 @@ async def test_open_calls_exchange_and_sets_leverage(settings):
     assert res["status"] == "filled"
     assert res["filled"] is True
     assert res["opened"] is True
-    assert client.created == [("BTCUSDT", "buy", 0.05, "market", None)]
+    assert len(client.created) == 1
+    assert client.created[0][0:4] == ("BTCUSDT", "buy", 0.05, "market")
+    assert client.created[0][4]["newClientOrderId"].startswith("bt-")
+    assert res["execution_mode"] == "MARKET_TAKER"
+    assert res["liquidity"] == "taker"
     assert client.setup_called == [("BTCUSDT", 3)]
 
 
@@ -153,7 +158,10 @@ async def test_close_position_calls_exchange(settings):
     res = await ex.close_position(pos)
     assert res["closed"] is True
     assert res["side"] == "sell"
-    assert client.created == [("BTCUSDT", "sell", 0.05, "market", {"reduceOnly": True})]
+    assert len(client.created) == 1
+    assert client.created[0][0:4] == ("BTCUSDT", "sell", 0.05, "market")
+    assert client.created[0][4]["reduceOnly"] is True
+    assert client.created[0][4]["newClientOrderId"].startswith("bt-")
 
 
 async def test_close_no_position(settings):
@@ -216,6 +224,95 @@ async def test_open_full_fill_when_filled_reported(settings):
     assert res["status"] == "filled"
     assert res["partial"] is False
     assert res["qty"] == pytest.approx(0.05)
+
+
+class MakerPartialClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.canceled: list[tuple] = []
+
+    async def fetch_order_book(self, symbol, limit=5):
+        return {"bids": [[100.0, 10]], "asks": [[100.2, 10]]}
+
+    async def create_order(self, symbol, side, amount, order_type="market", price=None, params=None):
+        self.created.append((symbol, side, amount, order_type, price, params))
+        return {
+            "id": "maker-1",
+            "price": price,
+            "filled": 0.0,
+            "status": "open",
+            "info": {"orderId": "maker-1", "clientOrderId": params["newClientOrderId"]},
+        }
+
+    async def fetch_order(self, symbol, order_id, params=None):
+        return {
+            "id": order_id,
+            "price": 100.0,
+            "average": 100.0,
+            "filled": 0.02,
+            "status": "open",
+            "info": {"status": "PARTIALLY_FILLED", "executedQty": "0.02"},
+        }
+
+    async def cancel_order(self, symbol, order_id, params=None):
+        self.canceled.append((symbol, order_id))
+        return {"id": order_id, "status": "canceled"}
+
+    async def fetch_order_trades(self, symbol, order_id, limit=100):
+        return [{"fee": {"cost": 0.001, "currency": "USDT"}, "takerOrMaker": "maker"}]
+
+
+async def test_maker_open_partial_fill_cancels_rest(settings):
+    settings.execution.entry_mode = ExecutionMode.MAKER_FIRST
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    client = MakerPartialClient()
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    assert res["status"] == "partial"
+    assert res["qty"] == pytest.approx(0.02)
+    assert res["remaining_qty"] == pytest.approx(0.03)
+    assert res["order_type"] == "limit"
+    assert res["execution_mode"] == "MAKER_FIRST"
+    assert res["time_in_force"] == "GTX"
+    assert res["liquidity"] == "maker"
+    assert res["fee"] == pytest.approx(0.001)
+    assert client.created[0][3] == "limit"
+    assert client.created[0][5]["timeInForce"] == "GTX"
+    assert client.canceled == [("BTCUSDT", "maker-1")]
+
+
+class MakerUnfilledClient(MakerPartialClient):
+    async def fetch_order(self, symbol, order_id, params=None):
+        return {
+            "id": order_id,
+            "price": 100.0,
+            "filled": 0.0,
+            "status": "open",
+            "info": {"status": "NEW", "executedQty": "0"},
+        }
+
+    async def fetch_order_trades(self, symbol, order_id, limit=100):
+        return []
+
+
+async def test_maker_open_unfilled_cancels_without_open(settings):
+    settings.execution.entry_mode = ExecutionMode.MAKER_ONLY
+    settings.execution.maker_timeout_seconds = 0.01
+    settings.execution.maker_poll_seconds = 0.001
+    settings.execution.maker_max_requotes = 0
+    client = MakerUnfilledClient()
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    assert res["status"] == "canceled"
+    assert res["filled"] is False
+    assert res["opened"] is False
+    assert res["execution_mode"] == "MAKER_ONLY"
+    assert client.canceled == [("BTCUSDT", "maker-1")]
 
 
 async def test_close_partial_fill(settings):

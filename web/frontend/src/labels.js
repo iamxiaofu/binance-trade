@@ -83,6 +83,21 @@ export function orderTypeLabel(type) {
   }[type] || type || '—'
 }
 
+export function executionModeLabel(mode) {
+  return {
+    MARKET_TAKER: '市价吃单',
+    MAKER_ONLY: '只挂 maker',
+    MAKER_FIRST: '优先 maker',
+  }[mode] || mode || '—'
+}
+
+export function liquidityLabel(value) {
+  return {
+    maker: 'maker',
+    taker: 'taker',
+  }[value] || value || '—'
+}
+
 export function tradeDirectionLabel(direction) {
   return { long: '多单', short: '空单' }[direction] || direction || '—'
 }

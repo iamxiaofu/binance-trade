@@ -35,6 +35,21 @@ class OrderType(str, Enum):
     LIMIT = "LIMIT"
 
 
+class ExecutionMode(str, Enum):
+    MARKET_TAKER = "MARKET_TAKER"
+    MAKER_ONLY = "MAKER_ONLY"
+    MAKER_FIRST = "MAKER_FIRST"
+
+
+class MakerUnfilledAction(str, Enum):
+    CANCEL = "CANCEL"
+    FALLBACK_MARKET = "FALLBACK_MARKET"
+
+
+class PartialFillAction(str, Enum):
+    PROTECT_AND_CANCEL_REST = "PROTECT_AND_CANCEL_REST"
+
+
 class _Base(BaseModel):
     """禁止未知字段，防止配置写错键名被静默忽略。"""
     model_config = {"extra": "forbid"}
@@ -132,11 +147,34 @@ class LLMConfig(_Base):
 
 
 class ExecutionConfig(_Base):
-    order_type: OrderType = OrderType.MARKET
+    # 兼容旧配置。新逻辑使用 entry_mode / normal_exit_mode / emergency_exit_mode。
+    order_type: OrderType | None = None
+    entry_mode: ExecutionMode | None = None
+    normal_exit_mode: ExecutionMode = ExecutionMode.MARKET_TAKER
+    emergency_exit_mode: ExecutionMode = ExecutionMode.MARKET_TAKER
+    maker_time_in_force: Literal["GTX"] = "GTX"
+    maker_timeout_seconds: float = Field(default=8.0, gt=0, le=120)
+    maker_poll_seconds: float = Field(default=1.0, gt=0, le=10)
+    maker_max_requotes: int = Field(default=2, ge=0, le=10)
+    maker_price_offset_bps: float = Field(default=1.0, ge=0, le=100)
+    maker_unfilled_action: MakerUnfilledAction = MakerUnfilledAction.CANCEL
+    partial_fill_action: PartialFillAction = PartialFillAction.PROTECT_AND_CANCEL_REST
     attach_sl_tp: bool = True
     rate_limit_backoff: float = Field(gt=1.0)
     max_order_retries: int = Field(ge=0, le=10)
     recv_window: int = Field(ge=1000, le=60000)
+
+    @model_validator(mode="after")
+    def _derive_execution_modes(self) -> "ExecutionConfig":
+        if self.entry_mode is None:
+            self.entry_mode = (
+                ExecutionMode.MAKER_FIRST
+                if self.order_type is OrderType.LIMIT
+                else ExecutionMode.MARKET_TAKER
+            )
+        if self.emergency_exit_mode is not ExecutionMode.MARKET_TAKER:
+            raise ValueError("emergency_exit_mode 当前必须为 MARKET_TAKER")
+        return self
 
 
 class StorageConfig(_Base):

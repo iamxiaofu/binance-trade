@@ -5,7 +5,9 @@ import { ElMessage } from 'element-plus'
 import {
   localTime,
   decisionLabel,
+  executionModeLabel,
   exitReasonLabel,
+  liquidityLabel,
   orderActionLabel,
   orderKindTag,
   orderStatusLabel,
@@ -236,6 +238,12 @@ onMounted(async () => {
                 <el-table-column label="订单类型" width="150">
                   <template #default="{ row: order }">{{ orderTypeLabel(order.order_type) }}</template>
                 </el-table-column>
+                <el-table-column label="执行模式" width="110">
+                  <template #default="{ row: order }">{{ executionModeLabel(order.execution_mode) }}</template>
+                </el-table-column>
+                <el-table-column label="流动性" width="80">
+                  <template #default="{ row: order }">{{ liquidityLabel(order.liquidity) }}</template>
+                </el-table-column>
                 <el-table-column label="买卖" width="70">
                   <template #default="{ row: order }">{{ sideLabel(order.side) }}</template>
                 </el-table-column>
@@ -250,6 +258,9 @@ onMounted(async () => {
                 </el-table-column>
                 <el-table-column label="保证金" width="110">
                   <template #default="{ row: order }"><span class="mono">{{ fmt(order.margin) }}</span></template>
+                </el-table-column>
+                <el-table-column label="手续费" width="105">
+                  <template #default="{ row: order }"><span class="mono">{{ fmt(order.fee, 4) }} {{ order.fee_asset || '' }}</span></template>
                 </el-table-column>
                 <el-table-column label="状态" min-width="140">
                   <template #default="{ row: order }">
@@ -296,15 +307,23 @@ onMounted(async () => {
           <el-table-column label="保证金" width="105">
             <template #default="{ row }"><span class="mono">{{ fmt(row.entry_margin) }}</span></template>
           </el-table-column>
-          <el-table-column label="盈亏" width="105">
+          <el-table-column label="手续费" width="105">
+            <template #default="{ row }"><span class="mono">{{ row.status !== 'open' ? fmt(row.total_fee, 4) : '—' }}</span></template>
+          </el-table-column>
+          <el-table-column label="毛盈亏" width="105">
             <template #default="{ row }">
-              <span class="mono" :class="pnlClass(row.realized_pnl)">{{ row.status === 'closed' ? fmt(row.realized_pnl) : '—' }}</span>
+              <span class="mono" :class="pnlClass(row.realized_pnl)">{{ row.status !== 'open' ? fmt(row.realized_pnl) : '—' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="净盈亏" width="105">
+            <template #default="{ row }">
+              <span class="mono" :class="pnlClass(row.net_realized_pnl)">{{ row.status !== 'open' ? fmt(row.net_realized_pnl) : '—' }}</span>
             </template>
           </el-table-column>
           <el-table-column label="保证金收益率" width="125">
             <template #default="{ row }">
               <span class="mono" :class="pnlClass(row.pnl_pct_on_margin)">
-                {{ row.status === 'closed' ? fmt(row.pnl_pct_on_margin) + '%' : '—' }}
+                {{ row.status !== 'open' ? fmt(row.pnl_pct_on_margin) + '%' : '—' }}
               </span>
             </template>
           </el-table-column>
@@ -341,6 +360,12 @@ onMounted(async () => {
         <el-table-column label="订单类型" width="150">
           <template #default="{ row }">{{ orderTypeLabel(row.order_type) }}</template>
         </el-table-column>
+        <el-table-column label="执行模式" width="120">
+          <template #default="{ row }">{{ executionModeLabel(row.execution_mode) }}</template>
+        </el-table-column>
+        <el-table-column label="流动性" width="90">
+          <template #default="{ row }">{{ liquidityLabel(row.liquidity) }}</template>
+        </el-table-column>
         <el-table-column label="买卖" width="80">
           <template #default="{ row }">{{ sideLabel(row.side) }}</template>
         </el-table-column>
@@ -358,6 +383,9 @@ onMounted(async () => {
         </el-table-column>
         <el-table-column label="杠杆" width="80">
           <template #default="{ row }">{{ row.leverage ? row.leverage + 'x' : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="手续费" width="120">
+          <template #default="{ row }"><span class="mono">{{ fmt(row.fee, 4) }} {{ row.fee_asset || '' }}</span></template>
         </el-table-column>
         <el-table-column label="状态" width="150">
           <template #default="{ row }">

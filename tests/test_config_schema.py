@@ -8,6 +8,7 @@ from src.config.schema import (
     AccountConfig,
     CycleConfig,
     ExecutionConfig,
+    ExecutionMode,
     LLMConfig,
     LoggingConfig,
     NotifyConfig,
@@ -85,3 +86,33 @@ def test_storage_legacy_db_path_remains_supported():
 def test_storage_rejects_template_without_mode_placeholder():
     with pytest.raises(ValidationError):
         StorageConfig(db_path_template="./data/trade.db")
+
+
+def test_execution_legacy_order_type_limit_maps_to_maker_first():
+    cfg = ExecutionConfig(
+        order_type="LIMIT",
+        rate_limit_backoff=1.5,
+        max_order_retries=3,
+        recv_window=5000,
+    )
+    assert cfg.entry_mode is ExecutionMode.MAKER_FIRST
+
+
+def test_execution_defaults_legacy_market_taker():
+    cfg = ExecutionConfig(
+        rate_limit_backoff=1.5,
+        max_order_retries=3,
+        recv_window=5000,
+    )
+    assert cfg.entry_mode is ExecutionMode.MARKET_TAKER
+
+
+def test_execution_rejects_non_market_emergency_mode():
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            entry_mode="MAKER_FIRST",
+            emergency_exit_mode="MAKER_ONLY",
+            rate_limit_backoff=1.5,
+            max_order_retries=3,
+            recv_window=5000,
+        )

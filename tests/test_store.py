@@ -134,6 +134,47 @@ async def test_log_order_groups_short_trade_with_protection_and_close(store):
     assert [row.trade_role for row in orders] == ["ENTRY", "PROTECTION_SL", "PROTECTION_TP", "EXIT"]
 
 
+async def test_partial_close_keeps_trade_partial_until_remaining_closes(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "limit", "qty": 1.0, "price": 100.0,
+        "notional": 100.0, "dry_run": False, "status": "filled",
+        "id": "open", "raw": {}, "leverage": 2, "fee": 0.02,
+        "liquidity": "maker",
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "CLOSE", "side": "sell",
+        "order_type": "limit", "qty": 0.4, "price": 110.0,
+        "notional": 44.0, "dry_run": False, "status": "partial",
+        "id": "close-1", "raw": {}, "fee": 0.01, "liquidity": "maker",
+    })
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+    assert trade.status == "partial"
+    assert trade.qty_closed == pytest.approx(0.4)
+    assert trade.realized_pnl == pytest.approx(4.0)
+    assert trade.net_realized_pnl == pytest.approx(3.97)
+    assert trade.entry_liquidity == "maker"
+    assert trade.exit_liquidity == "maker"
+
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "CLOSE", "side": "sell",
+        "order_type": "market", "qty": 0.6, "price": 108.0,
+        "notional": 64.8, "dry_run": False, "status": "filled",
+        "id": "close-2", "raw": {}, "fee": 0.02, "liquidity": "taker",
+    })
+
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+    assert trade.status == "closed"
+    assert trade.qty_closed == pytest.approx(1.0)
+    assert trade.realized_pnl == pytest.approx(8.8)
+    assert trade.total_fee == pytest.approx(0.05)
+    assert trade.net_realized_pnl == pytest.approx(8.75)
+
+
 async def test_has_open_trade_detects_local_managed_position(store):
     await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",

@@ -90,6 +90,18 @@ class OrderRow(Base):
     leverage: Mapped[int] = mapped_column(Integer, default=0)
     margin: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    execution_mode: Mapped[str] = mapped_column(String(24), default="")
+    time_in_force: Mapped[str] = mapped_column(String(12), default="")
+    requested_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    filled_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    remaining_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    requested_price: Mapped[float] = mapped_column(Float, default=0.0)
+    limit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_price: Mapped[float] = mapped_column(Float, default=0.0)
+    liquidity: Mapped[str] = mapped_column(String(12), default="")
+    fee: Mapped[float] = mapped_column(Float, default=0.0)
+    fee_asset: Mapped[str] = mapped_column(String(16), default="")
+    client_order_id: Mapped[str] = mapped_column(String(64), default="")
 
 
 class TradeRow(Base):
@@ -122,6 +134,14 @@ class TradeRow(Base):
     exit_notional: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     pnl_pct_on_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    total_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    gross_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    net_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    net_pnl_pct_on_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_liquidity: Mapped[str] = mapped_column(String(12), default="")
+    exit_liquidity: Mapped[str] = mapped_column(String(12), default="")
 
     exit_reason: Mapped[str] = mapped_column(String(24), default="")
     source: Mapped[str] = mapped_column(String(16), default="live")

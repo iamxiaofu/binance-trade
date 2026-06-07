@@ -14,7 +14,7 @@ import time
 
 from loguru import logger
 
-from src.config.schema import Credentials, Settings
+from src.config.schema import Credentials, ExecutionMode, Settings
 from src.exchange.client import ExchangeClient
 from src.exchange.filters import round_price
 from src.exchange.market_data import MarketData
@@ -735,7 +735,7 @@ class TradingEngine:
         if raw is None:
             logger.warning("{} emergency close skipped, no live position ({})", symbol, reason)
             return
-        result = await self._executor.close_position(raw)
+        result = await self._executor.close_position(raw, mode=ExecutionMode.MARKET_TAKER)
         await self._store.log_order(result)
         if not result.get("filled"):
             logger.error("{} emergency close failed: {}", symbol, result)
@@ -1230,6 +1230,13 @@ class TradingEngine:
         if result["status"] == "rejected":
             await self._notifier.send(Event.REJECT, f"{symbol} below min order")
             return
+        if not result["filled"]:
+            await self._notifier.send(
+                Event.REJECT,
+                f"{symbol} open not filled status={result.get('status')} "
+                f"mode={result.get('execution_mode') or 'unknown'}",
+            )
+            return
         if result["filled"]:
             self.runtime.mark_order_event(symbol)
             await self._notifier.send(
@@ -1259,7 +1266,10 @@ class TradingEngine:
         if not raw:
             logger.info("[{}] CLOSE requested but no position", symbol)
             return
-        result = await self._executor.close_position(raw)
+        result = await self._executor.close_position(
+            raw,
+            mode=self._settings.execution.normal_exit_mode,
+        )
         await self._store.log_order(result)
         if result["filled"]:
             # 计算本次平仓已实现盈亏并累加（驱动日亏熔断）
@@ -1270,9 +1280,25 @@ class TradingEngine:
                 qty=result["qty"],
             )
             self.runtime.add_realized_pnl(pnl)
+            self.runtime.mark_order_event(symbol)
+            if result.get("status") == "partial":
+                try:
+                    repair_result = await self._repair_sl_tp(symbol)
+                    logger.warning("{} partial close protection repaired: {}", symbol, repair_result)
+                except Exception as e:
+                    await self._disable_symbol_due_protection_failure(
+                        symbol, f"protection repair failed after partial close: {e}"
+                    )
+                    await self._emergency_close_unprotected_position(
+                        symbol, reason="protection repair failed after partial close"
+                    )
+                await self._notifier.send(
+                    Event.CLOSE,
+                    f"{symbol} partial close qty={result['qty']} pnl={pnl:.2f}",
+                )
+                return
             # 已显式平仓：从运行态移除，避免 _snapshot 的差异检测重复计账
             self.runtime.positions.pop(symbol, None)
-            self.runtime.mark_order_event(symbol)
             remaining = await self._cancel_symbol_condition_orders(
                 symbol, reason="explicit_close"
             )

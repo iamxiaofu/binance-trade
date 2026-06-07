@@ -41,6 +41,28 @@ _ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("leverage", "INTEGER NOT NULL DEFAULT 0"),
     ("margin", "FLOAT NOT NULL DEFAULT 0.0"),
     ("realized_pnl", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("execution_mode", "VARCHAR(24) NOT NULL DEFAULT ''"),
+    ("time_in_force", "VARCHAR(12) NOT NULL DEFAULT ''"),
+    ("requested_qty", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("filled_qty", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("remaining_qty", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("requested_price", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("limit_price", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("avg_price", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("liquidity", "VARCHAR(12) NOT NULL DEFAULT ''"),
+    ("fee", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("fee_asset", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("client_order_id", "VARCHAR(64) NOT NULL DEFAULT ''"),
+)
+_TRADE_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("entry_fee", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("exit_fee", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("total_fee", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("gross_realized_pnl", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("net_realized_pnl", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("net_pnl_pct_on_margin", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("entry_liquidity", "VARCHAR(12) NOT NULL DEFAULT ''"),
+    ("exit_liquidity", "VARCHAR(12) NOT NULL DEFAULT ''"),
 )
 _SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("enabled", "BOOLEAN NOT NULL DEFAULT 0"),
@@ -174,6 +196,13 @@ class Store:
         for name, ddl in _ORDER_EXTENSION_COLUMNS:
             if name not in existing:
                 await conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
+        trade_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(trades)"))).fetchall()
+        }
+        for name, ddl in _TRADE_EXTENSION_COLUMNS:
+            if trade_existing and name not in trade_existing:
+                await conn.execute(text(f"ALTER TABLE trades ADD COLUMN {name} {ddl}"))
         symbol_existing = {
             row[1]
             for row in (await conn.execute(text("PRAGMA table_info(symbols)"))).fetchall()
@@ -476,6 +505,18 @@ class Store:
             leverage=_safe_int(order.get("leverage")),
             margin=_safe_float(order.get("margin")),
             realized_pnl=_safe_float(order.get("realized_pnl")),
+            execution_mode=str(order.get("execution_mode") or ""),
+            time_in_force=str(order.get("time_in_force") or ""),
+            requested_qty=_safe_float(order.get("requested_qty")),
+            filled_qty=_safe_float(order.get("filled_qty")),
+            remaining_qty=_safe_float(order.get("remaining_qty")),
+            requested_price=_safe_float(order.get("requested_price")),
+            limit_price=_safe_float(order.get("limit_price")),
+            avg_price=_safe_float(order.get("avg_price")),
+            liquidity=str(order.get("liquidity") or ""),
+            fee=_safe_float(order.get("fee")),
+            fee_asset=str(order.get("fee_asset") or ""),
+            client_order_id=str(order.get("client_order_id") or ""),
         )
         trade_id = _safe_int(order.get("trade_id"))
         if trade_id > 0:
@@ -560,6 +601,9 @@ class Store:
             leverage=leverage,
             entry_notional=row.notional,
             entry_margin=entry_margin,
+            entry_fee=row.fee,
+            total_fee=row.fee,
+            entry_liquidity=row.liquidity,
             source=source,
             confidence=confidence,
         )
@@ -640,7 +684,7 @@ class Store:
         return _safe_int(leverage)
 
     def _close_trade_with_order(self, trade: TradeRow, row: OrderRow, *, exit_reason: str) -> None:
-        qty = row.qty if row.qty > 0 else trade.qty_opened
+        qty = row.qty if row.qty > 0 else max(trade.qty_opened - trade.qty_closed, 0.0)
         exit_price = _raw_number(row.raw_json, "filled_price") or row.price
         pnl = row.realized_pnl or _realized_pnl(
             direction=trade.direction,
@@ -649,16 +693,26 @@ class Store:
             qty=qty,
         )
         margin = trade.entry_margin or _margin(trade.entry_notional, trade.leverage)
-        trade.status = "closed"
-        trade.closed_at_ms = row.ts_ms
-        trade.closed_at = row.created_at
+        prev_closed = trade.qty_closed if trade.qty_closed > 0 else 0.0
+        total_closed = min(trade.qty_opened, prev_closed + qty)
+        is_closed = self._qty_matches(trade.qty_opened, total_closed)
+        trade.status = "closed" if is_closed else "partial"
+        if is_closed:
+            trade.closed_at_ms = row.ts_ms
+            trade.closed_at = row.created_at
         trade.exit_order_id = row.id
         trade.exit_price = exit_price
-        trade.qty_closed = qty
-        trade.exit_notional = abs(qty * exit_price) if exit_price > 0 else row.notional
-        trade.realized_pnl = pnl
-        trade.pnl_pct_on_margin = _pnl_pct(pnl, margin)
+        trade.qty_closed = total_closed
+        trade.exit_notional += abs(qty * exit_price) if exit_price > 0 else row.notional
+        trade.realized_pnl += pnl
+        trade.gross_realized_pnl = trade.realized_pnl
+        trade.exit_fee += row.fee
+        trade.total_fee = trade.entry_fee + trade.exit_fee
+        trade.net_realized_pnl = trade.gross_realized_pnl - trade.total_fee
+        trade.pnl_pct_on_margin = _pnl_pct(trade.realized_pnl, margin)
+        trade.net_pnl_pct_on_margin = _pnl_pct(trade.net_realized_pnl, margin)
         trade.exit_reason = exit_reason
+        trade.exit_liquidity = row.liquidity or trade.exit_liquidity
         row.realized_pnl = pnl
 
     async def mark_orders_status_by_exchange_ids(

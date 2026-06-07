@@ -273,7 +273,7 @@ class FakeExecutor:
             for kind, otype, trigger in specs
         ]
 
-    async def close_position(self, position):
+    async def close_position(self, position, *, mode=None):
         return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "filled",
                 "filled": True, "closed": True, "dry_run": False,
                 "qty": abs(float(position.get("contracts") or 0)),
@@ -566,7 +566,7 @@ class MissingStopExecutor(FakeExecutor):
              "raw": {"error": "timeout"}},
         ]
 
-    async def close_position(self, position):
+    async def close_position(self, position, *, mode=None):
         self.closed += 1
         return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "filled",
                 "filled": True, "closed": True, "dry_run": False,

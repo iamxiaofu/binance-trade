@@ -146,6 +146,9 @@ class ExchangeClient:
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self._exchange.fetch_ticker(self._to_ccxt_symbol(symbol))
 
+    async def fetch_order_book(self, symbol: str, limit: int = 5) -> dict:
+        return await self._exchange.fetch_order_book(self._to_ccxt_symbol(symbol), limit)
+
     async def fetch_funding_rate(self, symbol: str) -> dict:
         return await self._exchange.fetch_funding_rate(self._to_ccxt_symbol(symbol))
 
@@ -161,6 +164,33 @@ class ExchangeClient:
     ) -> dict:
         return await self._exchange.create_order(
             self._to_ccxt_symbol(symbol), order_type, side, amount, price, params or {}
+        )
+
+    async def fetch_order(self, symbol: str, order_id: str, params: dict | None = None) -> dict:
+        return await self._exchange.fetch_order(
+            order_id,
+            self._to_ccxt_symbol(symbol),
+            params or {},
+        )
+
+    async def fetch_order_trades(self, symbol: str, order_id: str, limit: int = 100) -> list[dict]:
+        return await self._exchange.fetch_my_trades(
+            self._to_ccxt_symbol(symbol),
+            since=None,
+            limit=limit,
+            params={"orderId": order_id},
+        )
+
+    async def cancel_order(
+        self,
+        symbol: str,
+        order_id: str,
+        params: dict | None = None,
+    ) -> Any:
+        return await self._exchange.cancel_order(
+            order_id,
+            self._to_ccxt_symbol(symbol),
+            params or {},
         )
 
     async def cancel_all_orders(

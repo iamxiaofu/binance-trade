@@ -57,7 +57,16 @@ llm:
 
 # ===== 执行层 =====
 execution:
-  order_type: MARKET          # MARKET | LIMIT
+  entry_mode: MAKER_FIRST     # MARKET_TAKER | MAKER_ONLY | MAKER_FIRST
+  normal_exit_mode: MARKET_TAKER   # 策略主动平仓默认市价，避免部分平仓保护单失配
+  emergency_exit_mode: MARKET_TAKER # 熔断/保护失败/kill-switch 永远走市价减仓
+  maker_time_in_force: GTX    # Binance USD-M Post Only
+  maker_timeout_seconds: 8
+  maker_poll_seconds: 1
+  maker_max_requotes: 2
+  maker_price_offset_bps: 1
+  maker_unfilled_action: CANCEL     # CANCEL | FALLBACK_MARKET
+  partial_fill_action: PROTECT_AND_CANCEL_REST
   attach_sl_tp: true          # 是否同时挂止盈止损单
   rate_limit_backoff: 1.5     # 限频指数退避基数
   max_order_retries: 3
