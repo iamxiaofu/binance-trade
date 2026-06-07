@@ -201,6 +201,32 @@ REVIEW_SYMBOL SOLUSDT
 这样可以避免人工测试仓位或待接管仓位被交易引擎误平。
 后续“自动接管已有持仓”需要单独设计本地交易组、保护单模板和风险边界。
 
+## 当前保护单展示规则
+
+Web 持仓页展示“止损条件单 / 止盈条件单”时，只表示交易所当前 active 条件单。
+
+展示数据来源：
+
+```text
+fetch_open_condition_orders(symbol)
+```
+
+不再使用历史条件单作为当前保护状态兜底。
+
+原因：
+
+- `fetch_condition_orders(symbol, limit=20)` 返回的是历史条件单。
+- 历史结果可能包含 `canceled`、`rejected`、`expired`、`filled`。
+- 这些历史状态不代表当前持仓已经挂出保护单。
+- 如果用历史结果兜底，页面可能在“条件单已取消 / 已拒绝 / 无挂单”之间跳动。
+
+当前规则：
+
+- 只有 `status=placed` 的 SL/TP 条件单会显示为当前保护单。
+- 没有 active SL 时，稳定显示缺少止损。
+- 没有 active TP 时，稳定显示缺少止盈。
+- 历史 canceled/rejected 条件单只应进入审计视角，不参与当前持仓保护状态。
+
 ## 启停规则
 
 `SET_SYMBOL_ENABLED` 从“校验 config symbols”改为“校验 symbols 注册表”。

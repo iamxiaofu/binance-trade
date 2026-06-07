@@ -223,14 +223,6 @@ async def _live_condition_orders(
     errors: list[str] = []
     for symbol in symbols:
         try:
-            recent = await client.fetch_condition_orders(symbol, limit=20)
-            for raw in recent:
-                order = normalize_condition_order(raw)
-                if order["kind"] in ("SL", "TP"):
-                    merged[order["id"] or f"{symbol}:{order['kind']}:{order['ts_ms']}"] = order
-        except Exception as e:
-            errors.append(f"{symbol} history: {e}")
-        try:
             open_orders = await client.fetch_open_condition_orders(symbol)
             for raw in open_orders:
                 order = normalize_condition_order(raw)
@@ -263,12 +255,10 @@ def _attach_protection_orders(positions: list[dict], orders: list[dict[str, Any]
 
 
 def _select_protection_order(orders: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
-    matching = [o for o in orders if o["kind"] == kind]
-    active = [o for o in matching if o["status"] == "placed"]
-    pool = active or matching
-    if not pool:
+    active = [o for o in orders if o["kind"] == kind and o["status"] == "placed"]
+    if not active:
         return None
-    return sorted(pool, key=lambda x: x.get("ts_ms") or 0, reverse=True)[0]
+    return sorted(active, key=lambda x: x.get("ts_ms") or 0, reverse=True)[0]
 
 
 async def _status_summary() -> dict[str, Any]:
