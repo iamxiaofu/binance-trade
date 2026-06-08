@@ -288,6 +288,31 @@ confidence=inferred
 
 `SOLUSDT` 残留的无持仓 TP 条件单 `1000000099101885` 已由新对账逻辑取消，并在本地标记为 canceled。
 
+### 手动平仓
+
+上线前备份：
+
+```text
+data/backups/trade-testnet-before-manual-close-20260608-160939.db
+data/backups/trade-mainnet-before-manual-close-20260608-160939.db
+```
+
+持仓页新增单仓位手动平仓：
+
+1. 前端按持仓行打开确认弹窗。
+2. 展示币种、方向、数量、开仓价、标记价、杠杆、预计盈亏。
+3. 提交 `CLOSE_POSITION` JSON 命令。
+4. 交易引擎重新拉交易所当前持仓，并校验页面签名：
+   - 方向一致。
+   - 数量一致。
+   - 开仓价一致。
+5. 使用 reduce-only `MARKET_TAKER` 反向平仓。
+6. 平仓后再次确认交易所是否 flat。
+7. 如果已 flat，撤销该币种关联 SL/TP 条件单并同步本地状态。
+8. 不禁用币种，不暂停策略，不阻止后续新开仓。
+
+如果平仓只部分成交，系统不会撤光保护单，而是返回剩余持仓提示，要求人工复核。
+
 ## 回滚方案
 
 本次变更前已备份：
@@ -331,5 +356,5 @@ systemctl stop binance-trade.service binance-trade-web.service
 结果：
 
 ```text
-199 passed, 2 warnings
+201 passed, 2 warnings
 ```

@@ -10,6 +10,10 @@ const repairing = ref({})
 const takeoverVisible = ref(false)
 const takeoverSubmitting = ref(false)
 const takeoverRow = ref(null)
+const closeVisible = ref(false)
+const closeSubmitting = ref(false)
+const closeRow = ref(null)
+const closeConfirm = ref(false)
 const takeoverForm = ref({
   qty: '',
   sl: '',
@@ -48,6 +52,16 @@ function fmtTime(ts) {
 
 function margin(row) {
   return Number(row.isolated_margin || row.initial_margin || 0)
+}
+
+function estimatedClosePnl(row) {
+  const qty = Number(row.contracts || 0)
+  const entry = Number(row.entry_price || 0)
+  const mark = Number(row.mark_price || 0)
+  if (!Number.isFinite(qty) || !Number.isFinite(entry) || !Number.isFinite(mark)) return 0
+  if (row.side === 'long') return (mark - entry) * qty
+  if (row.side === 'short') return (entry - mark) * qty
+  return 0
 }
 
 function protection(row, kind) {
@@ -160,6 +174,40 @@ async function submitTakeover() {
     takeoverSubmitting.value = false
   }
 }
+
+function openManualClose(row) {
+  closeRow.value = row
+  closeConfirm.value = false
+  closeVisible.value = true
+}
+
+async function submitManualClose() {
+  const row = closeRow.value
+  if (!row) return
+  if (!closeConfirm.value) {
+    ElMessage.error('请先确认市价平仓')
+    return
+  }
+  const payload = {
+    symbol: row.symbol,
+    confirm: true,
+    position: {
+      side: row.side,
+      qty: row.contracts,
+      entry: row.entry_price,
+    },
+  }
+  closeSubmitting.value = true
+  try {
+    const res = await api.command('CLOSE_POSITION', JSON.stringify(payload))
+    ElMessage.success(`${row.symbol} 手动平仓命令已入队 (#${res.id})`)
+    closeVisible.value = false
+  } catch (e) {
+    ElMessage.error(`手动平仓命令下发失败: ${e.message}`)
+  } finally {
+    closeSubmitting.value = false
+  }
+}
 </script>
 
 <template>
@@ -264,21 +312,26 @@ async function submitTakeover() {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="保护操作" width="240" fixed="right">
+        <el-table-column label="操作" width="340" fixed="right">
           <template #default="{ row }">
-            <div v-if="needsRepair(row)" class="action-buttons">
-              <el-button
-                type="danger"
-                size="small"
-                :icon="'CirclePlus'"
-                :loading="isRepairing(row)"
-                @click="repairProtection(row)"
-              >
-                历史补单
+            <div class="action-buttons">
+              <template v-if="needsRepair(row)">
+                <el-button
+                  type="danger"
+                  size="small"
+                  :icon="'CirclePlus'"
+                  :loading="isRepairing(row)"
+                  @click="repairProtection(row)"
+                >
+                  历史补单
+                </el-button>
+                <el-button size="small" @click="openTakeover(row)">接管保护</el-button>
+              </template>
+              <el-tag v-else type="success" size="small">{{ missingProtectionText(row) }}</el-tag>
+              <el-button type="danger" plain size="small" @click="openManualClose(row)">
+                手动平仓
               </el-button>
-              <el-button size="small" @click="openTakeover(row)">接管保护</el-button>
             </div>
-            <el-tag v-else type="success" size="small">{{ missingProtectionText(row) }}</el-tag>
           </template>
         </el-table-column>
       </el-table>
@@ -317,6 +370,42 @@ async function submitTakeover() {
         <el-button @click="takeoverVisible = false">取消</el-button>
         <el-button type="danger" :loading="takeoverSubmitting" @click="submitTakeover">
           提交接管
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="closeVisible" title="手动平仓" width="520px">
+      <el-form v-if="closeRow" label-width="120px">
+        <el-form-item label="币种">
+          <span class="mono">{{ closeRow.symbol }}</span>
+        </el-form-item>
+        <el-form-item label="方向/数量">
+          <span class="mono">{{ closeRow.side }} / {{ fmt(closeRow.contracts) }}</span>
+        </el-form-item>
+        <el-form-item label="开仓价/标记价">
+          <span class="mono">{{ fmt(closeRow.entry_price, 2) }} / {{ fmt(closeRow.mark_price, 2) }}</span>
+        </el-form-item>
+        <el-form-item label="杠杆">
+          <span class="mono">{{ Number(closeRow.leverage) > 0 ? `${closeRow.leverage}x` : '—' }}</span>
+        </el-form-item>
+        <el-form-item label="预计盈亏">
+          <span class="mono" :class="estimatedClosePnl(closeRow) >= 0 ? 'pnl-pos' : 'pnl-neg'">
+            {{ fmt(estimatedClosePnl(closeRow), 2) }} USDT
+          </span>
+        </el-form-item>
+        <el-form-item label="保护单处理">
+          <span>平仓确认后撤销该币种关联止盈止损条件单</span>
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="closeConfirm">
+            确认按市价 reduce-only 平掉当前交易所持仓
+          </el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="closeVisible = false">取消</el-button>
+        <el-button type="danger" :loading="closeSubmitting" @click="submitManualClose">
+          确认市价平仓
         </el-button>
       </template>
     </el-dialog>

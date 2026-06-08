@@ -283,6 +283,8 @@ class TradingEngine:
             return await self._repair_sl_tp(arg)
         if name == "PROTECT_POSITION":
             return await self._protect_position(arg)
+        if name == "CLOSE_POSITION":
+            return await self._close_position_command(arg)
         raise ValueError(f"unknown command: {name}")
 
     async def _apply_runtime_settings(self) -> None:
@@ -850,6 +852,109 @@ class TradingEngine:
         if failed:
             parts.append("下发失败: " + "；".join(failed))
         return "；".join(parts)
+
+    async def _close_position_command(self, arg: str) -> str:
+        """人工确认后，按交易所当前持仓执行 reduce-only 市价平仓。"""
+        try:
+            payload = json.loads(arg or "{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"CLOSE_POSITION requires JSON arg: {e}") from e
+        if not isinstance(payload, dict):
+            raise ValueError("CLOSE_POSITION arg must be a JSON object")
+        if not bool(payload.get("confirm")):
+            raise ValueError("CLOSE_POSITION requires confirm=true")
+
+        symbol = normalize_symbol(str(payload.get("symbol") or ""))
+        if not symbol:
+            raise ValueError("CLOSE_POSITION requires symbol")
+        if symbol not in self._tracked_symbols():
+            raise ValueError(f"symbol not registered: {symbol}")
+
+        raw_position = await self._fetch_exchange_position_raw(symbol)
+        if raw_position is None:
+            remaining = await self._cancel_symbol_condition_orders(
+                symbol, reason="manual_close_flat"
+            )
+            closed = await self._store.reconcile_symbol_flat(
+                symbol, reason="MANUAL_CLOSE"
+            )
+            parts = [f"{symbol}: 交易所当前无持仓，不需要平仓"]
+            if closed:
+                parts.append(f"已修正本地 open trade {closed} 条")
+            if remaining:
+                details = ", ".join(self._condition_order_label(order) for order in remaining)
+                parts.append(f"仍有条件单未撤销: {details}")
+            return "；".join(parts)
+
+        position = normalize_position(raw_position)
+        side = position["side"]
+        qty = float(position["contracts"] or 0.0)
+        entry = float(position["entry_price"] or 0.0)
+        mark = await self._current_mark_price(symbol, position)
+        if side not in ("long", "short") or qty <= 0 or entry <= 0:
+            raise ValueError(
+                f"{symbol}: 持仓数据不完整，无法手动平仓 "
+                f"(side={side}, qty={qty}, entry={entry})"
+            )
+        observed = payload.get("position") if isinstance(payload.get("position"), dict) else {}
+        self._validate_position_signature(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            entry=entry,
+            observed=observed,
+        )
+
+        estimate = realized_pnl(side=side, entry_price=entry, exit_price=mark, qty=qty)
+        result = await self._executor.close_position(
+            raw_position,
+            mode=ExecutionMode.MARKET_TAKER,
+        )
+        await self._store.log_order(result)
+        if not result.get("filled"):
+            raise ValueError(f"{symbol}: 手动平仓未成交 status={result.get('status')} raw={result.get('raw')}")
+
+        pnl = realized_pnl(
+            side=result.get("pos_side", side),
+            entry_price=result.get("entry_price", entry),
+            exit_price=result.get("price", 0.0),
+            qty=result.get("qty", 0.0),
+        )
+        self.runtime.add_realized_pnl(pnl)
+        self.runtime.mark_order_event(symbol)
+        remaining_position = await self._fetch_exchange_position(symbol)
+        if remaining_position is not None:
+            remaining_qty = float(remaining_position.get("contracts") or 0.0)
+            await self._notifier.send(
+                Event.CLOSE,
+                f"{symbol} manual close partial qty={result.get('qty')} "
+                f"remaining={remaining_qty:g} pnl={pnl:.2f}",
+            )
+            return (
+                f"{symbol}: 手动平仓部分成交 qty={float(result.get('qty') or 0.0):g} "
+                f"avg={float(result.get('price') or 0.0):.4f} "
+                f"pnl={pnl:.2f} USDT；剩余持仓 {remaining_qty:g}，保护单未自动撤销"
+            )
+
+        self.runtime.positions.pop(symbol, None)
+        remaining = await self._cancel_symbol_condition_orders(
+            symbol, reason="manual_close"
+        )
+        await self._store.reconcile_symbol_flat(symbol, reason="MANUAL_CLOSE")
+        canceled_note = "保护单已撤销" if not remaining else (
+            "仍有条件单未撤销: "
+            + ", ".join(self._condition_order_label(order) for order in remaining)
+        )
+        await self._notifier.send(
+            Event.CLOSE,
+            f"{symbol} manual closed qty={result.get('qty')} pnl={pnl:.2f}",
+        )
+        return (
+            f"{symbol}: 手动平仓完成 qty={float(result.get('qty') or 0.0):g} "
+            f"avg={float(result.get('price') or 0.0):.4f} "
+            f"pnl={pnl:.2f} USDT "
+            f"(提交前估算 {estimate:.2f} USDT)；{canceled_note}"
+        )
 
     @staticmethod
     def _validate_position_signature(

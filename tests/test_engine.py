@@ -1080,6 +1080,17 @@ class RepairClient:
         self.open_orders = []
 
 
+class ManualCloseExecutor(FakeExecutor):
+    def __init__(self, client):
+        super().__init__()
+        self.client = client
+
+    async def close_position(self, position, *, mode=None):
+        result = await super().close_position(position, mode=mode)
+        self.client.position = None
+        return result
+
+
 async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monkeypatch):
     settings.risk.max_loss_per_trade_pct = 10
     eng = _engine(settings, creds, monkeypatch)
@@ -1227,6 +1238,65 @@ async def test_command_protect_position_takeover_only_residual_qty(settings, cre
     assert "已接管保护 SL@98.00" in result
     assert eng._store.takeover_trades[0]["qty"] == pytest.approx(0.02)
     assert "trade_id" not in eng._store.orders[0]
+
+
+async def test_command_close_position_closes_and_cancels_protection_without_disabling(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+            "markPrice": 99.0,
+            "leverage": 2,
+        },
+        open_orders=[
+            {"id": "sl-1", "symbol": "BTC/USDT:USDT", "type": "STOP_MARKET",
+             "side": "sell", "amount": 0.1, "stopPrice": 98.0, "status": "open",
+             "reduceOnly": True},
+            {"id": "tp-1", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+             "side": "sell", "amount": 0.1, "stopPrice": 105.0, "status": "open",
+             "reduceOnly": True},
+        ],
+    )
+    eng._client = client
+    eng._executor = ManualCloseExecutor(client)
+    payload = {
+        "symbol": "BTCUSDT",
+        "confirm": True,
+        "position": {"side": "long", "qty": 0.1, "entry": 100.0},
+    }
+
+    result = await eng._exec_command("CLOSE_POSITION", json.dumps(payload))
+
+    assert "手动平仓完成" in result
+    assert eng._store.orders[-1]["kind"] == "CLOSE"
+    assert client.canceled == [("BTCUSDT", "ALL", "")]
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.runtime_settings.get("symbol.enabled.BTCUSDT") is None
+
+
+async def test_command_close_position_rejects_stale_position_signature(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+            "markPrice": 99.0,
+        },
+    )
+    payload = {
+        "symbol": "BTCUSDT",
+        "confirm": True,
+        "position": {"side": "long", "qty": 0.2, "entry": 100.0},
+    }
+
+    with pytest.raises(ValueError, match="页面持仓数量已过期"):
+        await eng._exec_command("CLOSE_POSITION", json.dumps(payload))
+    assert eng._store.orders == []
 
 
 async def test_command_unknown_marked_failed(settings, creds, monkeypatch):
