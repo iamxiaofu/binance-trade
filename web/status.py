@@ -303,6 +303,45 @@ def latest_positions(db_path: str) -> list[dict]:
     )
 
 
+def open_trade_metadata(db_path: str) -> dict[str, dict]:
+    """当前 open/partial trade 的本地开仓元数据，供实时持仓展示补充。"""
+    rows = _rows(
+        db_path,
+        """
+        SELECT id, symbol, opened_at_ms, opened_at, source, confidence, leverage,
+               qty_opened, qty_closed
+        FROM trades
+        WHERE status IN ('open', 'partial')
+        ORDER BY opened_at_ms ASC, id ASC
+        """,
+    )
+    out: dict[str, dict] = {}
+    for row in rows:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        item = out.setdefault(
+            symbol,
+            {
+                "local_opened_at_ms": row.get("opened_at_ms") or 0,
+                "local_opened_at": row.get("opened_at") or "",
+                "local_trade_source": row.get("source") or "",
+                "local_trade_confidence": row.get("confidence") or "",
+                "local_trade_qty": 0.0,
+                "local_trade_count": 0,
+                "local_leverage": row.get("leverage") or 0,
+            },
+        )
+        item["local_trade_qty"] += max(
+            float(row.get("qty_opened") or 0.0) - float(row.get("qty_closed") or 0.0),
+            0.0,
+        )
+        item["local_trade_count"] += 1
+        if not item.get("local_leverage") and row.get("leverage"):
+            item["local_leverage"] = row.get("leverage")
+    return out
+
+
 def latest_balance(db_path: str) -> dict | None:
     rows = _rows(db_path, "SELECT * FROM balance_snapshots ORDER BY id DESC LIMIT 1")
     return rows[0] if rows else None

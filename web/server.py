@@ -202,6 +202,7 @@ async def _live_positions_snapshot() -> dict[str, Any]:
                 client, [p["symbol"] for p in positions]
             )
             _attach_protection_orders(positions, condition_orders)
+            _attach_local_trade_metadata(positions)
             _positions_cache.update({
                 "ts_ms": int(time.time() * 1000),
                 "positions": positions,
@@ -252,6 +253,17 @@ def _attach_protection_orders(positions: list[dict], orders: list[dict[str, Any]
         protection["missing_tp"] = not protection["tp_active"]
         pos["protection_orders"] = related
         pos["protection"] = protection
+
+
+def _attach_local_trade_metadata(positions: list[dict]) -> None:
+    meta = st.open_trade_metadata(_DB)
+    for pos in positions:
+        item = meta.get(pos.get("symbol") or "")
+        if not item:
+            continue
+        pos.update(item)
+        if not pos.get("leverage") and item.get("local_leverage"):
+            pos["leverage"] = item["local_leverage"]
 
 
 def _select_protection_order(orders: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:

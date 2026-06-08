@@ -806,11 +806,16 @@ class TradingEngine:
         trade_id = 0
         managed_qty = await self._store.open_trade_qty(symbol)
         managed_tol = max(abs(target_qty) * 1e-6, 1e-12)
-        if managed_qty <= 0 or abs(managed_qty - target_qty) > managed_tol:
+        takeover_qty = 0.0
+        if managed_qty <= managed_tol:
+            takeover_qty = target_qty
+        elif target_qty - managed_qty > managed_tol:
+            takeover_qty = target_qty - managed_qty
+        if takeover_qty > managed_tol:
             trade_id = await self._store.ensure_takeover_trade(
                 symbol=symbol,
                 direction=side,
-                qty=target_qty,
+                qty=takeover_qty,
                 entry_price=entry,
                 leverage=int(position.get("leverage") or 0),
             )
@@ -822,7 +827,7 @@ class TradingEngine:
             specs=specs,
         )
         for order in results:
-            if trade_id > 0:
+            if trade_id > 0 and abs(takeover_qty - target_qty) <= managed_tol:
                 order["trade_id"] = trade_id
             await self._store.log_order(order)
 
@@ -1815,9 +1820,18 @@ class TradingEngine:
                 continue
             position = positions.get(symbol)
             if position is None:
+                await self._sync_condition_history(symbol, active_orders)
                 live_ids = {str(order.get("id") or "") for order in active_orders}
                 await self._store.mark_symbol_conditions_not_live(symbol, live_ids)
-                if active_orders and self._symbol_enabled.get(symbol, True):
+                closed = await self._store.reconcile_symbol_flat(
+                    symbol, reason="EXCHANGE_FLAT"
+                )
+                if closed:
+                    logger.warning(
+                        "{} reconciled {} local open trade(s) as exchange flat",
+                        symbol, closed,
+                    )
+                if active_orders:
                     remaining = await self._cancel_stale_condition_orders(
                         symbol=symbol,
                         orders=active_orders,
@@ -1873,9 +1887,10 @@ class TradingEngine:
                     symbol,
                     f"SL protection missing during exchange reconcile ({reason})",
                 )
-                await self._emergency_close_unprotected_position(
+                logger.error(
+                    "{} SL missing during {}; symbol disabled, auto close skipped",
                     symbol,
-                    reason=f"missing SL during exchange reconcile ({reason})",
+                    reason,
                 )
 
     async def _should_enforce_position_protection(self, symbol: str, reason: str) -> bool:

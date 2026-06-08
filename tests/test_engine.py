@@ -145,6 +145,9 @@ class FakeStore:
     async def sync_condition_order_history(self, **kw):
         return 0
 
+    async def reconcile_symbol_flat(self, symbol, *, reason="EXCHANGE_FLAT"):
+        return 0
+
     async def ensure_takeover_trade(self, **kw):
         trade_id = len(self.takeover_trades) + 100
         self.takeover_trades.append({"id": trade_id, **kw})
@@ -516,7 +519,7 @@ async def test_reconcile_waits_for_active_opening_claim(settings, creds, monkeyp
     assert not any("no local open trade" in msg for _event, msg in eng._notifier.events)
 
 
-async def test_reconcile_enforces_managed_position_missing_stop(settings, creds, monkeypatch):
+async def test_reconcile_disables_managed_position_missing_stop_without_auto_close(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._store.open_trades.add("BTCUSDT")
     eng._client.positions = [{
@@ -529,9 +532,9 @@ async def test_reconcile_enforces_managed_position_missing_stop(settings, creds,
 
     await eng._enforce_exchange_invariants("test")
 
-    assert eng._store.orders
-    assert eng._store.orders[-1]["kind"] == "CLOSE"
+    assert eng._store.orders == []
     assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
 
 
 async def test_skip_logs_decision(settings, creds, monkeypatch):
@@ -1193,6 +1196,37 @@ async def test_command_protect_position_uses_manual_stop_for_takeover(settings, 
     assert eng._store.takeover_trades
     assert [o["kind"] for o in eng._store.orders] == ["SL"]
     assert eng._store.orders[0]["trade_id"] == eng._store.takeover_trades[0]["id"]
+
+
+async def test_command_protect_position_takeover_only_residual_qty(settings, creds, monkeypatch):
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.08
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+            "markPrice": 99.0,
+            "leverage": 2,
+        },
+        equity=1000.0,
+    )
+    payload = {
+        "symbol": "BTCUSDT",
+        "qty": 0.1,
+        "sl_trigger": 98.0,
+        "confirm": True,
+        "position": {"side": "long", "qty": 0.1, "entry": 100.0},
+    }
+
+    result = await eng._exec_command("PROTECT_POSITION", json.dumps(payload))
+
+    assert "已接管保护 SL@98.00" in result
+    assert eng._store.takeover_trades[0]["qty"] == pytest.approx(0.02)
+    assert "trade_id" not in eng._store.orders[0]
 
 
 async def test_command_unknown_marked_failed(settings, creds, monkeypatch):

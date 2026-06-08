@@ -41,6 +41,11 @@ function fmtPct(n) {
   return Number.isFinite(v) ? `${v >= 0 ? '+' : ''}${v.toFixed(2)}%` : '—'
 }
 
+function fmtTime(ts) {
+  const v = Number(ts || 0)
+  return v > 0 ? new Date(v).toLocaleString() : '—'
+}
+
 function margin(row) {
   return Number(row.isolated_margin || row.initial_margin || 0)
 }
@@ -218,6 +223,9 @@ async function submitTakeover() {
         </el-table-column>
         <el-table-column label="杠杆" width="80">
           <template #default="{ row }">{{ Number(row.leverage) > 0 ? `${row.leverage}x` : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="开仓时间" width="170">
+          <template #default="{ row }">{{ fmtTime(row.local_opened_at_ms) }}</template>
         </el-table-column>
         <el-table-column label="名义价值" width="120">
           <template #default="{ row }"><span class="mono">{{ fmt(row.notional, 2) }}</span></template>

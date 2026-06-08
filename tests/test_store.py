@@ -176,6 +176,61 @@ async def test_partial_close_keeps_trade_partial_until_remaining_closes(store):
     assert trade.net_realized_pnl == pytest.approx(8.75)
 
 
+async def test_aggregate_close_allocates_across_open_trades_fifo(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "limit", "qty": 0.08, "price": 100.0,
+        "notional": 8.0, "dry_run": False, "status": "filled",
+        "id": "open-1", "raw": {},
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "limit", "qty": 0.02, "price": 100.0,
+        "notional": 2.0, "dry_run": False, "status": "filled",
+        "id": "open-2", "raw": {},
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "CLOSE", "side": "sell",
+        "order_type": "market", "qty": 0.1, "price": 90.0,
+        "notional": 9.0, "dry_run": False, "status": "filled",
+        "id": "close-all", "raw": {},
+    })
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trades = (await session.execute(select(TradeRow).order_by(TradeRow.id))).scalars().all()
+        close = (
+            await session.execute(
+                select(OrderRow).where(OrderRow.client_kind == "CLOSE")
+            )
+        ).scalar_one()
+
+    assert [trade.status for trade in trades] == ["closed", "closed"]
+    assert [trade.qty_closed for trade in trades] == pytest.approx([0.08, 0.02])
+    assert [trade.realized_pnl for trade in trades] == pytest.approx([-0.8, -0.2])
+    assert close.realized_pnl == pytest.approx(-1.0)
+
+
+async def test_reconcile_symbol_flat_closes_orphan_open_trade(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "limit", "qty": 0.1, "price": 100.0,
+        "notional": 10.0, "dry_run": False, "status": "filled",
+        "id": "open-flat", "raw": {},
+    })
+
+    changed = await store.reconcile_symbol_flat("BTCUSDT", reason="EXCHANGE_FLAT")
+
+    assert changed == 1
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+    assert trade.status == "closed"
+    assert trade.qty_closed == pytest.approx(0.1)
+    assert trade.exit_reason == "EXCHANGE_FLAT"
+    assert trade.confidence == "inferred"
+
+
 async def test_has_open_trade_detects_local_managed_position(store):
     await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",

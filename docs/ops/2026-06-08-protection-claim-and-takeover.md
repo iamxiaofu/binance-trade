@@ -197,6 +197,97 @@ PROTECT_POSITION <JSON>
   - 支持“按当前价重算”快速填充。
   - 勾选确认后提交。
 
+当前持仓表新增开仓时间展示：
+
+- 杠杆继续优先使用交易所实时持仓返回值。
+- 开仓时间来自本地仍 open/partial 的 trade lot，按最早 open trade 展示。
+- 当交易所仓位存在但本地没有 open trade 时，开仓时间显示为空，避免伪造数据。
+
+## 2026-06-08 补充修复
+
+### 缺 SL 处理调整
+
+周期对账发现已管理持仓缺少有效 SL 时，处理策略调整为：
+
+1. 禁用该币种交易。
+2. 发送错误告警。
+3. 不再自动应急平仓。
+
+这样可以避免系统在用户手动处理持仓时强制市价平仓。
+注意：开仓刚成交但保护单完全无法挂出的异常路径，仍保留“关闭本次未受保护成交”的安全处理。
+
+### 接管残余仓位
+
+`PROTECT_POSITION` 不再在本地已有 managed 数量时重复创建完整 takeover trade。
+
+示例：
+
+```text
+交易所 live qty = 0.10
+本地 managed qty = 0.08
+```
+
+旧逻辑会创建 `takeover qty=0.10`，导致本地 trade 重复。
+新逻辑只创建残余：
+
+```text
+takeover qty = 0.10 - 0.08 = 0.02
+```
+
+当保护单覆盖的是聚合仓位数量时，不强行绑定到残余 takeover trade，避免后续平仓只关闭残余 trade。
+
+### 聚合退出分摊
+
+交易所是按 symbol/side 聚合持仓；一张 reduce-only `CLOSE` / `SL` / `TP` 成交可能关闭多个本地 trade lot。
+
+本次新增 FIFO 分摊：
+
+1. 按开仓时间从早到晚找到本地 open/partial trade。
+2. 将退出成交数量分摊到这些 trade。
+3. 分别更新 `qty_closed`、`realized_pnl`、`status`。
+
+这样可以避免一张 0.10 的平仓单只关闭最新 takeover trade，而旧的 0.08 maker 部分成交继续显示“持仓中”。
+
+### 交易所已空兜底对账
+
+当交易所确认某币种无持仓时：
+
+1. 先同步条件单历史。
+2. 将交易所已不在 open 列表里的本地条件单标记终态。
+3. 关闭仍悬挂的本地 open/partial trade，并标记 `confidence=inferred`。
+4. 取消交易所残留的无持仓 reduce-only 条件单，即使该币种当前已禁用。
+
+这用于修复交易所已 flat、但本地旧 trade 仍 open 的账务残留。
+
+### 现场数据修复
+
+变更前再次备份：
+
+```text
+data/backups/trade-testnet-before-flat-reconcile-20260608-153926.db
+data/backups/trade-mainnet-before-flat-reconcile-20260608-153926.db
+```
+
+已对 `SOLUSDT` 执行一次 flat 兜底对账：
+
+```text
+trade_id=20 从 open 修正为 closed
+exit_reason=EXCHANGE_FLAT
+confidence=inferred
+```
+
+该历史 trade 没有可安全归属的独立退出成交单，因此用入场价作为 inferred exit price，避免重复计算已由后续 takeover trade 记录过的聚合平仓盈亏。
+
+服务重启后的首次周期对账还发现 `ETHUSDT` 交易所已 flat，但本地仍有 1 条历史 open trade，因此按同一规则修正为 closed：
+
+```text
+ETHUSDT trade_id=4
+exit_reason=EXCHANGE_FLAT
+confidence=inferred
+```
+
+`SOLUSDT` 残留的无持仓 TP 条件单 `1000000099101885` 已由新对账逻辑取消，并在本地标记为 canceled。
+
 ## 回滚方案
 
 本次变更前已备份：
@@ -240,5 +331,5 @@ systemctl stop binance-trade.service binance-trade-web.service
 结果：
 
 ```text
-196 passed, 2 warnings
+199 passed, 2 warnings
 ```

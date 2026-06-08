@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import text, select
+from sqlalchemy import text, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.exchange.positions import normalize_position, normalize_symbol
@@ -640,29 +640,30 @@ class Store:
             return
 
         if kind in ("SL", "TP"):
-            trade = await self._find_open_trade_for_order(session, row)
+            if status in _TRIGGERED_CONDITION_STATUSES:
+                await self._close_open_trades_with_exit_order(
+                    session, row, exit_reason=kind
+                )
+                return
+            trade = await self._find_open_trade_for_order(
+                session, row, allow_fallback=False
+            )
             if trade is None:
                 trade = await self._find_recent_trade_for_condition(session, row)
             if trade is None:
+                row.trade_role = _trade_role(kind)
                 return
             row.trade_id = trade.id
             row.trade_role = _trade_role(kind)
             row.leverage = trade.leverage
             row.margin = _margin(row.notional, trade.leverage)
-            if status in _TRIGGERED_CONDITION_STATUSES and trade.status != "closed":
-                self._close_trade_with_order(trade, row, exit_reason=kind)
             return
 
         if kind == "CLOSE":
-            trade = await self._find_open_trade_for_order(session, row)
-            if trade is None:
-                return
-            row.trade_id = trade.id
-            row.trade_role = "EXIT"
-            row.leverage = trade.leverage
-            row.margin = _margin(row.notional, trade.leverage)
             if status in _FILLED_ORDER_STATUSES:
-                self._close_trade_with_order(trade, row, exit_reason="CLOSE")
+                await self._close_open_trades_with_exit_order(
+                    session, row, exit_reason="CLOSE"
+                )
 
     async def _create_trade_from_open(
         self,
@@ -700,7 +701,13 @@ class Store:
         await session.flush()
         return trade
 
-    async def _find_open_trade_for_order(self, session: AsyncSession, row: OrderRow) -> TradeRow | None:
+    async def _find_open_trade_for_order(
+        self,
+        session: AsyncSession,
+        row: OrderRow,
+        *,
+        allow_fallback: bool = True,
+    ) -> TradeRow | None:
         if row.trade_id:
             trade = await session.get(TradeRow, row.trade_id)
             if trade is not None:
@@ -724,7 +731,7 @@ class Store:
         for trade in rows:
             if self._qty_matches(trade.qty_opened, row.qty):
                 return trade
-        return rows[0] if rows else None
+        return rows[0] if allow_fallback and rows else None
 
     async def _find_recent_trade_for_condition(
         self,
@@ -772,15 +779,102 @@ class Store:
         leverage = (await session.execute(stmt)).scalar_one_or_none()
         return _safe_int(leverage)
 
-    def _close_trade_with_order(self, trade: TradeRow, row: OrderRow, *, exit_reason: str) -> None:
-        qty = row.qty if row.qty > 0 else max(trade.qty_opened - trade.qty_closed, 0.0)
+    async def _close_open_trades_with_exit_order(
+        self,
+        session: AsyncSession,
+        row: OrderRow,
+        *,
+        exit_reason: str,
+    ) -> None:
+        """把一个聚合退出成交按 FIFO 分摊到本地 open trades。
+
+        交易所是 symbol/side 聚合仓位；一张 reduce-only CLOSE/SL/TP 可能覆盖多个
+        本地 trade lot。这里按开仓时间分摊，避免把整张退出单只挂到最新 takeover
+        trade 上，导致旧 maker 部分成交长期显示 open。
+        """
+        direction = _direction_from_close_side(row.side)
+        if not direction:
+            return
+        stmt = (
+            select(TradeRow)
+            .where(TradeRow.symbol == row.symbol)
+            .where(TradeRow.direction == direction)
+            .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+            .where(TradeRow.dry_run.is_(row.dry_run))
+            .where(TradeRow.opened_at_ms <= row.ts_ms)
+            .order_by(TradeRow.opened_at_ms.asc(), TradeRow.id.asc())
+        )
+        trades = (await session.execute(stmt)).scalars().all()
+        if row.trade_id:
+            preferred = await session.get(TradeRow, row.trade_id)
+            if (
+                preferred is not None
+                and preferred.status in _OPEN_TRADE_STATUSES
+                and preferred.symbol == row.symbol
+                and preferred.direction == direction
+            ):
+                trades = [preferred] + [trade for trade in trades if trade.id != preferred.id]
+        if not trades:
+            return
+
+        requested = row.qty if row.qty > 0 else sum(
+            max(float(trade.qty_opened or 0.0) - float(trade.qty_closed or 0.0), 0.0)
+            for trade in trades
+        )
+        if requested <= 0:
+            return
+
+        remaining = requested
+        first_trade: TradeRow | None = None
+        row.realized_pnl = 0.0
+        for trade in trades:
+            open_qty = max(float(trade.qty_opened or 0.0) - float(trade.qty_closed or 0.0), 0.0)
+            if open_qty <= 0:
+                continue
+            alloc_qty = min(open_qty, remaining)
+            if alloc_qty <= 0:
+                continue
+            fee_alloc = row.fee * (alloc_qty / requested) if row.fee and requested > 0 else 0.0
+            self._close_trade_with_order(
+                trade,
+                row,
+                exit_reason=exit_reason,
+                qty=alloc_qty,
+                fee=fee_alloc,
+            )
+            if first_trade is None:
+                first_trade = trade
+            remaining -= alloc_qty
+            if remaining <= max(requested * 1e-6, 1e-12):
+                break
+
+        if first_trade is not None:
+            row.trade_id = first_trade.id
+            row.trade_role = "EXIT" if row.client_kind == "CLOSE" else _trade_role(row.client_kind)
+            row.leverage = first_trade.leverage
+            row.margin = _margin(row.notional, first_trade.leverage)
+
+    def _close_trade_with_order(
+        self,
+        trade: TradeRow,
+        row: OrderRow,
+        *,
+        exit_reason: str,
+        qty: float | None = None,
+        fee: float | None = None,
+    ) -> None:
+        qty = qty if qty is not None else row.qty
+        qty = qty if qty > 0 else max(trade.qty_opened - trade.qty_closed, 0.0)
+        if qty <= 0:
+            return
         exit_price = _raw_number(row.raw_json, "filled_price") or row.price
-        pnl = row.realized_pnl or _realized_pnl(
+        pnl = _realized_pnl(
             direction=trade.direction,
             entry_price=trade.entry_price,
             exit_price=exit_price,
             qty=qty,
         )
+        fee = row.fee if fee is None else fee
         margin = trade.entry_margin or _margin(trade.entry_notional, trade.leverage)
         prev_closed = trade.qty_closed if trade.qty_closed > 0 else 0.0
         total_closed = min(trade.qty_opened, prev_closed + qty)
@@ -795,14 +889,14 @@ class Store:
         trade.exit_notional += abs(qty * exit_price) if exit_price > 0 else row.notional
         trade.realized_pnl += pnl
         trade.gross_realized_pnl = trade.realized_pnl
-        trade.exit_fee += row.fee
+        trade.exit_fee += fee
         trade.total_fee = trade.entry_fee + trade.exit_fee
         trade.net_realized_pnl = trade.gross_realized_pnl - trade.total_fee
         trade.pnl_pct_on_margin = _pnl_pct(trade.realized_pnl, margin)
         trade.net_pnl_pct_on_margin = _pnl_pct(trade.net_realized_pnl, margin)
         trade.exit_reason = exit_reason
         trade.exit_liquidity = row.liquidity or trade.exit_liquidity
-        row.realized_pnl = pnl
+        row.realized_pnl = (row.realized_pnl or 0.0) + pnl
 
     async def mark_orders_status_by_exchange_ids(
         self,
@@ -1158,6 +1252,90 @@ class Store:
             for row in rows:
                 qty += max(float(row.qty_opened or 0.0) - float(row.qty_closed or 0.0), 0.0)
             return qty
+
+    async def reconcile_symbol_flat(
+        self,
+        symbol: str,
+        *,
+        reason: str = "EXCHANGE_FLAT",
+    ) -> int:
+        """交易所确认该币种无持仓时，关闭仍悬挂的本地 open trade。
+
+        这是兜底账务修复：优先用该 trade 开仓后的最近退出成交价；如果没有可用退出成交，
+        用入场价关闭并把 confidence 标记为 inferred，避免页面继续显示虚假持仓。
+        """
+        import time as _t
+
+        symbol = normalize_symbol(symbol)
+        now_ms = int(_t.time() * 1000)
+        now = _now_iso_utc()
+        async with self._sessionmaker() as session:
+            trades = (
+                await session.execute(
+                    select(TradeRow)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                    .order_by(TradeRow.opened_at_ms.asc(), TradeRow.id.asc())
+                )
+            ).scalars().all()
+            changed = 0
+            for trade in trades:
+                open_qty = max(
+                    float(trade.qty_opened or 0.0) - float(trade.qty_closed or 0.0),
+                    0.0,
+                )
+                if open_qty <= 0:
+                    continue
+                exit_row = await self._latest_exit_order_after_open(session, trade)
+                exit_price = (
+                    (_raw_number(exit_row.raw_json, "filled_price") if exit_row else 0.0)
+                    or (float(exit_row.price or 0.0) if exit_row else 0.0)
+                    or float(trade.entry_price or 0.0)
+                )
+                pnl = _realized_pnl(
+                    direction=trade.direction,
+                    entry_price=trade.entry_price,
+                    exit_price=exit_price,
+                    qty=open_qty,
+                )
+                trade.status = "closed"
+                trade.closed_at_ms = int(exit_row.ts_ms if exit_row else now_ms)
+                trade.closed_at = str(exit_row.created_at if exit_row else now)
+                trade.exit_order_id = int(exit_row.id if exit_row else 0)
+                trade.exit_price = exit_price
+                trade.qty_closed = float(trade.qty_opened or 0.0)
+                trade.exit_notional += abs(open_qty * exit_price)
+                trade.realized_pnl += pnl
+                trade.gross_realized_pnl = trade.realized_pnl
+                trade.net_realized_pnl = trade.gross_realized_pnl - trade.total_fee
+                margin = trade.entry_margin or _margin(trade.entry_notional, trade.leverage)
+                trade.pnl_pct_on_margin = _pnl_pct(trade.realized_pnl, margin)
+                trade.net_pnl_pct_on_margin = _pnl_pct(trade.net_realized_pnl, margin)
+                trade.exit_reason = reason[:24]
+                trade.confidence = "inferred"
+                changed += 1
+            await session.commit()
+            return changed
+
+    async def _latest_exit_order_after_open(
+        self,
+        session: AsyncSession,
+        trade: TradeRow,
+    ) -> OrderRow | None:
+        close_side = "sell" if trade.direction == "long" else "buy"
+        return (
+            await session.execute(
+                select(OrderRow)
+                .where(OrderRow.symbol == trade.symbol)
+                .where(OrderRow.side == close_side)
+                .where(OrderRow.client_kind.in_(("CLOSE", "SL", "TP")))
+                .where(OrderRow.status.in_(tuple(_FILLED_ORDER_STATUSES | _TRIGGERED_CONDITION_STATUSES)))
+                .where(or_(OrderRow.trade_id == 0, OrderRow.trade_id == trade.id))
+                .where(OrderRow.ts_ms >= trade.opened_at_ms)
+                .order_by(OrderRow.ts_ms.desc(), OrderRow.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
     async def ensure_takeover_trade(
         self,
