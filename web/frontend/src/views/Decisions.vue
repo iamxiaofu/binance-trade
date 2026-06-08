@@ -13,6 +13,7 @@ const ctxPretty = ref('')
 const llmPromptPretty = ref('')
 const llmRequestPretty = ref('')
 const llmResponsePretty = ref('')
+const featureSnapshotPretty = ref('')
 const llmDataRows = ref([])
 const cfg = ref(null)
 const filters = ref({
@@ -77,6 +78,15 @@ async function showDetail(row) {
       ctxPretty.value = JSON.stringify(JSON.parse(detail.value.context_json || '{}'), null, 2)
     } catch (_) {
       ctxPretty.value = detail.value.context_json || '(无)'
+    }
+    try {
+      featureSnapshotPretty.value = JSON.stringify(
+        JSON.parse(detail.value.feature_snapshot_json || '{}'),
+        null,
+        2,
+      )
+    } catch (_) {
+      featureSnapshotPretty.value = detail.value.feature_snapshot_json || '(无)'
     }
     try {
       llmRequestPretty.value = JSON.stringify(
@@ -278,6 +288,9 @@ onMounted(async () => {
           </el-tab-pane>
           <el-tab-pane label="LLM回传结果">
             <pre class="detail-pre">{{ llmResponsePretty }}</pre>
+          </el-tab-pane>
+          <el-tab-pane label="Feature Snapshot">
+            <pre class="detail-pre">{{ featureSnapshotPretty }}</pre>
           </el-tab-pane>
           <el-tab-pane label="Context JSON">
             <pre class="detail-pre">{{ ctxPretty }}</pre>

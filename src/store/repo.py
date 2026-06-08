@@ -85,6 +85,7 @@ _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("llm_prompt", "TEXT NOT NULL DEFAULT ''"),
     ("llm_request_json", "TEXT NOT NULL DEFAULT ''"),
     ("llm_response_json", "TEXT NOT NULL DEFAULT ''"),
+    ("feature_snapshot_json", "TEXT NOT NULL DEFAULT ''"),
 )
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
@@ -543,6 +544,7 @@ class Store:
         llm_prompt: str = "",
         llm_request_json: str = "",
         llm_response_json: str = "",
+        feature_snapshot_json: str = "",
     ) -> None:
         row = DecisionRow(
             symbol=symbol,
@@ -566,6 +568,7 @@ class Store:
         row.llm_prompt = llm_prompt
         row.llm_request_json = llm_request_json
         row.llm_response_json = llm_response_json
+        row.feature_snapshot_json = feature_snapshot_json
         await self._add(row)
 
     # ---------- 拒单 ----------
@@ -1239,6 +1242,35 @@ class Store:
                 "ref_price": row.ref_price,
                 "ts_ms": row.ts_ms,
                 "created_at": row.created_at,
+            }
+
+    async def latest_decision_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        """Return latest persisted feature snapshot for LLM throttle restoration."""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(DecisionRow)
+                    .where(DecisionRow.symbol == symbol)
+                    .where(DecisionRow.skipped.is_(False))
+                    .where(DecisionRow.feature_snapshot_json != "")
+                    .order_by(DecisionRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            try:
+                snap = json.loads(row.feature_snapshot_json or "{}")
+            except Exception:
+                return None
+            if not isinstance(snap, dict):
+                return None
+            return {
+                "decision_id": row.id,
+                "ts_ms": row.ts_ms,
+                "ref_price": row.ref_price,
+                "snapshot": snap,
             }
 
     async def has_open_trade(self, symbol: str) -> bool:

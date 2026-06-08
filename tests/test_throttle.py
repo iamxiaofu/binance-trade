@@ -2,7 +2,30 @@
 from __future__ import annotations
 
 from src.llm.schema import PositionSnapshot
+from src.throttle.feature_snapshot import FeatureSnapshot
 from src.throttle.gate import should_call_llm
+
+
+def _snap(**kw):
+    base = dict(
+        symbol="BTCUSDT",
+        ts_ms=1,
+        last_price=100.0,
+        mark_price=100.0,
+        trend_direction="flat",
+        trend_score=0.0,
+        ema_spread_pct=-0.05,
+        macd_hist=-0.01,
+        rsi=49.0,
+        atr_pct=0.5,
+        boll_bandwidth_pct=0.8,
+        volume_ratio=1.0,
+        volume_zscore_20=0.0,
+        micro_return_5_pct=0.0,
+        micro_range_5_pct=0.2,
+    )
+    base.update(kw)
+    return FeatureSnapshot(**base)
 
 
 def _call(**kw):
@@ -87,3 +110,50 @@ def test_no_change_skips():
     r = _call(last_price=100.0)
     assert r.trigger is False
     assert "no significant change" in r.reason
+
+
+def test_feature_snapshot_ema_cross_triggers():
+    prev = _snap(ema_spread_pct=-0.03)
+    cur = _snap(ema_spread_pct=0.04)
+    r = _call(current_snapshot=cur, last_decision_snapshot=prev, last_price=100.05)
+    assert r.trigger is True
+    assert "EMA spread" in r.reason
+
+
+def test_feature_snapshot_volume_spike_triggers():
+    prev = _snap(volume_zscore_20=0.5)
+    cur = _snap(volume_zscore_20=2.5)
+    r = _call(current_snapshot=cur, last_decision_snapshot=prev, last_price=100.05)
+    assert r.trigger is True
+    assert "volume z-score" in r.reason
+
+
+def test_feature_snapshot_micro_move_triggers():
+    prev = _snap(micro_return_5_pct=0.1)
+    cur = _snap(micro_return_5_pct=0.8)
+    r = _call(current_snapshot=cur, last_decision_snapshot=prev, last_price=100.05)
+    assert r.trigger is True
+    assert "micro return" in r.reason
+
+
+def test_feature_snapshot_leader_micro_move_triggers():
+    prev = _snap(symbol="ETHUSDT", leader_symbol="BTCUSDT", leader_micro_return_5_pct=0.1)
+    cur = _snap(symbol="ETHUSDT", leader_symbol="BTCUSDT", leader_micro_return_5_pct=0.9)
+    r = _call(symbol="ETHUSDT", current_snapshot=cur, last_decision_snapshot=prev,
+              last_price=100.05)
+    assert r.trigger is True
+    assert "leader BTCUSDT" in r.reason
+
+
+def test_dynamic_position_review_interval_triggers():
+    pos = PositionSnapshot(has_position=True, unrealized_pnl_pct=0.2)
+    r = _call(
+        position=pos,
+        current_snapshot=_snap(),
+        last_decision_snapshot=_snap(),
+        last_decision_ts_ms=0,
+        now_ts_ms=16 * 60_000,
+        last_price=100.05,
+    )
+    assert r.trigger is True
+    assert "dynamic review" in r.reason

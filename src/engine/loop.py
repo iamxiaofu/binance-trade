@@ -29,6 +29,7 @@ from src.notify.telegram import Event, Notifier
 from src.risk.manager import RejectCode, RiskContext, Verdict, validate
 from src.state.runtime import RuntimeState
 from src.store.repo import Store
+from src.throttle.feature_snapshot import FeatureSnapshot, build_feature_snapshot
 from src.throttle.gate import should_call_llm
 
 
@@ -57,6 +58,7 @@ class TradingEngine:
         self._stopped = asyncio.Event()
         self._state_sync_lock = asyncio.Lock()
         self._reconcile_task: asyncio.Task | None = None
+        self._cycle_leader_snapshot: FeatureSnapshot | None = None
 
     # ---------- 生命周期 ----------
     async def startup(self) -> None:
@@ -69,6 +71,7 @@ class TradingEngine:
             await self._store.update_symbol_filters(symbol, filters)
             self._market.ensure_symbol(symbol)
         await self._market.refresh_all(self._symbols)
+        await self._restore_decision_snapshots()
         self.runtime.roll_day_if_needed()
         if self._settings.storage.reconcile_on_start:
             try:
@@ -91,6 +94,30 @@ class TradingEngine:
         logger.info("engine started (mode={}, db={}, equity={:.2f})",
                     self._settings.mode.value, self._settings.storage.db_path,
                     self.runtime.current_equity)
+
+    async def _restore_decision_snapshots(self) -> None:
+        restored = 0
+        for symbol in self._symbols:
+            try:
+                row = await self._store.latest_decision_snapshot(symbol)
+            except Exception as e:
+                logger.warning("restore decision snapshot failed {}: {}", symbol, e)
+                continue
+            if not row:
+                continue
+            try:
+                snap = FeatureSnapshot.model_validate(row["snapshot"])
+            except Exception as e:
+                logger.warning("invalid stored decision snapshot {}: {}", symbol, e)
+                continue
+            self.runtime.last_decision_snapshot[symbol] = snap.model_dump(mode="json")
+            self.runtime.last_decision_price[symbol] = float(
+                snap.last_price or row.get("ref_price") or 0.0
+            )
+            self.runtime.last_decision_time[symbol] = int(row.get("ts_ms") or snap.ts_ms)
+            restored += 1
+        if restored:
+            logger.info("restored {} decision feature snapshots", restored)
 
     async def shutdown(self) -> None:
         if self._reconcile_task is not None:
@@ -150,6 +177,7 @@ class TradingEngine:
             return
         symbols = self._tracked_symbols()
         await self._market.refresh_all(symbols)
+        self._cycle_leader_snapshot = None
 
         # 0. 全局熔断（最高优先级）：日亏 / 回撤
         if await self._check_circuit_breaker():
@@ -1596,6 +1624,24 @@ class TradingEngine:
             )
             return
         position = build_position_snapshot(self.runtime.positions.get(symbol))
+        higher_tf = await self._fetch_higher_tf_safe(symbol)
+        micro_klines = await self._fetch_micro_klines_safe(symbol)
+        leader_snapshot = await self._get_cycle_leader_snapshot(symbol)
+        current_feature_snapshot = build_feature_snapshot(
+            symbol=symbol,
+            snapshot=snap,
+            position=position,
+            higher_tf_klines=higher_tf,
+            micro_klines=micro_klines,
+            leader_snapshot=leader_snapshot,
+        )
+        last_feature_snapshot = None
+        raw_last_snapshot = self.runtime.last_decision_snapshot.get(symbol)
+        if raw_last_snapshot:
+            try:
+                last_feature_snapshot = FeatureSnapshot.model_validate(raw_last_snapshot)
+            except Exception:
+                last_feature_snapshot = None
 
         # 1. 节流：是否调用 LLM
         gate = should_call_llm(
@@ -1609,6 +1655,24 @@ class TradingEngine:
             trigger_on_order_event=self._settings.throttle.trigger_on_order_event,
             skip_count=self.runtime.skip_count.get(symbol, 0),
             max_skip_cycles=self._settings.throttle.max_skip_cycles,
+            last_decision_ts_ms=self.runtime.last_decision_time.get(symbol),
+            now_ts_ms=snap.updated_ms or int(time.time() * 1000),
+            current_snapshot=current_feature_snapshot,
+            last_decision_snapshot=last_feature_snapshot,
+            feature_snapshot_enabled=self._settings.throttle.feature_snapshot_enabled,
+            ema_spread_cross_min_pct=self._settings.throttle.ema_spread_cross_min_pct,
+            macd_hist_cross_min_abs=self._settings.throttle.macd_hist_cross_min_abs,
+            rsi_midline=self._settings.throttle.rsi_midline,
+            boll_bandwidth_low_pct=self._settings.throttle.boll_bandwidth_low_pct,
+            boll_bandwidth_expand_pct=self._settings.throttle.boll_bandwidth_expand_pct,
+            volume_zscore_trigger=self._settings.throttle.volume_zscore_trigger,
+            micro_return_5m_trigger_pct=self._settings.throttle.micro_return_5m_trigger_pct,
+            micro_range_5m_trigger_pct=self._settings.throttle.micro_range_5m_trigger_pct,
+            near_exit_pnl_pct=self._settings.throttle.near_exit_pnl_pct,
+            review_flat_minutes=self._settings.throttle.review_flat_minutes,
+            review_position_minutes=self._settings.throttle.review_position_minutes,
+            review_near_exit_minutes=self._settings.throttle.review_near_exit_minutes,
+            review_high_vol_minutes=self._settings.throttle.review_high_vol_minutes,
         )
         if not gate.trigger:
             self.runtime.record_skip(symbol)
@@ -1621,8 +1685,6 @@ class TradingEngine:
 
         # 2. 特征 → LLM 决策（失败降级 HOLD 由 LLMClient 内部保证）
         margin = await self._fetch_margin_safe()
-        higher_tf = await self._fetch_higher_tf_safe(symbol)
-        micro_klines = await self._fetch_micro_klines_safe(symbol)
         ctx = build_context(
             symbol=symbol, snapshot=snap, position=position,
             available_margin=margin, settings=self._settings,
@@ -1635,7 +1697,17 @@ class TradingEngine:
             return
 
         decision, llm_trace = await self._llm.decide_with_trace(ctx)
-        self.runtime.record_decision(symbol, snap.last_price)
+        feature_snapshot_json = (
+            current_feature_snapshot.model_dump_json() if current_feature_snapshot is not None else ""
+        )
+        self.runtime.record_decision(
+            symbol,
+            snap.last_price,
+            feature_snapshot=(
+                current_feature_snapshot.model_dump(mode="json")
+                if current_feature_snapshot is not None else None
+            ),
+        )
         await self._store.log_decision(
             symbol=symbol,
             decision=decision,
@@ -1645,6 +1717,7 @@ class TradingEngine:
             llm_prompt=llm_trace.user_prompt,
             llm_request_json=llm_trace.request_json,
             llm_response_json=llm_trace.response_json,
+            feature_snapshot_json=feature_snapshot_json,
         )
 
         # CLOSE 优先处理（不受开仓限额约束）
@@ -1874,6 +1947,30 @@ class TradingEngine:
         except Exception as e:
             logger.warning("fetch micro klines {} {} failed: {}", tf, symbol, e)
             return []
+
+    async def _get_cycle_leader_snapshot(self, symbol: str) -> FeatureSnapshot | None:
+        """Return BTC feature snapshot for cross-symbol trigger checks."""
+        leader = "BTCUSDT"
+        if symbol == leader or leader not in self._tracked_symbols():
+            return None
+        if self._cycle_leader_snapshot is not None:
+            return self._cycle_leader_snapshot
+        try:
+            snap = self._market.snapshot(leader)
+            position = build_position_snapshot(self.runtime.positions.get(leader))
+            higher_tf = await self._fetch_higher_tf_safe(leader)
+            micro_klines = await self._fetch_micro_klines_safe(leader)
+            self._cycle_leader_snapshot = build_feature_snapshot(
+                symbol=leader,
+                snapshot=snap,
+                position=position,
+                higher_tf_klines=higher_tf,
+                micro_klines=micro_klines,
+            )
+        except Exception as e:
+            logger.warning("build leader feature snapshot failed {}: {}", leader, e)
+            self._cycle_leader_snapshot = None
+        return self._cycle_leader_snapshot
 
     async def _fetch_positions_safe(self) -> list[dict]:
         try:

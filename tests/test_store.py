@@ -57,6 +57,7 @@ async def test_log_actual_decision_with_context(store):
         llm_prompt="prompt",
         llm_request_json='{"request": true}',
         llm_response_json='{"response": true}',
+        feature_snapshot_json='{"last_price": 100.0}',
     )
     sm = async_sessionmaker(store._engine, expire_on_commit=False)
     async with sm() as session:
@@ -67,6 +68,22 @@ async def test_log_actual_decision_with_context(store):
     assert row.llm_prompt == "prompt"
     assert "request" in row.llm_request_json
     assert "response" in row.llm_response_json
+    assert "last_price" in row.feature_snapshot_json
+
+
+async def test_latest_decision_snapshot(store):
+    d = TradeDecision(symbol="BTCUSDT", action=Action.HOLD, confidence=0.8,
+                      size_pct=0.0, leverage=1, stop_loss_pct=0.0,
+                      take_profit_pct=0.0, reason="wait")
+    await store.log_decision(
+        symbol="BTCUSDT",
+        decision=d,
+        ref_price=100.0,
+        feature_snapshot_json='{"symbol": "BTCUSDT", "last_price": 100.0}',
+    )
+    snap = await store.latest_decision_snapshot("BTCUSDT")
+    assert snap is not None
+    assert snap["snapshot"]["last_price"] == 100.0
 
 
 async def test_log_reject(store):

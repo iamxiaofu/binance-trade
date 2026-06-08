@@ -9,10 +9,11 @@ def test_record_decision_resets_skip():
     rt.record_skip("BTCUSDT")
     rt.record_skip("BTCUSDT")
     assert rt.skip_count["BTCUSDT"] == 2
-    rt.record_decision("BTCUSDT", 100.0, ts_ms=123)
+    rt.record_decision("BTCUSDT", 100.0, ts_ms=123, feature_snapshot={"trend": "up"})
     assert rt.skip_count["BTCUSDT"] == 0
     assert rt.last_decision_price["BTCUSDT"] == 100.0
     assert rt.last_decision_time["BTCUSDT"] == 123
+    assert rt.last_decision_snapshot["BTCUSDT"] == {"trend": "up"}
 
 
 def test_order_event_pop_is_one_shot():

@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 INTERVAL_SECONDS: dict[str, int] = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900,
     "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
+    "1d": 86400,
 }
 
 
@@ -82,6 +83,20 @@ class ThrottleConfig(_Base):
     pnl_alert_pct: float = Field(ge=0)
     trigger_on_order_event: bool = True
     max_skip_cycles: int = Field(ge=1)  # 兜底强制触发；至少 1
+    feature_snapshot_enabled: bool = True
+    ema_spread_cross_min_pct: float = Field(default=0.02, ge=0)
+    macd_hist_cross_min_abs: float = Field(default=0.0, ge=0)
+    rsi_midline: float = Field(default=50.0, ge=0, le=100)
+    boll_bandwidth_low_pct: float = Field(default=1.0, ge=0)
+    boll_bandwidth_expand_pct: float = Field(default=25.0, ge=0)
+    volume_zscore_trigger: float = Field(default=2.0, ge=0)
+    micro_return_5m_trigger_pct: float = Field(default=0.5, ge=0)
+    micro_range_5m_trigger_pct: float = Field(default=0.8, ge=0)
+    near_exit_pnl_pct: float = Field(default=0.8, ge=0)
+    review_flat_minutes: int = Field(default=60, ge=1)
+    review_position_minutes: int = Field(default=15, ge=1)
+    review_near_exit_minutes: int = Field(default=5, ge=1)
+    review_high_vol_minutes: int = Field(default=5, ge=1)
 
 
 class OnLeverageExceed(str, Enum):

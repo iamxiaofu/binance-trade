@@ -4,7 +4,7 @@
 设计为可单测：所有变更都是普通方法，不触碰 IO。
 
 包含：
-- 每 symbol 的上次决策价/时间、连续跳过计数
+- 每 symbol 的上次决策价/时间/特征快照、连续跳过计数
 - 挂单事件队列（成交/状态变化 → 下周期触发 LLM）
 - 当日已实现盈亏累计、账户回撤、权益峰值
 - 熔断标志 halt_new_entries、全局 kill_switch
@@ -22,6 +22,7 @@ class RuntimeState:
     # 上次触发 LLM 决策时的价格与时间（毫秒），用于 throttle 判定
     last_decision_price: dict[str, float] = field(default_factory=dict)
     last_decision_time: dict[str, int] = field(default_factory=dict)
+    last_decision_snapshot: dict[str, dict] = field(default_factory=dict)
     # 连续跳过 LLM 的次数（达到 max_skip_cycles 兜底强制触发）
     skip_count: dict[str, int] = field(default_factory=dict)
     # 待消费的挂单事件标志（成交/撤单/状态变化）
@@ -45,9 +46,17 @@ class RuntimeState:
     open_orders: dict[str, list[dict]] = field(default_factory=dict)
 
     # ---------- 决策记账 ----------
-    def record_decision(self, symbol: str, price: float, ts_ms: int | None = None) -> None:
+    def record_decision(
+        self,
+        symbol: str,
+        price: float,
+        ts_ms: int | None = None,
+        feature_snapshot: dict | None = None,
+    ) -> None:
         self.last_decision_price[symbol] = price
         self.last_decision_time[symbol] = ts_ms or int(time.time() * 1000)
+        if feature_snapshot is not None:
+            self.last_decision_snapshot[symbol] = feature_snapshot
         self.skip_count[symbol] = 0
 
     def record_skip(self, symbol: str) -> int:

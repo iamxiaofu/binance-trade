@@ -25,7 +25,21 @@ throttle:                     # 行情变化门槛（纯函数，全部可单测
   price_change_pct: 0.3       # 相对上次决策价变动 ≥ 0.3% 才触发
   pnl_alert_pct: 1.0          # 持仓未实现盈亏触及该百分比即触发
   trigger_on_order_event: true  # 挂单成交/状态变化即触发
-  max_skip_cycles: 6          # 连续跳过上限，达到即强制触发一次（兜底）
+  max_skip_cycles: 12         # 最终兜底：低波动无信号最长约 60min 复查
+  feature_snapshot_enabled: true
+  ema_spread_cross_min_pct: 0.02
+  macd_hist_cross_min_abs: 0.0
+  rsi_midline: 50
+  boll_bandwidth_low_pct: 1.0
+  boll_bandwidth_expand_pct: 25
+  volume_zscore_trigger: 2.0
+  micro_return_5m_trigger_pct: 0.5
+  micro_range_5m_trigger_pct: 0.8
+  near_exit_pnl_pct: 0.8
+  review_flat_minutes: 60
+  review_position_minutes: 15
+  review_near_exit_minutes: 5
+  review_high_vol_minutes: 5
 
 # ===== 风控（硬约束，优先级永远高于 LLM）=====
 # 保证金上限按「当前账户权益」动态计算；字段值为倍率小数：
@@ -54,7 +68,7 @@ llm:
   prompt_kline_count: 20      # Prompt 保留的主周期原始 K 线根数：5m × 20
   micro_kline_interval: 1m    # Prompt 微观 K 线周期，用于最近入场节奏
   micro_kline_lookback: 30    # Prompt 微观 K 线根数：1m × 30
-  higher_timeframes: [15m, 1h]  # 多周期共振：额外喂这些更高周期的指标
+  higher_timeframes: [15m, 1h, 4h, 1d]  # 多周期共振：只发送计算后的指标
   indicators: [ema, rsi, macd, atr, bollinger, volume]
 
 # ===== 执行层 =====

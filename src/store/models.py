@@ -52,6 +52,7 @@ class DecisionRow(Base):
     llm_prompt: Mapped[str] = mapped_column(Text, default="")
     llm_request_json: Mapped[str] = mapped_column(Text, default="")
     llm_response_json: Mapped[str] = mapped_column(Text, default="")
+    feature_snapshot_json: Mapped[str] = mapped_column(Text, default="")
     # 决策时的参考价
     ref_price: Mapped[float] = mapped_column(Float, default=0.0)
 
