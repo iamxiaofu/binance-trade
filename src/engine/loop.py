@@ -1632,10 +1632,17 @@ class TradingEngine:
             logger.warning("context unavailable for {}, skip", symbol)
             return
 
-        decision = await self._llm.decide(ctx)
+        decision, llm_trace = await self._llm.decide_with_trace(ctx)
         self.runtime.record_decision(symbol, snap.last_price)
         await self._store.log_decision(
-            symbol=symbol, decision=decision, ctx=ctx, skipped=False, ref_price=snap.last_price
+            symbol=symbol,
+            decision=decision,
+            ctx=ctx,
+            skipped=False,
+            ref_price=snap.last_price,
+            llm_prompt=llm_trace.user_prompt,
+            llm_request_json=llm_trace.request_json,
+            llm_response_json=llm_trace.response_json,
         )
 
         # CLOSE 优先处理（不受开仓限额约束）

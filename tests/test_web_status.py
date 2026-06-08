@@ -1,10 +1,11 @@
 """web/status.py 测试：只读查询返回正确结构。"""
 from __future__ import annotations
 
-import pytest
 import sqlite3
 
-from src.llm.schema import TradeDecision
+import pytest
+
+from src.llm.schema import IndicatorSnapshot, MarketContext, PositionSnapshot, TradeDecision
 from src.state.runtime import RuntimeState
 from src.store.repo import Store
 from web import status
@@ -17,6 +18,29 @@ async def db(tmp_path):
     await s.connect()
     await s.log_decision(symbol="BTCUSDT", skipped=True, skip_reason="flat", ref_price=100.0)
     await s.log_decision(symbol="BNBUSDT", skipped=True, skip_reason="symbol disabled", ref_price=600.0)
+    ctx = MarketContext(
+        symbol="ETHUSDT",
+        timestamp=1,
+        last_price=3000.0,
+        mark_price=3001.0,
+        funding_rate=0.0001,
+        change_24h_pct=1.2,
+        recent_klines=[[i, 1, 2, 0.5, 1.5, 100] for i in range(30)],
+        indicators=IndicatorSnapshot(
+            ema_fast=1,
+            ema_slow=2,
+            rsi=55,
+            macd=0.1,
+            macd_signal=0.05,
+            atr=10,
+            boll_upper=4,
+            boll_lower=1,
+        ),
+        position=PositionSnapshot(),
+        available_margin=180.0,
+        max_leverage_allowed=3,
+        account_equity=200.0,
+    )
     await s.log_decision(
         symbol="ETHUSDT",
         decision=TradeDecision(
@@ -29,7 +53,11 @@ async def db(tmp_path):
             take_profit_pct=0.02,
             reason="trend",
         ),
+        ctx=ctx,
         ref_price=3000.0,
+        llm_prompt="stored prompt",
+        llm_request_json='{"request": true}',
+        llm_response_json='{"response": true}',
     )
     await s.log_order({"symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
                        "order_type": "market", "qty": 0.01, "price": 100.0,
@@ -72,6 +100,16 @@ async def test_status_summary_shape(db):
     s = status.status_summary(db)
     assert set(s) == {"balance", "positions", "recent_decisions", "recent_orders",
                       "recent_rejects", "recent_commands"}
+
+
+async def test_decision_detail_includes_llm_trace_and_data_items(db):
+    detail = status.decision_detail(db, 3)
+    assert detail is not None
+    assert detail["llm_trace_available"] is True
+    assert detail["llm_user_prompt"] == "stored prompt"
+    assert "request" in detail["llm_request_effective_json"]
+    fields = {item["field"] for item in detail["llm_data_items"]}
+    assert {"last_price", "mark_price", "recent_klines_last20"}.issubset(fields)
 
 
 async def test_balance_history_ascending(db):

@@ -81,6 +81,11 @@ _SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("updated_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
     ("last_filter_sync_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
 )
+_DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("llm_prompt", "TEXT NOT NULL DEFAULT ''"),
+    ("llm_request_json", "TEXT NOT NULL DEFAULT ''"),
+    ("llm_response_json", "TEXT NOT NULL DEFAULT ''"),
+)
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
 _TRIGGERED_CONDITION_STATUSES = {"filled", "partial", "triggered"}
@@ -212,6 +217,13 @@ class Store:
         for name, ddl in _SYMBOL_COLUMNS:
             if symbol_existing and name not in symbol_existing:
                 await conn.execute(text(f"ALTER TABLE symbols ADD COLUMN {name} {ddl}"))
+        decision_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(decisions)"))).fetchall()
+        }
+        for name, ddl in _DECISION_EXTENSION_COLUMNS:
+            if decision_existing and name not in decision_existing:
+                await conn.execute(text(f"ALTER TABLE decisions ADD COLUMN {name} {ddl}"))
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -528,6 +540,9 @@ class Store:
         skipped: bool = False,
         skip_reason: str = "",
         ref_price: float = 0.0,
+        llm_prompt: str = "",
+        llm_request_json: str = "",
+        llm_response_json: str = "",
     ) -> None:
         row = DecisionRow(
             symbol=symbol,
@@ -548,6 +563,9 @@ class Store:
                 row.context_json = ctx.model_dump_json()
             except Exception:  # 落库失败不能影响主流程
                 row.context_json = ""
+        row.llm_prompt = llm_prompt
+        row.llm_request_json = llm_request_json
+        row.llm_response_json = llm_response_json
         await self._add(row)
 
     # ---------- 拒单 ----------

@@ -50,13 +50,23 @@ async def test_log_actual_decision_with_context(store):
     d = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.8,
                       size_pct=0.1, leverage=3, stop_loss_pct=0.02,
                       take_profit_pct=0.04, reason="trend up")
-    await store.log_decision(symbol="BTCUSDT", decision=d, ref_price=100.0)
+    await store.log_decision(
+        symbol="BTCUSDT",
+        decision=d,
+        ref_price=100.0,
+        llm_prompt="prompt",
+        llm_request_json='{"request": true}',
+        llm_response_json='{"response": true}',
+    )
     sm = async_sessionmaker(store._engine, expire_on_commit=False)
     async with sm() as session:
         row = (await session.execute(select(DecisionRow))).scalar_one()
     assert row.action == "OPEN_LONG"
     assert row.leverage == 3
     assert row.skipped is False
+    assert row.llm_prompt == "prompt"
+    assert "request" in row.llm_request_json
+    assert "response" in row.llm_response_json
 
 
 async def test_log_reject(store):

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import time
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -559,10 +560,11 @@ async def test_open_pipeline_passes_risk_and_executes(settings, creds, monkeypat
     monkeypatch.setattr(eng, "_fetch_margin_safe", fake_margin)
 
     async def fake_decide(ctx):
-        return TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
-                             size_pct=0.05, leverage=2, stop_loss_pct=0.02,
-                             take_profit_pct=0.04, reason="ok")
-    monkeypatch.setattr(eng._llm, "decide", fake_decide)
+        decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
+                                 size_pct=0.05, leverage=2, stop_loss_pct=0.02,
+                                 take_profit_pct=0.04, reason="ok")
+        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}")
+    monkeypatch.setattr(eng._llm, "decide_with_trace", fake_decide)
 
     await eng._process_symbol("BTCUSDT")
     assert eng._executor.opened and eng._executor.opened[0][0] == "BTCUSDT"
@@ -580,10 +582,11 @@ async def test_open_pipeline_rejects_high_leverage(settings, creds, monkeypatch)
     monkeypatch.setattr(eng, "_fetch_margin_safe", fake_margin)
 
     async def fake_decide(ctx):
-        return TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
-                             size_pct=0.05, leverage=10, stop_loss_pct=0.02,
-                             take_profit_pct=0.04, reason="too much")
-    monkeypatch.setattr(eng._llm, "decide", fake_decide)
+        decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
+                                 size_pct=0.05, leverage=10, stop_loss_pct=0.02,
+                                 take_profit_pct=0.04, reason="too much")
+        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}")
+    monkeypatch.setattr(eng._llm, "decide_with_trace", fake_decide)
 
     await eng._process_symbol("BTCUSDT")
     assert eng._executor.opened == []
@@ -607,10 +610,11 @@ async def test_open_rejects_stale_condition_without_position(settings, creds, mo
     monkeypatch.setattr(eng, "_fetch_margin_safe", fake_margin)
 
     async def fake_decide(ctx):
-        return TradeDecision(symbol="BTCUSDT", action=Action.OPEN_SHORT, confidence=0.9,
-                             size_pct=0.05, leverage=2, stop_loss_pct=0.02,
-                             take_profit_pct=0.04, reason="ok")
-    monkeypatch.setattr(eng._llm, "decide", fake_decide)
+        decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_SHORT, confidence=0.9,
+                                 size_pct=0.05, leverage=2, stop_loss_pct=0.02,
+                                 take_profit_pct=0.04, reason="ok")
+        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}")
+    monkeypatch.setattr(eng._llm, "decide_with_trace", fake_decide)
 
     await eng._process_symbol("BTCUSDT")
 

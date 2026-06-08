@@ -10,6 +10,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
 
 from anthropic import AsyncAnthropic
 from loguru import logger
@@ -20,6 +24,37 @@ from src.llm.prompt import SYSTEM_PROMPT, build_user_prompt
 from src.llm.schema import MarketContext, TradeDecision
 
 _TOOL_NAME = "submit_decision"
+
+
+@dataclass
+class LLMTrace:
+    """一次 LLM 调用的审计信息，不包含 API key。"""
+
+    user_prompt: str
+    request_json: str
+    response_json: str = ""
+
+
+def _jsonable(value: Any) -> Any:
+    """Best-effort conversion for SDK response objects used in audit logs."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(mode="json")
+        except TypeError:
+            return value.model_dump()
+    if isinstance(value, SimpleNamespace):
+        return {k: _jsonable(v) for k, v in vars(value).items()}
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    return repr(value)
+
+
+def _dump_json(value: Any) -> str:
+    return json.dumps(_jsonable(value), ensure_ascii=False, default=str)
 
 
 def _build_tool() -> dict:
@@ -46,31 +81,51 @@ class LLMClient:
 
     async def decide(self, ctx: MarketContext) -> TradeDecision:
         """对单个 symbol 做决策。任何失败都降级为 HOLD。"""
+        decision, _ = await self.decide_with_trace(ctx)
+        return decision
+
+    async def decide_with_trace(self, ctx: MarketContext) -> tuple[TradeDecision, LLMTrace]:
+        """对单个 symbol 做决策，并返回完整审计 trace。"""
         user_prompt = build_user_prompt(ctx, kline_interval=self._cfg.kline_interval)
+        request_payload = {
+            "model": self._cfg.model,
+            "max_tokens": self._cfg.max_tokens,
+            "system": SYSTEM_PROMPT,
+            "tools": [self._tool],
+            "tool_choice": {"type": "tool", "name": _TOOL_NAME},
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        trace = LLMTrace(
+            user_prompt=user_prompt,
+            request_json=_dump_json(request_payload),
+        )
         last_err = "unknown"
+        attempts: list[dict[str, Any]] = []
 
         for attempt in range(self._cfg.max_retries + 1):
             try:
                 resp = await asyncio.wait_for(
-                    self._client.messages.create(
-                        model=self._cfg.model,
-                        max_tokens=self._cfg.max_tokens,
-                        system=SYSTEM_PROMPT,
-                        tools=[self._tool],
-                        tool_choice={"type": "tool", "name": _TOOL_NAME},
-                        messages=[{"role": "user", "content": user_prompt}],
-                    ),
+                    self._client.messages.create(**request_payload),
                     timeout=self._cfg.timeout,
                 )
+                attempts.append({"attempt": attempt + 1, "response": _jsonable(resp)})
                 decision = self._parse(resp, ctx.symbol)
                 if decision is not None:
-                    return decision
+                    trace.response_json = _dump_json({
+                        "attempts": attempts,
+                        "final_decision": decision.model_dump(mode="json"),
+                    })
+                    return decision, trace
                 last_err = "no valid tool_use block"
             except asyncio.TimeoutError:
                 last_err = f"timeout after {self._cfg.timeout}s"
+                attempts.append({"attempt": attempt + 1, "error_type": "TimeoutError",
+                                 "error": last_err})
                 logger.warning("LLM timeout {} (attempt {})", ctx.symbol, attempt + 1)
             except Exception as e:  # 网络/限频/SDK 错误
                 last_err = f"{type(e).__name__}: {e}"
+                attempts.append({"attempt": attempt + 1, "error_type": type(e).__name__,
+                                 "error": str(e)})
                 logger.warning("LLM error {} (attempt {}): {}", ctx.symbol, attempt + 1, e)
 
             # 退避后重试
@@ -78,7 +133,12 @@ class LLMClient:
                 await asyncio.sleep(min(2 ** attempt, 5))
 
         logger.error("LLM decide failed for {}, degrade HOLD: {}", ctx.symbol, last_err)
-        return TradeDecision.safe_hold(ctx.symbol, last_err)
+        decision = TradeDecision.safe_hold(ctx.symbol, last_err)
+        trace.response_json = _dump_json({
+            "attempts": attempts,
+            "final_decision": decision.model_dump(mode="json"),
+        })
+        return decision, trace
 
     def _parse(self, resp, symbol: str) -> TradeDecision | None:
         """从响应里取出 tool_use 输入并校验为 TradeDecision。失败返回 None。"""

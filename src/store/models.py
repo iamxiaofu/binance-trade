@@ -48,6 +48,10 @@ class DecisionRow(Base):
 
     # 审计：完整输入上下文 JSON（便于复盘）
     context_json: Mapped[str] = mapped_column(Text, default="")
+    # LLM 审计：真实 prompt、请求载荷、原始回传（不包含 API key）
+    llm_prompt: Mapped[str] = mapped_column(Text, default="")
+    llm_request_json: Mapped[str] = mapped_column(Text, default="")
+    llm_response_json: Mapped[str] = mapped_column(Text, default="")
     # 决策时的参考价
     ref_price: Mapped[float] = mapped_column(Float, default=0.0)
 

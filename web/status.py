@@ -8,9 +8,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import sqlite3
 import time
 from typing import Any
+
+from src.llm.prompt import SYSTEM_PROMPT, build_user_prompt
+from src.llm.schema import MarketContext, TradeDecision
 
 
 def _rows(db_path: str, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -385,10 +389,125 @@ def recent_commands(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM control_commands ORDER BY id DESC LIMIT ?", (limit,))
 
 
+def _json_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _context_from_json(context_json: str) -> MarketContext | None:
+    if not context_json:
+        return None
+    try:
+        return MarketContext.model_validate_json(context_json)
+    except Exception:
+        return None
+
+
+def _reconstructed_request_json(user_prompt: str) -> str:
+    if not user_prompt:
+        return ""
+    schema = TradeDecision.model_json_schema()
+    schema.pop("title", None)
+    return json.dumps(
+        {
+            "reconstructed": True,
+            "note": "历史记录未保存原始请求；此处由 context_json 按当前 prompt 模板重建。",
+            "system": SYSTEM_PROMPT,
+            "tools": [{
+                "name": "submit_decision",
+                "description": "提交本周期对该标的的结构化交易决策。必须调用本工具。",
+                "input_schema": schema,
+            }],
+            "tool_choice": {"type": "tool", "name": "submit_decision"},
+            "messages": [{"role": "user", "content": user_prompt}],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _add_llm_item(items: list[dict[str, str]], category: str, field: str,
+                  value: Any, note: str = "") -> None:
+    items.append({
+        "category": category,
+        "field": field,
+        "value": _json_text(value),
+        "note": note,
+    })
+
+
+def _llm_data_items(ctx: MarketContext | None) -> list[dict[str, str]]:
+    """把发送给 LLM prompt 的核心数据拆成表格行。"""
+    if ctx is None:
+        return []
+    items: list[dict[str, str]] = []
+
+    _add_llm_item(items, "基础行情", "symbol", ctx.symbol)
+    _add_llm_item(items, "基础行情", "timestamp", ctx.timestamp)
+    _add_llm_item(items, "基础行情", "last_price", ctx.last_price)
+    _add_llm_item(items, "基础行情", "mark_price", ctx.mark_price)
+    _add_llm_item(items, "基础行情", "funding_rate", ctx.funding_rate)
+    _add_llm_item(items, "基础行情", "change_24h_pct", ctx.change_24h_pct)
+
+    _add_llm_item(items, "账户风控", "account_equity", ctx.account_equity)
+    _add_llm_item(items, "账户风控", "available_margin", ctx.available_margin)
+    _add_llm_item(items, "账户风控", "max_leverage_allowed", ctx.max_leverage_allowed)
+    _add_llm_item(items, "账户风控", "max_order_margin_abs", ctx.max_order_margin_abs)
+    _add_llm_item(items, "账户风控", "max_loss_per_trade_abs", ctx.max_loss_per_trade_abs)
+
+    pos = ctx.position
+    _add_llm_item(items, "持仓", "has_position", pos.has_position)
+    _add_llm_item(items, "持仓", "side", pos.side)
+    _add_llm_item(items, "持仓", "entry_price", pos.entry_price)
+    _add_llm_item(items, "持仓", "size", pos.size)
+    _add_llm_item(items, "持仓", "unrealized_pnl_pct", pos.unrealized_pnl_pct)
+    _add_llm_item(items, "持仓", "current_leverage", pos.current_leverage)
+
+    sentiment = ctx.sentiment
+    if sentiment is not None:
+        for key, value in sentiment.model_dump(mode="json").items():
+            _add_llm_item(items, "市场情绪", key, value)
+
+    for key, value in ctx.indicators.model_dump(mode="json").items():
+        _add_llm_item(items, "主周期指标", key, value)
+
+    for tf in ctx.higher_timeframes:
+        prefix = f"higher_timeframes[{tf.timeframe}]"
+        for key, value in tf.model_dump(mode="json").items():
+            _add_llm_item(items, "多周期指标", f"{prefix}.{key}", value)
+
+    recent = ctx.recent_klines[-20:]
+    _add_llm_item(
+        items,
+        "K线",
+        "recent_klines_last20",
+        [[round(float(x), 4) for x in k] for k in recent],
+        "prompt 中发送最近 20 根；完整窗口仅用于本地指标计算。",
+    )
+    _add_llm_item(items, "K线", "recent_klines_context_count", len(ctx.recent_klines),
+                  "context_json 中保存的完整窗口根数。")
+    return items
+
+
 def decision_detail(db_path: str, decision_id: int) -> dict | None:
     """单条决策完整记录（含喂给 LLM 的 context_json）。"""
     rows = _rows(db_path, "SELECT * FROM decisions WHERE id = ?", (decision_id,))
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    ctx = _context_from_json(row.get("context_json") or "")
+    user_prompt = row.get("llm_prompt") or (build_user_prompt(ctx) if ctx else "")
+    row["llm_system_prompt"] = SYSTEM_PROMPT
+    row["llm_user_prompt"] = user_prompt
+    row["llm_request_effective_json"] = (
+        row.get("llm_request_json") or _reconstructed_request_json(user_prompt)
+    )
+    row["llm_response_effective_json"] = row.get("llm_response_json") or ""
+    row["llm_trace_available"] = bool(row.get("llm_request_json") or row.get("llm_response_json"))
+    row["llm_data_items"] = _llm_data_items(ctx)
+    return row
 
 
 @dataclass(frozen=True)

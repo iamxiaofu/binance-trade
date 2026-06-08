@@ -10,6 +10,10 @@ const loading = ref(false)
 const detailVisible = ref(false)
 const detail = ref(null)
 const ctxPretty = ref('')
+const llmPromptPretty = ref('')
+const llmRequestPretty = ref('')
+const llmResponsePretty = ref('')
+const llmDataRows = ref([])
 const cfg = ref(null)
 const filters = ref({
   symbols: [],
@@ -61,10 +65,36 @@ async function load() {
 async function showDetail(row) {
   try {
     detail.value = await api.decisionDetail(row.id)
+    llmDataRows.value = detail.value.llm_data_items || []
+    llmPromptPretty.value = [
+      '【System Prompt】',
+      detail.value.llm_system_prompt || '(无)',
+      '',
+      '【User Prompt + 数据】',
+      detail.value.llm_user_prompt || '(无)',
+    ].join('\n')
     try {
       ctxPretty.value = JSON.stringify(JSON.parse(detail.value.context_json || '{}'), null, 2)
     } catch (_) {
       ctxPretty.value = detail.value.context_json || '(无)'
+    }
+    try {
+      llmRequestPretty.value = JSON.stringify(
+        JSON.parse(detail.value.llm_request_effective_json || '{}'),
+        null,
+        2,
+      )
+    } catch (_) {
+      llmRequestPretty.value = detail.value.llm_request_effective_json || '(无)'
+    }
+    try {
+      llmResponsePretty.value = JSON.stringify(
+        JSON.parse(detail.value.llm_response_effective_json || '{}'),
+        null,
+        2,
+      )
+    } catch (_) {
+      llmResponsePretty.value = detail.value.llm_response_effective_json || '(无)'
     }
     detailVisible.value = true
   } catch (e) {
@@ -207,7 +237,7 @@ onMounted(async () => {
       </div>
     </el-card>
 
-    <el-dialog v-model="detailVisible" title="决策详情" width="720px">
+    <el-dialog v-model="detailVisible" title="决策详情" width="90vw">
       <template v-if="detail">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="ID">{{ detail.id }}</el-descriptions-item>
@@ -222,10 +252,61 @@ onMounted(async () => {
           <el-descriptions-item label="SL/TP">{{ detail.stop_loss_pct }} / {{ detail.take_profit_pct }}</el-descriptions-item>
           <el-descriptions-item label="理由" :span="2">{{ detail.skipped ? detail.skip_reason : detail.reason }}</el-descriptions-item>
         </el-descriptions>
-        <div style="margin-top:12px; font-size:13px; color:#909399">喂给 LLM 的市场上下文 (context_json)：</div>
-        <pre style="max-height:300px; overflow:auto; background:#1f2329; color:#cfd3dc;
-                    padding:12px; border-radius:6px; font-size:12px">{{ ctxPretty }}</pre>
+        <el-alert
+          v-if="!detail.skipped && !detail.llm_trace_available"
+          class="trace-alert"
+          type="warning"
+          show-icon
+          :closable="false"
+          title="该历史记录没有保存原始 LLM request/response，页面已基于 context_json 重建 Prompt；新决策会保存完整调用记录。"
+        />
+
+        <el-tabs class="decision-detail-tabs">
+          <el-tab-pane label="LLM数据列表">
+            <el-table :data="llmDataRows" border height="360px" size="small">
+              <el-table-column prop="category" label="分类" width="110" />
+              <el-table-column prop="field" label="字段" width="220" show-overflow-tooltip />
+              <el-table-column prop="value" label="发送值" min-width="320" show-overflow-tooltip />
+              <el-table-column prop="note" label="说明" min-width="220" show-overflow-tooltip />
+            </el-table>
+          </el-tab-pane>
+          <el-tab-pane label="Prompt">
+            <pre class="detail-pre">{{ llmPromptPretty }}</pre>
+          </el-tab-pane>
+          <el-tab-pane label="完整请求JSON">
+            <pre class="detail-pre">{{ llmRequestPretty }}</pre>
+          </el-tab-pane>
+          <el-tab-pane label="LLM回传结果">
+            <pre class="detail-pre">{{ llmResponsePretty }}</pre>
+          </el-tab-pane>
+          <el-tab-pane label="Context JSON">
+            <pre class="detail-pre">{{ ctxPretty }}</pre>
+          </el-tab-pane>
+        </el-tabs>
       </template>
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.trace-alert {
+  margin-top: 12px;
+}
+
+.decision-detail-tabs {
+  margin-top: 12px;
+}
+
+.detail-pre {
+  max-height: 460px;
+  overflow: auto;
+  background: #1f2329;
+  color: #cfd3dc;
+  padding: 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+</style>
