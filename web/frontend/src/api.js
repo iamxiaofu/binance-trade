@@ -1,6 +1,6 @@
 // 统一的后端 API 封装。Basic Auth 由浏览器在首次 401 后自动附带，
 // 因此这里不手动管理凭据；仅做 fetch + JSON 解析 + 错误处理。
-const JSON_HEADERS = { Accept: 'application/json' }
+const JSON_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json' }
 
 function qs(params) {
   const q = new URLSearchParams()
@@ -16,15 +16,34 @@ function qs(params) {
   return q.toString()
 }
 
+function formatDetail(detail) {
+  if (detail == null) return ''
+  if (typeof detail === "string") return detail
+  if (Array.isArray(detail)) {
+    // FastAPI 422: [{type, loc, msg, input}, ...]
+    return detail
+      .map((e) => {
+        const loc = Array.isArray(e.loc) ? e.loc.join(".") : ""
+        return loc ? `${loc}: ${e.msg}` : e.msg || JSON.stringify(e)
+      })
+      .join("; ")
+  }
+  if (typeof detail === "object") return JSON.stringify(detail)
+  return String(detail)
+}
+
 async function req(path, opts = {}) {
-  const resp = await fetch(path, { headers: JSON_HEADERS, ...opts })
+  // 没 body 的 POST/PUT 不需要 Content-Type，让 fetch 不带该 header
+  const hasBody = opts.body !== undefined && opts.body !== null
+  const headers = hasBody ? JSON_HEADERS : { Accept: 'application/json' }
+  const resp = await fetch(path, { headers, ...opts })
   if (!resp.ok) {
     let detail = resp.statusText
     try {
       const j = await resp.json()
-      detail = j.detail || detail
+      detail = j.detail !== undefined ? j.detail : detail
     } catch (_) { /* ignore */ }
-    throw new Error(`${resp.status}: ${detail}`)
+    throw new Error(`${resp.status}: ${formatDetail(detail)}`)
   }
   return resp.json()
 }

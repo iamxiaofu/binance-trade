@@ -769,22 +769,23 @@ async def api_llm_profiles_test(name: str, _: str = Depends(_check_auth)):
         api_key = ks.get(prof["keyring_ref"])
     except (KeyError, KeyringUnavailable) as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
-    # 真正的 ping
+    # 真正的 ping：test 端点只关心 (model, base_url, timeout, api_key, max_tokens)，
+    # 不依赖 LLMConfig 的工程参数 (kline_lookback / kline_interval / ...)，所以
+    # 这里直接构造 AsyncAnthropic，避免 LLMConfig 必填字段缺失的问题。
     from anthropic import AsyncAnthropic  # type: ignore
-    from src.config.schema import LLMConfig
-    cfg = LLMConfig(
-        model=prof["model"],
-        timeout=min(float(prof["timeout"]), 15.0),  # 测试给短超时
-        max_tokens=8,
-        max_retries=0,
-        base_url=prof["base_url"] or None,
-    )
-    client = AsyncAnthropic(api_key=api_key, timeout=cfg.timeout)
+    timeout = min(float(prof["timeout"]), 15.0)  # 测试给短超时
+    kwargs = {"api_key": api_key, "timeout": timeout}
+    base_url = prof.get("base_url") or None
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = AsyncAnthropic(**kwargs)
     t0 = time.monotonic()
     try:
+        # 用 profile 自己的 max_tokens 做上限，但 cap 到 256 防 8k 浪费
+        max_tokens = min(int(prof.get("max_tokens", 1024) or 1024), 256)
         await client.messages.create(
-            model=cfg.model,
-            max_tokens=cfg.max_tokens,
+            model=prof["model"],
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": "ping"}],
         )
     except Exception as e:  # noqa: BLE001

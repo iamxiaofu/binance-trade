@@ -4,13 +4,22 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 
 const loading = ref(false)
-const status = ref(null)  // { keyring, active, engine, switching_supported }
+// 状态/数据都给出"乐观默认"，避免 onMounted/refresh 时 ref=null 导致黄条闪动。
+// 后端首次响应回来后会整体覆盖；轮询用 Object.assign 局部更新，不会瞬时清空。
+const status = ref({
+  keyring: { backend: 'unknown', available: false, hint: '' },
+  active: null,
+  switching_supported: false,
+  engine: { active_name: '', active_version: 0, active_source: '' },
+})
 const profiles = ref([])
 const showDialog = ref(false)
 const editing = ref(null)  // null = 新增；否则为原 profile
 const form = ref(emptyForm())
 const testResult = ref({})  // { [name]: { ok, latency_ms, error } }
 const pollTimer = ref(null)
+// 区分"从未加载过"与"已经加载过"，UI 空白骨架只在首次进入时显示
+const firstLoaded = ref(false)
 
 function emptyForm() {
   return {
@@ -25,7 +34,11 @@ function emptyForm() {
   }
 }
 
-const keyringAvailable = computed(() => status.value?.switching_supported)
+const keyringAvailable = computed(() => {
+  // status 默认值里 switching_supported=false，所以 firstLoaded=false 时 banner 不显示
+  // 真正响应回来后，后端返回的 switching_supported 才是权威值
+  return Boolean(status.value?.switching_supported)
+})
 const activeName = computed(() => status.value?.active?.name || '—')
 const engineActiveName = computed(() => status.value?.engine?.active_name || '—')
 const engineVersion = computed(() => status.value?.engine?.active_version ?? 0)
@@ -38,8 +51,10 @@ async function refresh() {
   loading.value = true
   try {
     const [st, pr] = await Promise.all([api.llmStatus(), api.llmProfiles()])
+    // 用整体赋值即可，ref 默认值已经给出"乐观默认"，不会瞬时变 null。
     status.value = st
     profiles.value = pr.items || []
+    firstLoaded.value = true
   } catch (e) {
     ElMessage.error(`加载失败: ${e.message}`)
   } finally {
@@ -159,7 +174,10 @@ onMounted(() => {
   refresh()
   // 切换命令入队后 1.5s 起轮询 /api/llm/status，捕获 engine 热替换完成的 version 变化
   pollTimer.value = setInterval(() => {
-    api.llmStatus().then((s) => { status.value = s }).catch(() => {})
+    api.llmStatus().then((s) => {
+      // 局部覆盖，不整体替换，避免 computed 中间态
+      status.value = { ...status.value, ...s }
+    }).catch(() => {})
   }, 2000)
 })
 onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
@@ -168,12 +186,12 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
 <template>
   <div class="llm-page">
     <el-alert
-      v-if="!keyringAvailable"
+      v-if="firstLoaded && !keyringAvailable"
       type="warning"
       :closable="false"
       show-icon
       class="banner"
-      :title="`keyring 后端不可用：${status?.keyring?.backend || 'unknown'}`"
+      :title="`keyring 后端不可用：${status.keyring?.backend || 'unknown'}`"
     >
       <template #default>
         <div>当前 web 端切换功能被禁用。可用方案：</div>
