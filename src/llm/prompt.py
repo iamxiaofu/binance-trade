@@ -24,7 +24,8 @@ SYSTEM_PROMPT = """\
 3. 多周期共振(高周期与当前周期方向一致)时机会更可靠，可给更高 confidence。
 4. 关注量价配合：放量突破比缩量更可信；背离需警惕。
 5. leverage 不要超过 max_leverage_allowed（超过会被系统直接拒单）。资金量小，杠杆宜适中。
-6. size_pct 为动用可用保证金比例(0~1)，按机会质量与风险动态调整，单笔注意控制风险敞口。
+6. size_pct 为动用可用保证金比例(0~1)，存在硬上限 max_order_margin_pct（系统按权益动态设置，
+   通常约 0.2），超过该硬上限的决策会被直接拒单（不截断、不调整）。
 7. stop_loss_pct / take_profit_pct 为相对开仓价的比例(如 0.02=2%)，结合 ATR 设置合理止损。
 8. confidence 如实反映把握(0~1)；信号矛盾或数据不足时选 HOLD 并给低 confidence。
 9. 只依据提供的数据判断，不臆造未提供的信息。
@@ -93,7 +94,8 @@ def build_user_prompt(
 最新价: {ctx.last_price}  标记价: {ctx.mark_price}
 账户权益: {ctx.account_equity:.2f} USDT    可用保证金: {ctx.available_margin} USDT
 风控允许最大杠杆(max_leverage_allowed): {ctx.max_leverage_allowed}x
-单笔保证金上限: {ctx.max_order_margin_abs:.2f} USDT（= size_pct × 可用保证金，不得超过此值，否则被拒单）
+单笔保证金硬上限: size_pct ≤ {ctx.max_order_margin_pct*100:.1f}% (即 max_order_margin_pct={ctx.max_order_margin_pct:.4f}，硬性约束，超出直接拒单)
+   对应绝对金额: {ctx.max_order_margin_abs:.2f} USDT (= {ctx.max_order_margin_pct:.4f} × 可用保证金 {ctx.available_margin:.2f})
 单笔止损理论亏损上限: {ctx.max_loss_per_trade_abs:.2f} USDT（= size_pct × 可用保证金 × 杠杆 × stop_loss_pct）
 说明: 请据账户权益与上限自主决定 size_pct（占可用保证金比例）与止损距离。
 名义价值=size_pct×杠杆×可用保证金；杠杆不会放大保证金上限，但会放大名义价值与止损亏损。

@@ -109,6 +109,7 @@ def build_context(
         max_leverage_allowed=settings.risk.max_leverage,
         account_equity=equity_base,
         max_order_margin_abs=max_order_margin_abs,
+        max_order_margin_pct=settings.risk.max_order_margin_pct,
         max_loss_per_trade_abs=max_loss_per_trade_abs,
         higher_timeframes=higher,
         sentiment=sentiment,

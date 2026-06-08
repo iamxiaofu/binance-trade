@@ -106,6 +106,9 @@ class MarketContext(BaseModel):
     # 资金尺度与风险上限(USDT)，告知 LLM 以便其自主决定 size_pct/止损距离
     account_equity: float = 0.0
     max_order_margin_abs: float = 0.0
+    # 硬上限百分比（0~1），由 config.yaml risk.max_order_margin_pct 设置；
+    # user prompt 透传给 LLM，让 LLM 在决策时知道 size_pct 的硬边界。
+    max_order_margin_pct: float = 0.0
     max_loss_per_trade_abs: float = 0.0
     # 新增：多周期指标 + 市场情绪（可为空，向后兼容）
     higher_timeframes: list[TimeframeIndicators] = []
