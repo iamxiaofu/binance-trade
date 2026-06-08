@@ -78,11 +78,17 @@ execution:
   normal_exit_mode: MARKET_TAKER   # 策略主动平仓默认市价，避免部分平仓保护单失配
   emergency_exit_mode: MARKET_TAKER # 熔断/保护失败/kill-switch 永远走市价减仓
   maker_time_in_force: GTX    # Binance USD-M Post Only
-  maker_timeout_seconds: 8
+  maker_timeout_seconds: 15           # 单次 maker 挂单等待上限（之前 8s 太短）
   maker_poll_seconds: 1
-  maker_max_requotes: 2
-  maker_price_offset_bps: 1
-  maker_unfilled_action: CANCEL     # CANCEL | FALLBACK_MARKET
+  maker_max_requotes: 4               # 最多 4 次重挂（之前 2 次）
+  maker_price_offset_bps: 5          # 挂单离盘口偏移（之前 1bps 太小，1-2s 内易被 Post-Only 撤单）
+  maker_unfilled_action: CANCEL     # CANCEL | FALLBACK_MARKET（暂保守，不开兜底市价单）
+  # ---- 市价单滑点护栏（保护 FALLBACK_MARKET 兜底场景）----
+  # 下单前用盘口估算市价单冲击价 vs 决策参考价，偏差超阈值就拒单。
+  # 默认 8 bps = 0.08% 覆盖 BTC/ETH/BNB 正常+中等急跌；SOL 等中等币种单独放宽。
+  market_slippage_bps: 8
+  market_slippage_bps_per_symbol:
+    SOLUSDT: 10                       # SOL 急跌时 spread 拉得更快，单独放宽到 10 bps
   partial_fill_action: PROTECT_AND_CANCEL_REST
   attach_sl_tp: true          # 是否同时挂止盈止损单
   rate_limit_backoff: 1.5     # 限频指数退避基数

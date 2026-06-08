@@ -176,6 +176,12 @@ class ExecutionConfig(_Base):
     maker_max_requotes: int = Field(default=2, ge=0, le=10)
     maker_price_offset_bps: float = Field(default=1.0, ge=0, le=100)
     maker_unfilled_action: MakerUnfilledAction = MakerUnfilledAction.CANCEL
+    # ---- 市价单滑点护栏（保护 FALLBACK_MARKET 兜底场景）----
+    # 下单前用盘口估算市价单冲击价：估算价 vs 决策参考价的偏差超过阈值就拒单。
+    # 阈值单位 bps（0.01%）。默认 8 bps = 0.08% 覆盖 BTC/ETH/BNB 的正常+中等急跌场景；
+    # SOL 等中等币种可在 market_slippage_bps_per_symbol 里放宽。
+    market_slippage_bps: float = Field(default=8.0, gt=0, le=100)
+    market_slippage_bps_per_symbol: dict[str, float] = Field(default_factory=dict)
     partial_fill_action: PartialFillAction = PartialFillAction.PROTECT_AND_CANCEL_REST
     attach_sl_tp: bool = True
     rate_limit_backoff: float = Field(gt=1.0)

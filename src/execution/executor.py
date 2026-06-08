@@ -305,6 +305,75 @@ class Executor:
             return await self._open_market_position(decision=decision, qty=qty, price=price)
         return await self._open_maker_position(decision=decision, qty=qty, price=price, mode=mode)
 
+    def _slippage_limit_bps(self, symbol: str) -> float:
+        """按 symbol 取市价单最大允许滑点（bps）。先 per_symbol 覆盖，再 default。"""
+        sym = (symbol or "").upper()
+        per = (self._cfg.market_slippage_bps_per_symbol or {}).get(sym)
+        if per is not None:
+            return float(per)
+        return float(self._cfg.market_slippage_bps)
+
+    async def _preflight_market_slippage(
+        self,
+        *,
+        symbol: str,
+        side: str,         # "buy" / "sell"
+        ref_price: float,  # 决策参考价（用于估算偏差）
+        qty: float,
+    ) -> tuple[bool, float, str]:
+        """市价单预检：用盘口估算成交价 vs ref_price 的偏差是否超阈值。
+
+        返回 (ok, est_impact_price, reason)。
+        - ok=True  允许下市价单
+        - ok=False 应拒单（reason 解释）
+        估算方法：以 ref_price 一侧的对手盘深度累计 qty，得到加权均价 est_impact。
+        卖单看 bids（吃买盘），买单看 asks（吃卖盘）。
+        """
+        if ref_price <= 0 or qty <= 0:
+            return True, ref_price, ""
+        try:
+            book = await self._client.fetch_order_book(symbol, limit=20)
+        except Exception as e:
+            logger.warning("[{}] preflight orderbook failed (allow): {}", symbol, e)
+            return True, ref_price, ""
+        levels = (book.get("bids") if side == "sell" else book.get("asks")) or []
+        if not levels:
+            return True, ref_price, ""
+        # 累计 qty 拿加权均价
+        remaining = qty
+        cost = 0.0
+        for lvl in levels:
+            px = float(lvl[0] or 0.0)
+            sz = float(lvl[1] or 0.0)
+            if px <= 0 or sz <= 0:
+                continue
+            take = min(sz, remaining)
+            cost += take * px
+            remaining -= take
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            # 盘口深度不够：可能严重滑点，但保守起见 allow（市价单至少会成交部分）
+            logger.warning(
+                "[{}] preflight: book depth insufficient qty={} remaining={}",
+                symbol, qty, remaining,
+            )
+            est_impact = cost / max(qty - remaining, 1e-9)
+        else:
+            est_impact = cost / qty
+        # 偏差：卖单 impact <= ref_price（吃买盘会更低），买单 impact >= ref_price
+        if side == "sell":
+            bps = (ref_price - est_impact) / ref_price * 10000.0
+        else:
+            bps = (est_impact - ref_price) / ref_price * 10000.0
+        limit = self._slippage_limit_bps(symbol)
+        if bps > limit:
+            return False, est_impact, (
+                f"slippage {bps:.1f}bps > limit {limit:.1f}bps "
+                f"(est_impact={est_impact:.4f} ref={ref_price:.4f})"
+            )
+        return True, est_impact, ""
+
     async def _open_market_position(
         self,
         *,
@@ -323,6 +392,23 @@ class Executor:
                            raw={"reason": "below minNotional/minQty"},
                            execution_mode=ExecutionMode.MARKET_TAKER.value,
                            requested_qty=qty, requested_price=price)
+        # 市价单滑点预检：参考价 (price) 偏离盘口估算成交价过远则拒单，
+        # 避免 FALLBACK_MARKET 兜底时拿到不合理价格。
+        ok, _est, reason = await self._preflight_market_slippage(
+            symbol=symbol, side=side, ref_price=price, qty=float(norm.qty),
+        )
+        if not ok:
+            logger.warning(
+                "[{}] market OPEN rejected by slippage guard: {}",
+                symbol, reason,
+            )
+            return _result(
+                symbol=symbol, kind="OPEN", side=side, qty=float(norm.qty), price=price,
+                notional=0.0, dry_run=False, status="rejected",
+                raw={"reason": "slippage_exceeded", "detail": reason},
+                execution_mode=ExecutionMode.MARKET_TAKER.value,
+                requested_qty=float(norm.qty), requested_price=price,
+            )
         q = float(norm.qty)
 
         # 下单前确保保证金模式+杠杆就位
@@ -728,6 +814,23 @@ class Executor:
                            raw={"reason": "no position"})
         close_side = "sell" if pos_side == "long" else "buy"
         mark = float(position.get("markPrice") or position.get("entryPrice") or 0)
+        # 市价平仓滑点预检：用 mark 价作为 ref，盘口估算平仓冲击价超阈值则拒单。
+        if mark > 0:
+            ok, _est, reason = await self._preflight_market_slippage(
+                symbol=symbol, side=close_side, ref_price=mark, qty=contracts,
+            )
+            if not ok:
+                logger.warning(
+                    "[{}] market CLOSE rejected by slippage guard: {}",
+                    symbol, reason,
+                )
+                return _result(
+                    symbol=symbol, kind="CLOSE", side=close_side, qty=contracts, price=mark,
+                    notional=0.0, dry_run=False, status="rejected",
+                    raw={"reason": "slippage_exceeded", "detail": reason},
+                    execution_mode=mode.value,
+                    requested_qty=contracts, requested_price=mark,
+                )
         client_order_id = self._client_order_id(symbol=symbol, kind="CLOSE", side=close_side)
 
         order = await self._with_retry(
