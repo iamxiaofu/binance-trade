@@ -30,6 +30,10 @@ let stopped = false
 let indicatorsCreated = false
 const priceSeries = []   // [{t: timestamp_ms, v: price}]
 
+function cssVar(name, fallback) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
+}
+
 function toBar(k) {
   return {
     timestamp: k[0], open: k[1], high: k[2], low: k[3], close: k[4], volume: k[5],
@@ -101,21 +105,30 @@ async function loadKline() {
 
 function renderPrice() {
   if (!pchart) return
+  const textColor = cssVar('--bt-text', '#303133')
+  const mutedColor = cssVar('--bt-muted', '#909399')
+  const gridColor = cssVar('--bt-border', '#e5e7eb')
+  const lineColor = cssVar('--bt-primary', '#409eff')
   pchart.setOption({
     animation: false,
-    textStyle: { color: '#1f2937' },
-    tooltip: { trigger: 'axis' },
+    textStyle: { color: textColor },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: cssVar('--bt-card', '#ffffff'),
+      borderColor: gridColor,
+      textStyle: { color: textColor },
+    },
     grid: { left: 64, right: 24, top: 20, bottom: 34 },
     xAxis: {
       type: 'time',
-      axisLabel: { fontSize: 10, color: '#4b5563' },
-      axisLine: { lineStyle: { color: '#d1d5db' } },
+      axisLabel: { fontSize: 10, color: mutedColor },
+      axisLine: { lineStyle: { color: gridColor } },
     },
     yAxis: {
       type: 'value',
       scale: true,
-      axisLabel: { color: '#4b5563' },
-      splitLine: { lineStyle: { color: '#eef2f7' } },
+      axisLabel: { color: mutedColor },
+      splitLine: { lineStyle: { color: gridColor } },
     },
     series: [{
       name: '最新价',
@@ -123,8 +136,9 @@ function renderPrice() {
       smooth: true,
       showSymbol: false,
       data: priceSeries.map(p => [p.t, p.v]),
-      lineStyle: { color: '#2563eb', width: 2 },
-      areaStyle: { color: 'rgba(37, 99, 235, 0.08)' },
+      lineStyle: { color: lineColor, width: 2 },
+      itemStyle: { color: lineColor },
+      areaStyle: { color: lineColor, opacity: 0.1 },
     }],
   })
 }
@@ -224,6 +238,10 @@ function onResize() {
   if (kchart) kchart.resize()
 }
 
+function onThemeChange() {
+  renderPrice()
+}
+
 function pauseMarketTransport() {
   stopResyncTimer()
   closeMarketWs()
@@ -243,6 +261,7 @@ onMounted(async () => {
   await reloadMarket()
   startResyncTimer()
   window.addEventListener('resize', onResize)
+  window.addEventListener('binance-trade-theme-change', onThemeChange)
   window.addEventListener('binance-trade-pause-live', pauseMarketTransport)
   window.addEventListener('binance-trade-resume-live', resumeMarketTransport)
 })
@@ -252,6 +271,7 @@ onUnmounted(() => {
   closeMarketWs()
   stopResyncTimer()
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('binance-trade-theme-change', onThemeChange)
   window.removeEventListener('binance-trade-pause-live', pauseMarketTransport)
   window.removeEventListener('binance-trade-resume-live', resumeMarketTransport)
   if (kchart) dispose(klineEl.value)
@@ -310,8 +330,10 @@ onUnmounted(() => {
 }
 
 .price-value {
-  color: #111827;
+  color: var(--bt-text);
   font-size: 22px;
   font-weight: 700;
+  line-height: 1;
+  transition: color 0.2s ease;
 }
 </style>
