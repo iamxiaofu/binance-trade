@@ -587,7 +587,7 @@ class _LLMProfileUpsert(BaseModel):
     model: str = Field(min_length=1, max_length=128)
     base_url: str | None = None
     timeout: float = Field(default=60.0, gt=0)
-    max_tokens: int = Field(default=1024, gt=0, le=8192)
+    max_tokens: int = Field(default=1024, gt=0, le=512000)
     max_retries: int = Field(default=2, ge=0, le=5)
     # 留空=不更新（PUT 时）；POST 时必填
     api_key: str = Field(default="", max_length=512)

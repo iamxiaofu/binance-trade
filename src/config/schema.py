@@ -210,7 +210,7 @@ class LLMProfile(_Base):
     model: str = Field(min_length=1, max_length=128)
     base_url: str | None = None
     timeout: float = Field(default=60.0, gt=0)
-    max_tokens: int = Field(default=1024, gt=0, le=8192)
+    max_tokens: int = Field(default=1024, gt=0, le=512000)
     max_retries: int = Field(default=2, ge=0, le=5)
     is_active: bool = False
     # keyring 引用，格式 "profile://<service>/<name>"，明文不写库

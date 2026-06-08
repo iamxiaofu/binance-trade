@@ -254,7 +254,7 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
           </template>
         </el-table-column>
         <el-table-column prop="timeout" label="timeout" width="80" />
-        <el-table-column prop="max_tokens" label="max_tokens" width="100" />
+        <el-table-column prop="max_tokens" label="max_tokens" min-width="100" />
         <el-table-column label="key" width="80">
           <template #default="{ row }">
             <el-tag v-if="row.key_present" type="success" size="small">已存</el-tag>
@@ -318,7 +318,14 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
           <el-input-number v-model="form.timeout" :min="5" :max="300" />
         </el-form-item>
         <el-form-item label="max_tokens">
-          <el-input-number v-model="form.max_tokens" :min="64" :max="8192" :step="64" />
+          <el-input-number v-model="form.max_tokens" :min="64" :max="512000" :step="64" />
+          <div
+            v-if="form.max_tokens > 8192"
+            class="hint-warn"
+            style="font-size:12px; color:#e6a23c; margin-top:4px"
+          >
+            ⚠ 已超过多数模型默认上限 8192；少数模型（如部分长上下文变体）支持更大值，请确认你的模型/中转实际支持
+          </div>
         </el-form-item>
         <el-form-item label="max_retries">
           <el-input-number v-model="form.max_retries" :min="0" :max="5" />
