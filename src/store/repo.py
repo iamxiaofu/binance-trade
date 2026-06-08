@@ -27,6 +27,7 @@ from src.store.models import (
     DecisionRow,
     OpenOrderRow,
     OrderRow,
+    PositionClaimRow,
     PositionSnapshotRow,
     RejectRow,
     RuntimeSettingRow,
@@ -82,8 +83,9 @@ _SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
-_TRIGGERED_CONDITION_STATUSES = {"filled", "partial"}
+_TRIGGERED_CONDITION_STATUSES = {"filled", "partial", "triggered"}
 _OPEN_TRADE_STATUSES = {"open", "partial"}
+_ACTIVE_CLAIM_STATUSES = {"opening", "submitted", "protecting"}
 
 
 def _safe_float(value: Any) -> float:
@@ -410,6 +412,88 @@ class Store:
                 runtime.updated_at = now
             await session.commit()
 
+    # ---------- 仓位所有权声明 ----------
+    async def begin_position_claim(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        planned_qty: float,
+        source: str = "strategy",
+        ttl_ms: int = 300_000,
+        reason: str = "",
+    ) -> int:
+        """在发出交易所开仓前声明本地所有权，避免部分成交竞态误判为外部仓位。"""
+        import time as _t
+
+        symbol = normalize_symbol(symbol)
+        now_ms = int(_t.time() * 1000)
+        now = _now_iso_utc()
+        async with self._sessionmaker() as session:
+            row = PositionClaimRow(
+                symbol=symbol,
+                side=(side or "").lower(),
+                status="opening",
+                source=source[:16],
+                planned_qty=planned_qty,
+                expires_at_ms=now_ms + max(int(ttl_ms), 1),
+                reason=reason[:240],
+                updated_at=now,
+            )
+            session.add(row)
+            await session.flush()
+            claim_id = row.id
+            await session.commit()
+            return claim_id
+
+    async def finish_position_claim(
+        self,
+        claim_id: int,
+        *,
+        status: str,
+        filled_qty: float = 0.0,
+        entry_price: float = 0.0,
+        client_order_id: str = "",
+        reason: str = "",
+        raw: dict[str, Any] | None = None,
+    ) -> None:
+        now = _now_iso_utc()
+        async with self._sessionmaker() as session:
+            row = await session.get(PositionClaimRow, claim_id)
+            if row is None:
+                return
+            row.status = status[:24]
+            row.filled_qty = _safe_float(filled_qty)
+            row.entry_price = _safe_float(entry_price)
+            if client_order_id:
+                row.client_order_id = client_order_id[:64]
+            row.reason = reason[:240]
+            row.updated_at = now
+            if raw is not None:
+                try:
+                    row.raw_json = json.dumps(raw, ensure_ascii=False, default=str)[:8000]
+                except Exception:
+                    row.raw_json = ""
+            await session.commit()
+
+    async def has_active_position_claim(self, symbol: str) -> bool:
+        import time as _t
+
+        symbol = normalize_symbol(symbol)
+        now_ms = int(_t.time() * 1000)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(PositionClaimRow.id)
+                    .where(PositionClaimRow.symbol == symbol)
+                    .where(PositionClaimRow.status.in_(tuple(_ACTIVE_CLAIM_STATUSES)))
+                    .where(PositionClaimRow.expires_at_ms >= now_ms)
+                    .order_by(PositionClaimRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return row is not None
+
     async def backfill_trades(self) -> int:
         """把没有 trade_id 的历史订单按仓位生命周期归组，幂等执行。"""
         async with self._sessionmaker() as session:
@@ -486,7 +570,12 @@ class Store:
             row = self._order_row_from_dict(order)
             session.add(row)
             await session.flush()
-            await self._attach_order_to_trade(session, row, source="live", confidence="exact")
+            await self._attach_order_to_trade(
+                session,
+                row,
+                source=str(order.get("source") or "live")[:16],
+                confidence=str(order.get("confidence") or "exact")[:16],
+            )
             await session.commit()
             return {"order_id": row.id, "trade_id": row.trade_id}
 
@@ -763,6 +852,100 @@ class Store:
             await session.commit()
             return changed
 
+    async def sync_condition_order_history(
+        self,
+        *,
+        symbol: str,
+        live_exchange_order_ids: set[str],
+        history_orders: list[dict[str, Any]],
+    ) -> int:
+        """持仓仍存在时同步已不在 open 列表里的条件单终态。
+
+        只在交易所历史明确返回 filled/triggered/canceled/expired 时更新，避免把 API
+        分页缺失误判成取消。
+        """
+        symbol = normalize_symbol(symbol)
+        live_ids = {str(x) for x in live_exchange_order_ids if str(x)}
+        history_by_id = {
+            str(order.get("id") or ""): order
+            for order in history_orders
+            if str(order.get("id") or "")
+        }
+        if not history_by_id:
+            return 0
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(OrderRow)
+                    .where(OrderRow.symbol == symbol)
+                    .where(OrderRow.client_kind.in_(("SL", "TP")))
+                    .where(OrderRow.dry_run.is_(False))
+                    .where(OrderRow.status.in_(("placed", "open")))
+                )
+            ).scalars().all()
+            changed = 0
+            for row in rows:
+                if row.exchange_order_id and row.exchange_order_id in live_ids:
+                    continue
+                hist = history_by_id.get(str(row.exchange_order_id or ""))
+                if not hist:
+                    continue
+                status = str(hist.get("status") or "").lower()
+                if status in _TRIGGERED_CONDITION_STATUSES:
+                    row.status = "filled"
+                    qty = _safe_float(hist.get("filled_qty")) or _safe_float(hist.get("qty")) or row.qty
+                    price = (
+                        _safe_float(hist.get("filled_price"))
+                        or _safe_float(hist.get("avg_price"))
+                        or _safe_float(hist.get("price"))
+                        or _safe_float(hist.get("trigger_price"))
+                        or row.price
+                    )
+                    if qty > 0:
+                        row.qty = qty
+                    if price > 0:
+                        row.notional = abs(row.qty * price)
+                    self._merge_order_raw(row, {"condition_history": hist, "filled_price": price, "filled_qty": row.qty})
+                    await self._refresh_trade_for_existing_order(session, row)
+                    if row.trade_id:
+                        counterparts = (
+                            await session.execute(
+                                select(OrderRow)
+                                .where(OrderRow.trade_id == row.trade_id)
+                                .where(OrderRow.id != row.id)
+                                .where(OrderRow.client_kind.in_(("SL", "TP")))
+                                .where(OrderRow.status.in_(("placed", "open")))
+                            )
+                        ).scalars().all()
+                        for other in counterparts:
+                            if other.exchange_order_id and other.exchange_order_id in live_ids:
+                                continue
+                            other.status = "canceled"
+                            self._merge_order_raw(other, {"canceled_by_condition": row.exchange_order_id})
+                    changed += 1
+                    continue
+                if status in {"canceled", "cancelled", "expired", "rejected"}:
+                    row.status = "canceled" if status == "cancelled" else status
+                    self._merge_order_raw(row, {"condition_history": hist})
+                    await self._refresh_trade_for_existing_order(session, row)
+                    changed += 1
+            await session.commit()
+            return changed
+
+    @staticmethod
+    def _merge_order_raw(row: OrderRow, extra: dict[str, Any]) -> None:
+        try:
+            raw = json.loads(row.raw_json or "{}")
+            if not isinstance(raw, dict):
+                raw = {"raw": raw}
+        except Exception:
+            raw = {}
+        raw.update(extra)
+        try:
+            row.raw_json = json.dumps(raw, ensure_ascii=False, default=str)[:8000]
+        except Exception:
+            pass
+
     async def _refresh_trade_for_existing_order(self, session: AsyncSession, row: OrderRow) -> None:
         if row.client_kind not in ("SL", "TP", "CLOSE"):
             return
@@ -959,6 +1142,80 @@ class Store:
                 )
             ).scalar_one_or_none()
             return row is not None
+
+    async def open_trade_qty(self, symbol: str) -> float:
+        """返回本地仍打开的 managed 数量合计，用于识别交易所剩余/人工仓位。"""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(TradeRow)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                )
+            ).scalars().all()
+            qty = 0.0
+            for row in rows:
+                qty += max(float(row.qty_opened or 0.0) - float(row.qty_closed or 0.0), 0.0)
+            return qty
+
+    async def ensure_takeover_trade(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        qty: float,
+        entry_price: float,
+        leverage: int = 0,
+        source: str = "takeover",
+    ) -> int:
+        """为人工确认接管的剩余仓位创建或复用一条 open trade。"""
+        symbol = normalize_symbol(symbol)
+        direction = (direction or "").lower()
+        qty = _safe_float(qty)
+        entry_price = _safe_float(entry_price)
+        async with self._sessionmaker() as session:
+            existing = (
+                await session.execute(
+                    select(TradeRow)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.direction == direction)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                    .where(TradeRow.source == source)
+                    .order_by(TradeRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is not None and self._qty_matches(existing.qty_opened, qty):
+                return existing.id
+
+            import time as _t
+
+            now_ms = int(_t.time() * 1000)
+            now = _now_iso_utc()
+            notional = abs(qty * entry_price)
+            trade = TradeRow(
+                ts_ms=now_ms,
+                created_at=now,
+                symbol=symbol,
+                direction=direction,
+                status="open",
+                dry_run=False,
+                opened_at_ms=now_ms,
+                opened_at=now,
+                entry_price=entry_price,
+                qty_opened=qty,
+                leverage=leverage,
+                entry_notional=notional,
+                entry_margin=_margin(notional, leverage),
+                source=source[:16],
+                confidence="manual",
+            )
+            session.add(trade)
+            await session.flush()
+            trade_id = trade.id
+            await session.commit()
+            return trade_id
 
     async def snapshot_balance(
         self,

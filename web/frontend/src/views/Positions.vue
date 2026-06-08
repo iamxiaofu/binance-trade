@@ -7,6 +7,15 @@ import { orderStatusLabel } from '../labels'
 
 const live = useLiveStore()
 const repairing = ref({})
+const takeoverVisible = ref(false)
+const takeoverSubmitting = ref(false)
+const takeoverRow = ref(null)
+const takeoverForm = ref({
+  qty: '',
+  sl: '',
+  tp: '',
+  confirm: false,
+})
 const positions = computed(() => live.positions || [])
 const positionsSource = computed(() => live.summary?.positions_source || 'db_snapshot')
 const positionsError = computed(() => live.summary?.positions_error || '')
@@ -79,6 +88,71 @@ async function repairProtection(row) {
     const next = { ...repairing.value }
     delete next[symbol]
     repairing.value = next
+  }
+}
+
+function openTakeover(row) {
+  takeoverRow.value = row
+  takeoverForm.value = {
+    qty: row.contracts || '',
+    sl: '',
+    tp: row.protection?.tp?.trigger_price || row.protection?.tp?.price || '',
+    confirm: false,
+  }
+  takeoverVisible.value = true
+}
+
+function recomputeTakeover() {
+  const row = takeoverRow.value
+  if (!row) return
+  const mark = Number(row.mark_price || 0)
+  const entry = Number(row.entry_price || 0)
+  if (!Number.isFinite(mark) || mark <= 0 || !Number.isFinite(entry) || entry <= 0) return
+  if (row.side === 'long') {
+    takeoverForm.value.sl = (mark * 0.99).toFixed(2)
+    takeoverForm.value.tp = (entry * 1.02).toFixed(2)
+  } else if (row.side === 'short') {
+    takeoverForm.value.sl = (mark * 1.01).toFixed(2)
+    takeoverForm.value.tp = (entry * 0.98).toFixed(2)
+  }
+}
+
+async function submitTakeover() {
+  const row = takeoverRow.value
+  if (!row) return
+  if (!takeoverForm.value.confirm) {
+    ElMessage.error('请先确认接管当前持仓')
+    return
+  }
+  const sl = Number(takeoverForm.value.sl)
+  const qty = Number(takeoverForm.value.qty)
+  if (!Number.isFinite(sl) || sl <= 0 || !Number.isFinite(qty) || qty <= 0) {
+    ElMessage.error('请输入有效的接管数量和止损触发价')
+    return
+  }
+  const tp = Number(takeoverForm.value.tp)
+  const payload = {
+    symbol: row.symbol,
+    mode: 'manual',
+    qty,
+    sl_trigger: sl,
+    confirm: true,
+    position: {
+      side: row.side,
+      qty: row.contracts,
+      entry: row.entry_price,
+    },
+  }
+  if (Number.isFinite(tp) && tp > 0) payload.tp_trigger = tp
+  takeoverSubmitting.value = true
+  try {
+    const res = await api.command('PROTECT_POSITION', JSON.stringify(payload))
+    ElMessage.success(`${row.symbol} 接管保护命令已入队 (#${res.id})`)
+    takeoverVisible.value = false
+  } catch (e) {
+    ElMessage.error(`接管保护命令下发失败: ${e.message}`)
+  } finally {
+    takeoverSubmitting.value = false
   }
 }
 </script>
@@ -182,23 +256,62 @@ async function repairProtection(row) {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="保护操作" width="170" fixed="right">
+        <el-table-column label="保护操作" width="240" fixed="right">
           <template #default="{ row }">
-            <el-button
-              v-if="needsRepair(row)"
-              type="danger"
-              size="small"
-              :icon="'CirclePlus'"
-              :loading="isRepairing(row)"
-              @click="repairProtection(row)"
-            >
-              补止盈止损
-            </el-button>
+            <div v-if="needsRepair(row)" class="action-buttons">
+              <el-button
+                type="danger"
+                size="small"
+                :icon="'CirclePlus'"
+                :loading="isRepairing(row)"
+                @click="repairProtection(row)"
+              >
+                历史补单
+              </el-button>
+              <el-button size="small" @click="openTakeover(row)">接管保护</el-button>
+            </div>
             <el-tag v-else type="success" size="small">{{ missingProtectionText(row) }}</el-tag>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-dialog v-model="takeoverVisible" title="接管保护" width="520px">
+      <el-form v-if="takeoverRow" label-width="120px">
+        <el-form-item label="币种">
+          <span class="mono">{{ takeoverRow.symbol }}</span>
+        </el-form-item>
+        <el-form-item label="方向/数量">
+          <span class="mono">{{ takeoverRow.side }} / {{ fmt(takeoverRow.contracts) }}</span>
+        </el-form-item>
+        <el-form-item label="开仓价/标记价">
+          <span class="mono">{{ fmt(takeoverRow.entry_price, 2) }} / {{ fmt(takeoverRow.mark_price, 2) }}</span>
+        </el-form-item>
+        <el-form-item label="接管数量">
+          <el-input v-model="takeoverForm.qty" class="protect-input" />
+        </el-form-item>
+        <el-form-item label="止损触发价">
+          <el-input v-model="takeoverForm.sl" class="protect-input" />
+        </el-form-item>
+        <el-form-item label="止盈触发价">
+          <el-input v-model="takeoverForm.tp" class="protect-input" />
+        </el-form-item>
+        <el-form-item>
+          <el-button size="small" @click="recomputeTakeover">按当前价重算</el-button>
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="takeoverForm.confirm">
+            确认用以上触发价接管当前交易所持仓
+          </el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="takeoverVisible = false">取消</el-button>
+        <el-button type="danger" :loading="takeoverSubmitting" @click="submitTakeover">
+          提交接管
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -217,5 +330,15 @@ async function repairProtection(row) {
   gap: 10px;
   color: #909399;
   font-size: 13px;
+}
+
+.action-buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.protect-input {
+  width: 180px;
 }
 </style>

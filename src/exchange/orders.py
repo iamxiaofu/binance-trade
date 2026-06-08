@@ -65,6 +65,8 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
     qty = abs(_float(_value(o, info, "amount", "quantity", "origQty")))
     trigger = _float(_value(o, info, "triggerPrice", "stopPrice"))
     price = _float(_value(o, info, "price"))
+    filled_qty = abs(_float(_value(o, info, "filled", "filledQty", "executedQty", "actualQty")))
+    filled_price = _float(_value(o, info, "average", "avgPrice", "actualPrice"))
     ts_ms = int(_float(_value(o, info, "updateTime", "timestamp", "createTime")))
     if not ts_ms:
         ts_ms = int(_float(_value(o, info, "timestamp", "createTime")))
@@ -77,6 +79,9 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
         "order_type": order_type,
         "qty": qty,
         "price": price,
+        "filled_qty": filled_qty,
+        "filled_price": filled_price,
+        "avg_price": filled_price,
         "trigger_price": trigger,
         "status": _status(o, info),
         "raw_status": str(_value(o, info, "status", "algoStatus") or ""),

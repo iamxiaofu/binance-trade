@@ -148,6 +148,27 @@ class TradeRow(Base):
     confidence: Mapped[str] = mapped_column(String(16), default="exact")
 
 
+class PositionClaimRow(Base):
+    """开仓中的仓位所有权声明，避免交易所成交早于本地 trade 落库时被误判。"""
+    __tablename__ = "position_claims"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    side: Mapped[str] = mapped_column(String(8), default="", index=True)  # long/short
+    status: Mapped[str] = mapped_column(String(24), default="opening", index=True)
+    source: Mapped[str] = mapped_column(String(16), default="strategy")
+    planned_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    filled_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    client_order_id: Mapped[str] = mapped_column(String(64), default="")
+    expires_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    reason: Mapped[str] = mapped_column(String(240), default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+
+
 class OpenOrderRow(Base):
     """启动对账时从交易所拉取的未完成挂单快照（用于恢复 SL/TP 等挂单）。"""
     __tablename__ = "open_orders"
@@ -248,7 +269,7 @@ class ControlCommandRow(Base):
     ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
     created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
     command: Mapped[str] = mapped_column(String(32), index=True)  # PAUSE/RESUME/etc.
-    arg: Mapped[str] = mapped_column(String(64), default="")       # 命令参数
+    arg: Mapped[str] = mapped_column(Text, default="")             # 命令参数
     source: Mapped[str] = mapped_column(String(32), default="web")
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending/done/failed
     result: Mapped[str] = mapped_column(String(300), default="")

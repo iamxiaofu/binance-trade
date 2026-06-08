@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 from decimal import Decimal
 
@@ -46,6 +47,10 @@ class FakeStore:
         self.balance_snapshots = []
         self.open_order_snapshots = []
         self.open_trades = set()
+        self.active_claims = set()
+        self.claims = []
+        self.takeover_trades = []
+        self.open_qty = {}
         self.symbols = {
             "BTCUSDT": {
                 "symbol": "BTCUSDT",
@@ -69,6 +74,10 @@ class FakeStore:
 
     async def log_order(self, order):
         self.orders.append(order)
+        if order.get("kind") == "OPEN" and order.get("filled"):
+            self.open_trades.add(order["symbol"])
+            self.open_qty[order["symbol"]] = self.open_qty.get(order["symbol"], 0.0) + float(order.get("qty") or 0.0)
+        return {"order_id": len(self.orders), "trade_id": int(order.get("trade_id") or len(self.orders))}
 
     async def snapshot_positions(self, positions, symbols=None):
         self.position_snapshots.append((positions, symbols))
@@ -112,6 +121,36 @@ class FakeStore:
 
     async def has_open_trade(self, symbol):
         return symbol in self.open_trades
+
+    async def open_trade_qty(self, symbol):
+        return self.open_qty.get(symbol, 0.0) if symbol in self.open_trades else 0.0
+
+    async def begin_position_claim(self, **kw):
+        claim_id = len(self.claims) + 1
+        self.claims.append({"id": claim_id, **kw, "status": "opening"})
+        self.active_claims.add(kw["symbol"])
+        return claim_id
+
+    async def finish_position_claim(self, claim_id, **kw):
+        for row in self.claims:
+            if row["id"] == claim_id:
+                row.update(kw)
+                row["status"] = kw.get("status", row.get("status"))
+                self.active_claims.discard(row["symbol"])
+                return
+
+    async def has_active_position_claim(self, symbol):
+        return symbol in self.active_claims
+
+    async def sync_condition_order_history(self, **kw):
+        return 0
+
+    async def ensure_takeover_trade(self, **kw):
+        trade_id = len(self.takeover_trades) + 100
+        self.takeover_trades.append({"id": trade_id, **kw})
+        self.open_trades.add(kw["symbol"])
+        self.open_qty[kw["symbol"]] = float(kw.get("qty") or 0.0)
+        return trade_id
 
     async def sync_config_symbols(self, symbols):
         for symbol in symbols:
@@ -193,6 +232,9 @@ class FakeClient:
     async def fetch_open_condition_orders(self, symbol):
         return self.condition_orders
 
+    async def fetch_condition_orders(self, symbol, limit=20):
+        return []
+
     async def fetch_positions(self, symbols=None):
         return self.positions
 
@@ -209,6 +251,14 @@ class FakeClient:
         return {"fundingRate": 0.0}
 
     async def ensure_symbol(self, symbol):
+        return SymbolFilters(
+            tick_size=Decimal("0.01"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            min_notional=Decimal("5"),
+        )
+
+    def filters(self, symbol):
         return SymbolFilters(
             tick_size=Decimal("0.01"),
             step_size=Decimal("0.001"),
@@ -447,6 +497,25 @@ async def test_reconcile_disables_enabled_unmanaged_position_without_auto_close(
     assert any("no local open trade" in msg for _event, msg in eng._notifier.events)
 
 
+async def test_reconcile_waits_for_active_opening_claim(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.active_claims.add("BTCUSDT")
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.orders == []
+    assert not any("no local open trade" in msg for _event, msg in eng._notifier.events)
+
+
 async def test_reconcile_enforces_managed_position_missing_stop(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._store.open_trades.add("BTCUSDT")
@@ -575,6 +644,44 @@ class MissingStopExecutor(FakeExecutor):
                 "entry_price": float(position.get("entryPrice") or 0),
                 "pos_side": (position.get("side") or "").lower(),
                 "id": "close-1", "side": "buy"}
+
+
+class TinyPartialExecutor(FakeExecutor):
+    def __init__(self):
+        super().__init__()
+        self.closed = 0
+
+    async def open_position(self, *, decision, qty, price):
+        return {"symbol": decision.symbol, "kind": "OPEN", "status": "partial",
+                "filled": True, "opened": True, "qty": 0.001, "price": price,
+                "notional": 0.1, "dry_run": False, "side": "buy", "id": "open-tiny"}
+
+    async def close_position(self, position, *, mode=None):
+        self.closed += 1
+        return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "filled",
+                "filled": True, "closed": True, "dry_run": False,
+                "qty": abs(float(position.get("contracts") or 0)),
+                "price": float(position.get("markPrice") or 0),
+                "entry_price": float(position.get("entryPrice") or 0),
+                "pos_side": (position.get("side") or "").lower(),
+                "id": "close-tiny", "side": "sell"}
+
+
+async def test_open_tiny_partial_closes_when_protection_below_min(settings, creds, monkeypatch):
+    settings.risk.max_leverage = 5
+    settings.risk.min_confidence = 0.6
+    eng = _engine(settings, creds, monkeypatch)
+    eng._executor = TinyPartialExecutor()
+    decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
+                             size_pct=0.05, leverage=2, stop_loss_pct=0.02,
+                             take_profit_pct=0.04, reason="ok")
+
+    await eng._handle_open(decision, _ctx())
+
+    assert eng._executor.closed == 1
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert [o["kind"] for o in eng._store.orders] == ["OPEN", "CLOSE"]
+    assert eng._store.claims[0]["status"] == "partial"
 
 
 async def test_open_closes_position_when_stop_not_confirmed(settings, creds, monkeypatch):
@@ -1056,6 +1163,36 @@ async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, cred
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert eng._store.marked[0][1] == "failed"
     assert "陈旧条件单" in eng._store.marked[0][2]
+
+
+async def test_command_protect_position_uses_manual_stop_for_takeover(settings, creds, monkeypatch):
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+            "markPrice": 99.0,
+            "leverage": 2,
+        },
+        equity=1000.0,
+    )
+    payload = {
+        "symbol": "BTCUSDT",
+        "qty": 0.1,
+        "sl_trigger": 98.0,
+        "confirm": True,
+        "position": {"side": "long", "qty": 0.1, "entry": 100.0},
+    }
+
+    result = await eng._exec_command("PROTECT_POSITION", json.dumps(payload))
+
+    assert "已接管保护 SL@98.00" in result
+    assert eng._store.takeover_trades
+    assert [o["kind"] for o in eng._store.orders] == ["SL"]
+    assert eng._store.orders[0]["trade_id"] == eng._store.takeover_trades[0]["id"]
 
 
 async def test_command_unknown_marked_failed(settings, creds, monkeypatch):

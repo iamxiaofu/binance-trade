@@ -10,13 +10,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from loguru import logger
 
 from src.config.schema import Credentials, ExecutionMode, Settings
 from src.exchange.client import ExchangeClient
-from src.exchange.filters import round_price
+from src.exchange.filters import normalize_order, round_price
 from src.exchange.market_data import MarketData
 from src.exchange.orders import normalize_condition_order
 from src.exchange.positions import normalize_position, normalize_symbol
@@ -34,6 +35,7 @@ from src.throttle.gate import should_call_llm
 _RECONCILE_ACTIVE_INTERVAL_SECONDS = 15.0
 _RECONCILE_IDLE_INTERVAL_SECONDS = 30.0
 _COMMAND_POLL_INTERVAL_SECONDS = 1.0
+_ENTRY_CLAIM_TTL_MS = 300_000
 
 
 class TradingEngine:
@@ -279,6 +281,8 @@ class TradingEngine:
             return "trading engine stopped; positions/orders untouched"
         if name == "REPAIR_SL_TP":
             return await self._repair_sl_tp(arg)
+        if name == "PROTECT_POSITION":
+            return await self._protect_position(arg)
         raise ValueError(f"unknown command: {name}")
 
     async def _apply_runtime_settings(self) -> None:
@@ -679,6 +683,215 @@ class TradingEngine:
         )
         return "；".join(parts)
 
+    async def _protect_position(self, arg: str) -> str:
+        """人工确认后，为当前交易所剩余/接管持仓按新触发价挂保护单。"""
+        try:
+            payload = json.loads(arg or "{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"PROTECT_POSITION requires JSON arg: {e}") from e
+        if not isinstance(payload, dict):
+            raise ValueError("PROTECT_POSITION arg must be a JSON object")
+        if not bool(payload.get("confirm")):
+            raise ValueError("PROTECT_POSITION requires confirm=true")
+
+        symbol = normalize_symbol(str(payload.get("symbol") or ""))
+        if not symbol:
+            raise ValueError("PROTECT_POSITION requires symbol")
+        if symbol not in self._tracked_symbols():
+            raise ValueError(f"symbol not registered: {symbol}")
+
+        position = await self._fetch_exchange_position(symbol)
+        if position is None:
+            return f"{symbol}: 交易所当前无持仓，不需要接管保护"
+        side = position["side"]
+        live_qty = float(position["contracts"] or 0.0)
+        entry = float(position["entry_price"] or 0.0)
+        mark = await self._current_mark_price(symbol, position)
+        position["mark_price"] = mark
+        if side not in ("long", "short") or live_qty <= 0 or entry <= 0 or mark <= 0:
+            raise ValueError(
+                f"{symbol}: 持仓数据不完整，无法接管保护 "
+                f"(side={side}, qty={live_qty}, entry={entry}, mark={mark})"
+            )
+
+        observed = payload.get("position") if isinstance(payload.get("position"), dict) else {}
+        self._validate_position_signature(
+            symbol=symbol,
+            side=side,
+            qty=live_qty,
+            entry=entry,
+            observed=observed,
+        )
+
+        target_qty = float(payload.get("qty") or live_qty)
+        qty_tol = max(abs(live_qty) * 1e-6, 1e-12)
+        if target_qty <= 0 or target_qty - live_qty > qty_tol:
+            raise ValueError(f"{symbol}: 接管数量 {target_qty:g} 必须大于 0 且不超过当前持仓 {live_qty:g}")
+
+        close_side = "sell" if side == "long" else "buy"
+        active_orders = await self._active_protection_orders(symbol)
+        await self._sync_condition_history(symbol, active_orders)
+        stale = self._stale_protection_orders(
+            active_orders,
+            side=side,
+            close_side=close_side,
+            qty=target_qty,
+            entry=entry,
+            mark=mark,
+        )
+        if stale:
+            remaining = await self._cancel_stale_condition_orders(
+                symbol=symbol,
+                orders=[order for order, _reason in stale],
+                reason="protect_position",
+            )
+            if remaining:
+                details = ", ".join(self._condition_order_label(order) for order in remaining)
+                await self._disable_symbol_due_stale_conditions(symbol, details)
+                raise ValueError(f"{symbol}: 存在无法撤销的陈旧条件单，已禁用该标的新开仓: {details}")
+            active_orders = await self._active_protection_orders(symbol)
+
+        equity = await self._current_equity()
+        specs: list[tuple[str, str, float]] = []
+        skipped: list[str] = []
+        errors: list[str] = []
+        triggers = self._manual_protection_triggers(payload, side=side, entry=entry, mark=mark)
+        if not triggers.get("SL") and not self._has_active_protection(
+            active_orders, kind="SL", close_side=close_side, side=side,
+            qty=target_qty, entry=entry, mark=mark,
+        ):
+            raise ValueError(f"{symbol}: 当前缺少止损，接管保护必须提供新的 SL trigger")
+
+        filters = self._client.filters(symbol)
+        for kind in ("SL", "TP"):
+            trigger = float(triggers.get(kind) or 0.0)
+            if trigger <= 0:
+                continue
+            trigger = float(round_price(trigger, filters))
+            if self._has_active_protection(
+                active_orders,
+                kind=kind,
+                close_side=close_side,
+                side=side,
+                qty=target_qty,
+                entry=entry,
+                mark=mark,
+            ):
+                skipped.append(f"{kind}: 已有有效条件单")
+                continue
+            reason = self._validate_repair_trigger(
+                symbol=symbol,
+                side=side,
+                kind=kind,
+                trigger=trigger,
+                entry=entry,
+                mark=mark,
+                qty=target_qty,
+                equity=equity,
+            )
+            if reason:
+                errors.append(f"{kind}@{trigger:.2f}: {reason}")
+                continue
+            if normalize_order(qty=target_qty, price=trigger, f=filters, is_market=True) is None:
+                errors.append(f"{kind}@{trigger:.2f}: 数量/名义价值低于交易所最小限制")
+                continue
+            otype = "STOP_MARKET" if kind == "SL" else "TAKE_PROFIT_MARKET"
+            specs.append((kind, otype, trigger))
+
+        if errors:
+            raise ValueError(f"{symbol}: 接管保护参数无效；" + "；".join(errors))
+        if not specs:
+            return f"{symbol}: 无需补挂新保护单" + (f"；{'; '.join(skipped)}" if skipped else "")
+
+        trade_id = 0
+        managed_qty = await self._store.open_trade_qty(symbol)
+        managed_tol = max(abs(target_qty) * 1e-6, 1e-12)
+        if managed_qty <= 0 or abs(managed_qty - target_qty) > managed_tol:
+            trade_id = await self._store.ensure_takeover_trade(
+                symbol=symbol,
+                direction=side,
+                qty=target_qty,
+                entry_price=entry,
+                leverage=int(position.get("leverage") or 0),
+            )
+
+        results = await self._executor.place_protection_orders(
+            symbol=symbol,
+            pos_side=side,
+            qty=target_qty,
+            specs=specs,
+        )
+        for order in results:
+            if trade_id > 0:
+                order["trade_id"] = trade_id
+            await self._store.log_order(order)
+
+        placed = [
+            f"{o['kind']}@{float(o.get('price') or 0.0):.2f}"
+            for o in results
+            if o.get("status") == "placed"
+        ]
+        failed = [
+            f"{o.get('kind')}:{(o.get('raw') or {}).get('error') or o.get('status')}"
+            for o in results
+            if o.get("status") != "placed"
+        ]
+        self.runtime.mark_order_event(symbol)
+        if not placed:
+            raise ValueError(f"{symbol}: 接管保护下发失败；" + "；".join(failed))
+        parts = [f"{symbol}: 已接管保护 {', '.join(placed)}"]
+        if skipped:
+            parts.append("跳过: " + "；".join(skipped))
+        if failed:
+            parts.append("下发失败: " + "；".join(failed))
+        return "；".join(parts)
+
+    @staticmethod
+    def _validate_position_signature(
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        entry: float,
+        observed: dict,
+    ) -> None:
+        if not observed:
+            return
+        obs_side = str(observed.get("side") or "").lower()
+        obs_qty = float(observed.get("qty") or observed.get("contracts") or 0.0)
+        obs_entry = float(observed.get("entry") or observed.get("entry_price") or 0.0)
+        qty_tol = max(abs(qty) * 1e-6, 1e-12)
+        entry_tol = max(abs(entry) * 1e-6, 1e-8)
+        if obs_side and obs_side != side:
+            raise ValueError(f"{symbol}: 页面持仓方向已过期，请刷新后重试")
+        if obs_qty > 0 and abs(obs_qty - qty) > qty_tol:
+            raise ValueError(f"{symbol}: 页面持仓数量已过期，请刷新后重试")
+        if obs_entry > 0 and abs(obs_entry - entry) > entry_tol:
+            raise ValueError(f"{symbol}: 页面开仓价已过期，请刷新后重试")
+
+    @staticmethod
+    def _manual_protection_triggers(
+        payload: dict,
+        *,
+        side: str,
+        entry: float,
+        mark: float,
+    ) -> dict[str, float]:
+        mode = str(payload.get("mode") or "manual").lower()
+        if mode == "recompute":
+            sl_pct = float(payload.get("stop_loss_pct") or payload.get("sl_pct") or 0.0)
+            tp_pct = float(payload.get("take_profit_pct") or payload.get("tp_pct") or 0.0)
+            out: dict[str, float] = {}
+            if sl_pct > 0:
+                out["SL"] = mark * (1 - sl_pct) if side == "long" else mark * (1 + sl_pct)
+            if tp_pct > 0:
+                out["TP"] = entry * (1 + tp_pct) if side == "long" else entry * (1 - tp_pct)
+            return out
+        return {
+            "SL": float(payload.get("sl_trigger") or payload.get("sl") or 0.0),
+            "TP": float(payload.get("tp_trigger") or payload.get("tp") or 0.0),
+        }
+
     async def _fetch_exchange_position_raw(self, symbol: str) -> dict | None:
         positions = await self._client.fetch_positions([symbol])
         for raw in positions:
@@ -710,13 +923,117 @@ class TradingEngine:
         if has_stop:
             return
 
-        symbol = decision.symbol
-        await self._disable_symbol_due_protection_failure(
-            symbol, "SL protection was not confirmed after open"
+        await self._handle_unprotected_open_failure(
+            decision=decision,
+            open_result=open_result,
+            reason="SL protection was not confirmed after open",
+            protection_orders=protection_orders,
         )
-        await self._emergency_close_unprotected_position(
-            symbol,
-            reason="missing SL protection after open",
+
+    def _planned_protection_specs(
+        self,
+        decision: TradeDecision,
+        entry_price: float,
+    ) -> list[tuple[str, str, float]]:
+        """复用 executor 的触发价规则，提前做本地最小量校验。"""
+        symbol = decision.symbol
+        is_long = decision.action == Action.OPEN_LONG
+        filters = self._client.filters(symbol)
+        specs: list[tuple[str, str, float]] = []
+        if decision.stop_loss_pct > 0:
+            raw = entry_price * (1 - decision.stop_loss_pct) if is_long else entry_price * (1 + decision.stop_loss_pct)
+            specs.append(("SL", "STOP_MARKET", float(round_price(raw, filters))))
+        if decision.take_profit_pct > 0:
+            raw = entry_price * (1 + decision.take_profit_pct) if is_long else entry_price * (1 - decision.take_profit_pct)
+            specs.append(("TP", "TAKE_PROFIT_MARKET", float(round_price(raw, filters))))
+        return specs
+
+    def _protection_specs_reject_reason(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        specs: list[tuple[str, str, float]],
+    ) -> str:
+        if not specs:
+            return ""
+        filters = self._client.filters(symbol)
+        for kind, _otype, trigger in specs:
+            norm = normalize_order(qty=qty, price=trigger, f=filters, is_market=True)
+            if norm is None:
+                return f"{kind} qty={qty:g} trigger={trigger:g} below minQty/minNotional"
+        return ""
+
+    async def _handle_unprotected_open_failure(
+        self,
+        *,
+        decision: TradeDecision,
+        open_result: dict,
+        reason: str,
+        protection_orders: list[dict] | None = None,
+    ) -> None:
+        """系统成交后无法确认 SL 时，撤保护残单并只平掉本次成交数量。"""
+        symbol = decision.symbol
+        await self._disable_symbol_due_protection_failure(symbol, reason)
+        if protection_orders:
+            remaining = await self._cancel_symbol_condition_orders(
+                symbol, reason="protection_failed_after_open"
+            )
+            if remaining:
+                details = ", ".join(self._condition_order_label(order) for order in remaining)
+                await self._disable_symbol_due_stale_conditions(symbol, details)
+        await self._close_open_result_unprotected(
+            decision=decision,
+            open_result=open_result,
+            reason=reason,
+        )
+
+    async def _close_open_result_unprotected(
+        self,
+        *,
+        decision: TradeDecision,
+        open_result: dict,
+        reason: str,
+    ) -> None:
+        qty = abs(float(open_result.get("qty") or 0.0))
+        price = float(open_result.get("price") or 0.0)
+        if qty <= 0:
+            return
+        side = "long" if decision.action == Action.OPEN_LONG else "short"
+        raw_position = {
+            "symbol": decision.symbol,
+            "side": side,
+            "contracts": qty,
+            "entryPrice": price,
+            "markPrice": price,
+        }
+        result = await self._executor.close_position(
+            raw_position,
+            mode=ExecutionMode.MARKET_TAKER,
+        )
+        await self._store.log_order(result)
+        if not result.get("filled"):
+            logger.error("{} close unprotected open failed: {}", decision.symbol, result)
+            await self._notifier.send(
+                Event.ERROR,
+                f"{decision.symbol} unprotected open close failed: {result}",
+            )
+            return
+        pnl = realized_pnl(
+            side=result.get("pos_side", ""),
+            entry_price=result.get("entry_price", 0.0),
+            exit_price=result.get("price", 0.0),
+            qty=result.get("qty", 0.0),
+        )
+        self.runtime.add_realized_pnl(pnl)
+        self.runtime.mark_order_event(decision.symbol)
+        logger.error(
+            "{} closed unprotected filled qty={} pnl={:.2f} reason={}",
+            decision.symbol, result.get("qty"), pnl, reason,
+        )
+        await self._notifier.send(
+            Event.CLOSE,
+            f"{decision.symbol} closed unprotected filled qty={result.get('qty')} pnl={pnl:.2f}",
         )
 
     async def _disable_symbol_due_protection_failure(self, symbol: str, reason: str) -> None:
@@ -872,6 +1189,35 @@ class TradingEngine:
                 order["status"] = "placed"
                 out.append(order)
         return out
+
+    async def _sync_condition_history(self, symbol: str, active_orders: list[dict]) -> None:
+        if not hasattr(self._client, "fetch_condition_orders"):
+            return
+        live_ids = {str(order.get("id") or "") for order in active_orders if order.get("id")}
+        try:
+            history_raw = await self._client.fetch_condition_orders(symbol, limit=30)
+        except Exception as e:
+            logger.warning("fetch condition history {} failed: {}", symbol, e)
+            return
+        history: list[dict] = []
+        for raw in history_raw:
+            order = normalize_condition_order(raw)
+            if order["symbol"] != symbol or order["kind"] not in ("SL", "TP"):
+                continue
+            order["raw"] = raw
+            history.append(order)
+        if not history:
+            return
+        try:
+            changed = await self._store.sync_condition_order_history(
+                symbol=symbol,
+                live_exchange_order_ids=live_ids,
+                history_orders=history,
+            )
+            if changed:
+                logger.info("synced {} condition order history rows for {}", changed, symbol)
+        except Exception as e:
+            logger.warning("sync condition history {} failed: {}", symbol, e)
 
     def _has_active_protection(
         self,
@@ -1222,11 +1568,33 @@ class TradingEngine:
             await self._notifier.send(Event.REJECT, f"{symbol} {verdict.reason}")
             return
 
-        # 4. 执行（精度规整在 executor 内）
-        result = await self._executor.open_position(
-            decision=decision, qty=verdict.qty, price=ctx.last_price
+        # 4. 执行（精度规整在 executor 内）。先声明 ownership，避免 maker
+        # 部分成交早于本地 trade 落库时被周期对账误判成外部持仓。
+        claim_id = await self._store.begin_position_claim(
+            symbol=symbol,
+            side="long" if decision.action == Action.OPEN_LONG else "short",
+            planned_qty=verdict.qty,
+            ttl_ms=_ENTRY_CLAIM_TTL_MS,
+            reason="strategy open",
         )
-        logged = await self._store.log_order(result)
+        try:
+            result = await self._executor.open_position(
+                decision=decision, qty=verdict.qty, price=ctx.last_price
+            )
+            logged = await self._store.log_order(result)
+            await self._store.finish_position_claim(
+                claim_id,
+                status=str(result.get("status") or "unknown"),
+                filled_qty=float(result.get("qty") or 0.0) if result.get("filled") else 0.0,
+                entry_price=float(result.get("price") or 0.0),
+                client_order_id=str(result.get("client_order_id") or ""),
+                raw=result.get("raw") if isinstance(result.get("raw"), dict) else None,
+            )
+        except Exception as e:
+            await self._store.finish_position_claim(
+                claim_id, status="error", reason=str(e)[:240]
+            )
+            raise
         if result["status"] == "rejected":
             await self._notifier.send(Event.REJECT, f"{symbol} below min order")
             return
@@ -1244,6 +1612,19 @@ class TradingEngine:
                 f"notional={result['notional']:.2f}"
             )
             if self._settings.execution.attach_sl_tp:
+                specs = self._planned_protection_specs(decision, result["price"])
+                reject_reason = self._protection_specs_reject_reason(
+                    symbol=symbol,
+                    qty=float(result["qty"]),
+                    specs=specs,
+                )
+                if reject_reason:
+                    await self._handle_unprotected_open_failure(
+                        decision=decision,
+                        open_result=result,
+                        reason=f"protection order below exchange minimum: {reject_reason}",
+                    )
+                    return
                 sltp = await self._executor.place_sl_tp(
                     decision=decision, entry_price=result["price"], qty=result["qty"]
                 )
@@ -1449,6 +1830,7 @@ class TradingEngine:
                         await self._disable_symbol_due_stale_conditions(symbol, details)
                 continue
 
+            await self._sync_condition_history(symbol, active_orders)
             if not await self._should_enforce_position_protection(symbol, reason):
                 continue
 
@@ -1516,6 +1898,22 @@ class TradingEngine:
             return False
         if managed:
             return True
+        try:
+            claimed = await self._store.has_active_position_claim(symbol)
+        except Exception as e:
+            logger.warning(
+                "{} live position detected during {}, but position claim check failed: {}; "
+                "skip auto protection enforcement",
+                symbol, reason, e,
+            )
+            return False
+        if claimed:
+            logger.warning(
+                "{} live position detected during {}, but local entry claim is still active; "
+                "wait for open flow to finish",
+                symbol, reason,
+            )
+            return False
 
         self._symbol_enabled[symbol] = False
         await self._store.set_symbol_enabled(symbol, False)

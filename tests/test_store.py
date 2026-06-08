@@ -17,6 +17,7 @@ from src.store.models import (
     DecisionRow,
     OpenOrderRow,
     OrderRow,
+    PositionClaimRow,
     PositionSnapshotRow,
     RejectRow,
     RuntimeSettingRow,
@@ -187,6 +188,29 @@ async def test_has_open_trade_detects_local_managed_position(store):
     assert await store.has_open_trade("ETHUSDT") is False
 
 
+async def test_position_claim_lifecycle(store):
+    claim_id = await store.begin_position_claim(
+        symbol="BTCUSDT",
+        side="long",
+        planned_qty=0.01,
+        ttl_ms=60_000,
+        reason="test",
+    )
+
+    assert await store.has_active_position_claim("BTCUSDT") is True
+
+    await store.finish_position_claim(
+        claim_id,
+        status="partial",
+        filled_qty=0.01,
+        entry_price=100.0,
+        client_order_id="open-1",
+    )
+
+    assert await store.has_active_position_claim("BTCUSDT") is False
+    assert await _count(store, PositionClaimRow) == 1
+
+
 async def test_mark_condition_exit_closes_group_with_filled_price(store):
     opened = await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
@@ -221,6 +245,55 @@ async def test_mark_condition_exit_closes_group_with_filled_price(store):
     assert trade.realized_pnl == pytest.approx(9.5)
     assert by_kind["TP"].realized_pnl == pytest.approx(9.5)
     assert by_kind["SL"].status == "canceled"
+
+
+async def test_sync_condition_history_marks_triggered_stop_while_position_remains(store):
+    opened = await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "limit", "qty": 0.08, "price": 100.0,
+        "notional": 8.0, "dry_run": False, "status": "partial",
+        "id": "open", "raw": {}, "leverage": 2,
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "sell",
+        "order_type": "STOP_MARKET", "qty": 0.08, "price": 99.0,
+        "notional": 7.92, "dry_run": False, "status": "placed",
+        "id": "sl", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "sell",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 0.08, "price": 103.0,
+        "notional": 8.24, "dry_run": False, "status": "placed",
+        "id": "tp", "raw": {}, "trade_id": opened["trade_id"],
+    })
+
+    changed = await store.sync_condition_order_history(
+        symbol="BTCUSDT",
+        live_exchange_order_ids={"tp"},
+        history_orders=[
+            {
+                "id": "sl",
+                "symbol": "BTCUSDT",
+                "kind": "SL",
+                "status": "filled",
+                "qty": 0.08,
+                "filled_qty": 0.08,
+                "filled_price": 98.8,
+                "trigger_price": 99.0,
+            }
+        ],
+    )
+
+    assert changed == 1
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        rows = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
+    by_kind = {row.client_kind: row for row in rows}
+    assert trade.status == "closed"
+    assert trade.exit_reason == "SL"
+    assert by_kind["SL"].status == "filled"
+    assert by_kind["TP"].status == "placed"
 
 
 async def test_runtime_settings_upsert_and_list(store):
