@@ -111,3 +111,39 @@ def test_decide_with_trace_records_request_and_response(monkeypatch):
     assert "标的: BTCUSDT" in trace.user_prompt
     assert '"messages"' in trace.request_json
     assert '"final_decision"' in trace.response_json
+
+
+def test_decide_with_trace_records_latency_and_status(monkeypatch):
+    client = LLMClient(_cfg(max_retries=0), api_key="x")
+
+    async def fast(*a, **k):
+        await asyncio.sleep(0.05)
+        payload = {
+            "symbol": "BTCUSDT", "action": "HOLD", "confidence": 0.5,
+            "size_pct": 0, "leverage": 1, "stop_loss_pct": 0,
+            "take_profit_pct": 0, "reason": "ok",
+        }
+        return _resp(_tool_use_block(payload))
+
+    monkeypatch.setattr(client._client.messages, "create", fast)
+    decision, trace = asyncio.run(client.decide_with_trace(_ctx()))
+    assert decision.action is Action.HOLD
+    assert trace.status == "ok"
+    assert trace.attempts == 1
+    assert trace.latency_ms >= 50
+    assert trace.error == ""
+
+
+def test_decide_with_trace_marks_degraded_after_retries(monkeypatch):
+    client = LLMClient(_cfg(max_retries=2), api_key="x")
+
+    async def boom(*a, **k):
+        raise RuntimeError("net down")
+
+    monkeypatch.setattr(client._client.messages, "create", boom)
+    decision, trace = asyncio.run(client.decide_with_trace(_ctx()))
+    assert decision.action is Action.HOLD
+    assert trace.status == "degraded"
+    assert trace.attempts >= 1
+    assert trace.latency_ms >= 0
+    assert "net down" in trace.error

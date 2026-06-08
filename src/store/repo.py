@@ -86,6 +86,10 @@ _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("llm_request_json", "TEXT NOT NULL DEFAULT ''"),
     ("llm_response_json", "TEXT NOT NULL DEFAULT ''"),
     ("feature_snapshot_json", "TEXT NOT NULL DEFAULT ''"),
+    ("llm_latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("llm_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("llm_status", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("llm_error", "VARCHAR(200) NOT NULL DEFAULT ''"),
 )
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
@@ -545,6 +549,10 @@ class Store:
         llm_request_json: str = "",
         llm_response_json: str = "",
         feature_snapshot_json: str = "",
+        llm_latency_ms: int = 0,
+        llm_attempts: int = 0,
+        llm_status: str = "",
+        llm_error: str = "",
     ) -> None:
         row = DecisionRow(
             symbol=symbol,
@@ -569,6 +577,10 @@ class Store:
         row.llm_request_json = llm_request_json
         row.llm_response_json = llm_response_json
         row.feature_snapshot_json = feature_snapshot_json
+        row.llm_latency_ms = max(0, int(llm_latency_ms or 0))
+        row.llm_attempts = max(0, int(llm_attempts or 0))
+        row.llm_status = (llm_status or "")[:16]
+        row.llm_error = (llm_error or "")[:200]
         await self._add(row)
 
     # ---------- 拒单 ----------

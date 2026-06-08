@@ -311,6 +311,65 @@ ALTER TABLE decisions ADD COLUMN feature_snapshot_json TEXT NOT NULL DEFAULT '';
 - `tests/test_engine.py`
 - `tests/test_throttle.py`
 - `tests/test_state.py`
+- `web/frontend/src/labels.js`
+
+
+## LLM 调用耗时追踪
+
+每次实际调用 LLM 后，会记录从首次 attempt 开始到拿到有效 `TradeDecision` 的耗时。
+
+### 数据来源
+
+`LLMClient.decide_with_trace` 内部用 `time.monotonic()` 计时，统计指标：
+
+- `latency_ms`：包含所有 attempt 累计的毫秒数。
+- `attempts`：实际请求次数（含重试）。
+- `status`：`ok` / `degraded`。
+- `error`：失败原因（成功时为空）。
+
+### 数据库
+
+`decisions` 表新增四列，由 `Store._upgrade_schema` 自动迁移：
+
+```sql
+ALTER TABLE decisions ADD COLUMN llm_latency_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE decisions ADD COLUMN llm_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE decisions ADD COLUMN llm_status VARCHAR(16) NOT NULL DEFAULT '';
+ALTER TABLE decisions ADD COLUMN llm_error VARCHAR(200) NOT NULL DEFAULT '';
+```
+
+### 展示规则
+
+Web 决策日志列表新增 `LLM耗时` 列，配色规则：
+
+| 区间 | Tag 类型 | 文案 |
+|---|---|---|
+| `<5s` 且 ok | success | `1.4s` |
+| `5 ~ 10s` 且 ok | warning | `7.6s` |
+| `10 ~ 20s` 且 ok | danger | `13.2s` |
+| `≥20s` 或 `attempts≥3` 且 ok | danger | `22.0s ×3` |
+| `degraded`（无论耗时） | danger | `降级 ×2` |
+| 旧记录 (`latency_ms=0`) | info | `—` |
+
+阈值与文案集中在 `web/frontend/src/labels.js` 的 `llmLatencyTag`，方便后续统一调整。
+
+### 兼容性
+
+- 旧记录没有耗时，列表显示 `—`，详情 `LLM状态` 显示 `未采集`。
+- 不展示 `latency_ms=0` 的旧记录用于统计聚合，避免假数据。
+- 前端标签配色可独立调整，不影响后端字段。
+
+### 验证
+
+```bash
+.venv/bin/python -m pytest tests/test_llm_client.py tests/test_store.py tests/test_web_status.py tests/test_engine.py
+```
+
+期望结果：
+
+```text
+108 passed
+```
 
 ## 验证
 

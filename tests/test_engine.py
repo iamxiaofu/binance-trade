@@ -565,7 +565,7 @@ async def test_open_pipeline_passes_risk_and_executes(settings, creds, monkeypat
         decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
                                  size_pct=0.05, leverage=2, stop_loss_pct=0.02,
                                  take_profit_pct=0.04, reason="ok")
-        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}")
+        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}", latency_ms=10, attempts=1, status="ok", error="")
     monkeypatch.setattr(eng._llm, "decide_with_trace", fake_decide)
 
     await eng._process_symbol("BTCUSDT")
@@ -587,7 +587,7 @@ async def test_open_pipeline_rejects_high_leverage(settings, creds, monkeypatch)
         decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
                                  size_pct=0.05, leverage=10, stop_loss_pct=0.02,
                                  take_profit_pct=0.04, reason="too much")
-        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}")
+        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}", latency_ms=10, attempts=1, status="ok", error="")
     monkeypatch.setattr(eng._llm, "decide_with_trace", fake_decide)
 
     await eng._process_symbol("BTCUSDT")
@@ -615,7 +615,7 @@ async def test_open_rejects_stale_condition_without_position(settings, creds, mo
         decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_SHORT, confidence=0.9,
                                  size_pct=0.05, leverage=2, stop_loss_pct=0.02,
                                  take_profit_pct=0.04, reason="ok")
-        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}")
+        return decision, SimpleNamespace(user_prompt="prompt", request_json="{}", response_json="{}", latency_ms=10, attempts=1, status="ok", error="")
     monkeypatch.setattr(eng._llm, "decide_with_trace", fake_decide)
 
     await eng._process_symbol("BTCUSDT")

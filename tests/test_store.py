@@ -625,3 +625,25 @@ async def test_command_fifo_order(store):
     b = await store.enqueue_command("RESUME")
     pending = await store.fetch_pending_commands()
     assert [p["id"] for p in pending] == [a, b]  # 先进先出
+
+
+async def test_log_decision_persists_latency_fields(store):
+    d = TradeDecision(symbol="ETHUSDT", action=Action.OPEN_LONG, confidence=0.8,
+                      size_pct=0.1, leverage=3, stop_loss_pct=0.02,
+                      take_profit_pct=0.04, reason="trend up")
+    await store.log_decision(
+        symbol="ETHUSDT",
+        decision=d,
+        ref_price=100.0,
+        llm_latency_ms=4231,
+        llm_attempts=1,
+        llm_status="ok",
+        llm_error="",
+    )
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        row = (await session.execute(select(DecisionRow))).scalar_one()
+    assert row.llm_latency_ms == 4231
+    assert row.llm_attempts == 1
+    assert row.llm_status == "ok"
+    assert row.llm_error == ""

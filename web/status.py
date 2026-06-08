@@ -500,6 +500,9 @@ def _llm_data_items(ctx: MarketContext | None) -> list[dict[str, str]]:
         f"prompt 中发送最近 {micro_count} 根短周期 K 线；用于观察最近入场节奏。",
     )
     _add_llm_item(items, "微观K线", "micro_klines_context_count", len(ctx.micro_klines))
+
+    # 决策态上下文里只关心这些字段是否存在；如果未来把耗时纳入 MarketContext
+    # 也可在此展示，本次仍以下方 decision_detail 的派生字段为准。
     return items
 
 
@@ -519,6 +522,11 @@ def decision_detail(db_path: str, decision_id: int) -> dict | None:
     row["llm_response_effective_json"] = row.get("llm_response_json") or ""
     row["llm_trace_available"] = bool(row.get("llm_request_json") or row.get("llm_response_json"))
     row["llm_data_items"] = _llm_data_items(ctx)
+    row["llm_latency_ms"] = int(row.get("llm_latency_ms") or 0)
+    row["llm_attempts"] = int(row.get("llm_attempts") or 0)
+    row["llm_status"] = row.get("llm_status") or ""
+    row["llm_error"] = row.get("llm_error") or ""
+    row["llm_status_available"] = bool(row["llm_status"])
     return row
 
 

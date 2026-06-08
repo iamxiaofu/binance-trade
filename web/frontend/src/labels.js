@@ -147,3 +147,37 @@ export function rejectCodeLabel(code) {
     LIQ_DISTANCE: '强平距离过近',
   }[code] || code || '—'
 }
+
+// LLM 调用耗时展示口径：
+//   < 5s                → success
+//   5 ~ 10s             → warning
+//   10 ~ 20s            → danger
+//   ≥ 20s 或 attempts≥3 → danger
+//   status=degraded     → danger + 降级
+//   latency_ms=0（无新版本数据）→ info，显示 "—"
+const LLMLatencyBucket = {
+  fast: 5000,   // 5s
+  slow: 10000,  // 10s
+  dead: 20000,  // 20s
+}
+
+export function llmLatencyTag(row) {
+  if (!row) return { type: 'info', label: '—' }
+  const status = String(row.llm_status || '')
+  const latency = Number(row.llm_latency_ms || 0)
+  const attempts = Number(row.llm_attempts || 0)
+  if (!status) return { type: 'info', label: '—' }
+  if (status === 'degraded') {
+    return { type: 'danger', label: attempts > 1 ? `降级 ×${attempts}` : '降级' }
+  }
+  if (latency <= 0) return { type: 'info', label: '—' }
+  let bucket = 'success'
+  if (latency >= LLMLatencyBucket.dead || attempts >= 3) bucket = 'danger'
+  else if (latency >= LLMLatencyBucket.slow) bucket = 'danger'
+  else if (latency >= LLMLatencyBucket.fast) bucket = 'warning'
+  const seconds = (latency / 1000).toFixed(1)
+  return {
+    type: bucket,
+    label: attempts > 1 ? `${seconds}s ×${attempts}` : `${seconds}s`,
+  }
+}

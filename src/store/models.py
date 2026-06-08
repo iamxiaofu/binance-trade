@@ -52,6 +52,11 @@ class DecisionRow(Base):
     llm_prompt: Mapped[str] = mapped_column(Text, default="")
     llm_request_json: Mapped[str] = mapped_column(Text, default="")
     llm_response_json: Mapped[str] = mapped_column(Text, default="")
+    # LLM 调用耗时与状态：0 表示未采集
+    llm_latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    llm_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    llm_status: Mapped[str] = mapped_column(String(16), default="")
+    llm_error: Mapped[str] = mapped_column(String(200), default="")
     feature_snapshot_json: Mapped[str] = mapped_column(Text, default="")
     # 决策时的参考价
     ref_price: Mapped[float] = mapped_column(Float, default=0.0)

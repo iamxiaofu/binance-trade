@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from src.llm.schema import IndicatorSnapshot, MarketContext, PositionSnapshot, TradeDecision
+from src.llm.schema import Action, IndicatorSnapshot, MarketContext, PositionSnapshot, TradeDecision
 from src.state.runtime import RuntimeState
 from src.store.repo import Store
 from web import status
@@ -277,3 +277,41 @@ async def test_missing_table_degrades_to_empty(tmp_path):
     sqlite3.connect(empty).close()  # 建立空文件
     assert status.recent_orders(empty) == []
     assert status.latest_balance(empty) is None
+
+
+async def test_decision_detail_exposes_latency_fields(db):
+    s = Store(db)
+    await s.connect()
+    d = TradeDecision(
+        symbol="ETHUSDT",
+        action=Action.OPEN_LONG,
+        confidence=0.8,
+        size_pct=0.1,
+        leverage=3,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        reason="trend up",
+    )
+    await s.log_decision(
+        symbol="ETHUSDT",
+        decision=d,
+        ref_price=3000.0,
+        llm_latency_ms=7821,
+        llm_attempts=2,
+        llm_status="ok",
+        llm_error="",
+    )
+    await s.close()
+    detail = status.decision_detail(db, status.search_decisions(db, status.DecisionFilters(types=["OPEN_LONG"], limit=1))["items"][0]["id"])
+    assert detail is not None
+    assert detail["llm_latency_ms"] == 7821
+    assert detail["llm_attempts"] == 2
+    assert detail["llm_status"] == "ok"
+    assert detail["llm_status_available"] is True
+
+
+async def test_decision_detail_zero_latency_marks_unavailable(db):
+    detail = status.decision_detail(db, status.search_decisions(db, status.DecisionFilters(symbols=["BNBUSDT"], limit=1))["items"][0]["id"])
+    assert detail is not None
+    assert detail["llm_latency_ms"] == 0
+    assert detail["llm_status_available"] is False

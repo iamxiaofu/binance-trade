@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -33,6 +34,14 @@ class LLMTrace:
     user_prompt: str
     request_json: str
     response_json: str = ""
+    # 调用耗时(毫秒)。包含所有 attempt 累计。0 表示未采集。
+    latency_ms: int = 0
+    # 实际请求次数(包含重试)。失败降级也会记录。
+    attempts: int = 0
+    # 最终状态: "ok" | "degraded"
+    status: str = ""
+    # 失败原因(成功时为空)。
+    error: str = ""
 
 
 def _jsonable(value: Any) -> Any:
@@ -106,6 +115,7 @@ class LLMClient:
         )
         last_err = "unknown"
         attempts: list[dict[str, Any]] = []
+        loop_start = time.monotonic()
 
         for attempt in range(self._cfg.max_retries + 1):
             try:
@@ -120,6 +130,10 @@ class LLMClient:
                         "attempts": attempts,
                         "final_decision": decision.model_dump(mode="json"),
                     })
+                    trace.latency_ms = int((time.monotonic() - loop_start) * 1000)
+                    trace.attempts = attempt + 1
+                    trace.status = "ok"
+                    trace.error = ""
                     return decision, trace
                 last_err = "no valid tool_use block"
             except asyncio.TimeoutError:
@@ -143,6 +157,10 @@ class LLMClient:
             "attempts": attempts,
             "final_decision": decision.model_dump(mode="json"),
         })
+        trace.latency_ms = int((time.monotonic() - loop_start) * 1000)
+        trace.attempts = len(attempts)
+        trace.status = "degraded"
+        trace.error = last_err[:200]
         return decision, trace
 
     def _parse(self, resp, symbol: str) -> TradeDecision | None:

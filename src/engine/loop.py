@@ -1718,6 +1718,10 @@ class TradingEngine:
             llm_request_json=llm_trace.request_json,
             llm_response_json=llm_trace.response_json,
             feature_snapshot_json=feature_snapshot_json,
+            llm_latency_ms=llm_trace.latency_ms,
+            llm_attempts=llm_trace.attempts,
+            llm_status=llm_trace.status,
+            llm_error=llm_trace.error,
         )
 
         # CLOSE 优先处理（不受开仓限额约束）

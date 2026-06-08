@@ -2,7 +2,7 @@
 import { computed, ref, onMounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
-import { decisionLabel, decisionTagType, localTime } from '../labels'
+import { decisionLabel, decisionTagType, llmLatencyTag, localTime } from '../labels'
 
 const rows = ref([])
 const total = ref(0)
@@ -224,6 +224,14 @@ onMounted(async () => {
             <span v-else>—</span>
           </template>
         </el-table-column>
+        <el-table-column label="LLM耗时" width="120">
+          <template #default="{ row }">
+            <el-tag v-if="!row.skipped" :type="llmLatencyTag(row).type" size="small">
+              {{ llmLatencyTag(row).label }}
+            </el-tag>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="原因" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">{{ row.skipped ? row.skip_reason : row.reason }}</template>
         </el-table-column>
@@ -260,6 +268,19 @@ onMounted(async () => {
           <el-descriptions-item label="杠杆">{{ detail.leverage }}x</el-descriptions-item>
           <el-descriptions-item label="参考价">{{ detail.ref_price }}</el-descriptions-item>
           <el-descriptions-item label="SL/TP">{{ detail.stop_loss_pct }} / {{ detail.take_profit_pct }}</el-descriptions-item>
+          <el-descriptions-item label="LLM耗时">
+            <el-tag v-if="!detail.skipped" :type="llmLatencyTag(detail).type" size="small">
+              {{ llmLatencyTag(detail).label }}
+            </el-tag>
+            <span v-else>—</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="LLM状态">
+            <template v-if="detail.skipped">—</template>
+            <template v-else-if="!detail.llm_status_available">未采集</template>
+            <template v-else>
+              {{ detail.llm_status || 'ok' }} · 尝试 {{ detail.llm_attempts || 1 }} 次
+            </template>
+          </el-descriptions-item>
           <el-descriptions-item label="理由" :span="2">{{ detail.skipped ? detail.skip_reason : detail.reason }}</el-descriptions-item>
         </el-descriptions>
         <el-alert
