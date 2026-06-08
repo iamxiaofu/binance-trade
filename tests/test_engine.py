@@ -560,6 +560,8 @@ async def test_open_pipeline_passes_risk_and_executes(settings, creds, monkeypat
     monkeypatch.setattr(eng, "_fetch_margin_safe", fake_margin)
 
     async def fake_decide(ctx):
+        assert ctx.micro_kline_interval == "1m"
+        assert len(ctx.micro_klines) == 30
         decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
                                  size_pct=0.05, leverage=2, stop_loss_pct=0.02,
                                  take_profit_pct=0.04, reason="ok")

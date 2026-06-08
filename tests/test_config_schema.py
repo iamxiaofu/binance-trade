@@ -88,6 +88,20 @@ def test_storage_rejects_template_without_mode_placeholder():
         StorageConfig(db_path_template="./data/trade.db")
 
 
+def test_llm_rejects_invalid_micro_kline_interval():
+    with pytest.raises(ValidationError):
+        LLMConfig(
+            model="claude-opus-4-8",
+            timeout=30,
+            max_tokens=1024,
+            max_retries=2,
+            kline_lookback=100,
+            kline_interval="5m",
+            micro_kline_interval="7m",
+            indicators=["ema", "rsi"],
+        )
+
+
 def test_execution_legacy_order_type_limit_maps_to_maker_first():
     cfg = ExecutionConfig(
         order_type="LIMIT",

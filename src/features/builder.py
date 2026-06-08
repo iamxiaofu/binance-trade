@@ -49,6 +49,7 @@ def build_context(
     settings: Settings,
     equity: float = 0.0,
     higher_tf_klines: dict[str, list[list[float]]] | None = None,
+    micro_klines: list[list[float]] | None = None,
     sentiment_extra: dict | None = None,
 ) -> MarketContext | None:
     """组装单个 symbol 的 MarketContext。
@@ -57,6 +58,7 @@ def build_context(
 
     higher_tf_klines: {timeframe: klines} 形如 {"15m": [...], "1h": [...]}，
       由调用方(engine)预先拉好传入；缺失则多周期为空，不影响主决策。
+    micro_klines: 短周期原始 K 线窗口，仅用于 Prompt 展示最近入场节奏。
     sentiment_extra: 额外情绪字段(long_short_ratio/open_interest/fear_greed_index)。
     """
     if not snapshot.is_ready:
@@ -97,6 +99,10 @@ def build_context(
         funding_rate=snapshot.funding_rate,
         change_24h_pct=snapshot.change_24h_pct,
         recent_klines=snapshot.klines,
+        prompt_kline_count=settings.llm.prompt_kline_count,
+        micro_kline_interval=settings.llm.micro_kline_interval,
+        micro_kline_count=settings.llm.micro_kline_lookback,
+        micro_klines=micro_klines or [],
         indicators=IndicatorSnapshot(**ind),
         position=position,
         available_margin=available_margin,

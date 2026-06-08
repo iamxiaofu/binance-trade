@@ -26,6 +26,8 @@ async def db(tmp_path):
         funding_rate=0.0001,
         change_24h_pct=1.2,
         recent_klines=[[i, 1, 2, 0.5, 1.5, 100] for i in range(30)],
+        micro_kline_interval="1m",
+        micro_klines=[[i, 1, 2, 0.5, 1.5, 10] for i in range(30)],
         indicators=IndicatorSnapshot(
             ema_fast=1,
             ema_slow=2,
@@ -109,7 +111,8 @@ async def test_decision_detail_includes_llm_trace_and_data_items(db):
     assert detail["llm_user_prompt"] == "stored prompt"
     assert "request" in detail["llm_request_effective_json"]
     fields = {item["field"] for item in detail["llm_data_items"]}
-    assert {"last_price", "mark_price", "recent_klines_last20"}.issubset(fields)
+    assert {"last_price", "mark_price", "recent_klines_last20",
+            "micro_klines_last30"}.issubset(fields)
 
 
 async def test_balance_history_ascending(db):

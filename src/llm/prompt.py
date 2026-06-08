@@ -58,7 +58,12 @@ def _fmt_higher_tf(tfs) -> str:
     return "\n".join(lines)
 
 
-def build_user_prompt(ctx: MarketContext, kline_interval: str = "5m") -> str:
+def build_user_prompt(
+    ctx: MarketContext,
+    kline_interval: str = "5m",
+    prompt_kline_count: int | None = None,
+    micro_kline_count: int | None = None,
+) -> str:
     """把 MarketContext 渲染成紧凑、信息密度高的 user prompt。"""
     pos = ctx.position
     if pos.has_position:
@@ -70,10 +75,17 @@ def build_user_prompt(ctx: MarketContext, kline_interval: str = "5m") -> str:
         pos_desc = "持仓: 无（空仓）"
 
     ind = ctx.indicators
-    # 只取最近 20 根 K 线进 prompt，控制 token（完整序列已用于指标计算）
-    recent = ctx.recent_klines[-20:]
+    # 只取最近 N 根主周期 K 线进 prompt，控制 token（完整序列已用于指标计算）
+    main_count = prompt_kline_count if prompt_kline_count is not None else ctx.prompt_kline_count
+    micro_count = micro_kline_count if micro_kline_count is not None else ctx.micro_kline_count
+    recent = ctx.recent_klines[-main_count:]
     klines_brief = json.dumps(
         [[round(x, 4) for x in k] for k in recent], ensure_ascii=False
+    )
+    micro_recent = ctx.micro_klines[-micro_count:] if micro_count > 0 else []
+    micro_brief = (
+        json.dumps([[round(x, 4) for x in k] for k in micro_recent], ensure_ascii=False)
+        if micro_recent else "（未获取）"
     )
 
     return f"""\
@@ -114,8 +126,11 @@ def build_user_prompt(ctx: MarketContext, kline_interval: str = "5m") -> str:
 多周期指标(共振参考):
 {_fmt_higher_tf(ctx.higher_timeframes)}
 
-最近20根K线（{kline_interval}级别）[ts,open,high,low,close,volume]:
+最近{len(recent)}根K线（{kline_interval}级别）[ts,open,high,low,close,volume]:
 {klines_brief}
+
+最近{len(micro_recent)}根微观K线（{ctx.micro_kline_interval}级别）[ts,open,high,low,close,volume]:
+{micro_brief}
 
 请基于以上多维数据，调用 submit_decision 给出本周期对 {ctx.symbol} 的交易决策。
 """

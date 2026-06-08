@@ -478,16 +478,28 @@ def _llm_data_items(ctx: MarketContext | None) -> list[dict[str, str]]:
         for key, value in tf.model_dump(mode="json").items():
             _add_llm_item(items, "多周期指标", f"{prefix}.{key}", value)
 
-    recent = ctx.recent_klines[-20:]
+    main_count = ctx.prompt_kline_count
+    recent = ctx.recent_klines[-main_count:]
     _add_llm_item(
         items,
         "K线",
-        "recent_klines_last20",
+        f"recent_klines_last{main_count}",
         [[round(float(x), 4) for x in k] for k in recent],
-        "prompt 中发送最近 20 根；完整窗口仅用于本地指标计算。",
+        f"prompt 中发送最近 {main_count} 根；完整窗口仅用于本地指标计算。",
     )
     _add_llm_item(items, "K线", "recent_klines_context_count", len(ctx.recent_klines),
                   "context_json 中保存的完整窗口根数。")
+    micro_count = ctx.micro_kline_count
+    micro = ctx.micro_klines[-micro_count:] if micro_count > 0 else []
+    _add_llm_item(items, "微观K线", "micro_kline_interval", ctx.micro_kline_interval)
+    _add_llm_item(
+        items,
+        "微观K线",
+        f"micro_klines_last{micro_count}",
+        [[round(float(x), 4) for x in k] for k in micro],
+        f"prompt 中发送最近 {micro_count} 根短周期 K 线；用于观察最近入场节奏。",
+    )
+    _add_llm_item(items, "微观K线", "micro_klines_context_count", len(ctx.micro_klines))
     return items
 
 

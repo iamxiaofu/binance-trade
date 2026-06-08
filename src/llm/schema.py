@@ -95,6 +95,10 @@ class MarketContext(BaseModel):
     funding_rate: float
     change_24h_pct: float
     recent_klines: list[list[float]]  # [[ts,o,h,l,c,v], ...]
+    prompt_kline_count: int = 20
+    micro_kline_interval: str = "1m"
+    micro_kline_count: int = 30
+    micro_klines: list[list[float]] = []  # [[ts,o,h,l,c,v], ...] 短周期入场节奏
     indicators: IndicatorSnapshot
     position: PositionSnapshot
     available_margin: float

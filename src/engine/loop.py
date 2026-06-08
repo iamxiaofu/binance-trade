@@ -1622,11 +1622,13 @@ class TradingEngine:
         # 2. 特征 → LLM 决策（失败降级 HOLD 由 LLMClient 内部保证）
         margin = await self._fetch_margin_safe()
         higher_tf = await self._fetch_higher_tf_safe(symbol)
+        micro_klines = await self._fetch_micro_klines_safe(symbol)
         ctx = build_context(
             symbol=symbol, snapshot=snap, position=position,
             available_margin=margin, settings=self._settings,
             equity=self.runtime.current_equity,
             higher_tf_klines=higher_tf,
+            micro_klines=micro_klines,
         )
         if ctx is None:
             logger.warning("context unavailable for {}, skip", symbol)
@@ -1860,6 +1862,18 @@ class TradingEngine:
             except Exception as e:
                 logger.warning("fetch higher tf {} {} failed: {}", tf, symbol, e)
         return out
+
+    async def _fetch_micro_klines_safe(self, symbol: str) -> list[list[float]]:
+        """拉取短周期原始 K 线，供 Prompt 观察最近入场节奏。失败不阻塞主决策。"""
+        limit = self._settings.llm.micro_kline_lookback
+        if limit <= 0:
+            return []
+        tf = self._settings.llm.micro_kline_interval
+        try:
+            return await self._client.fetch_ohlcv(symbol, tf, limit)
+        except Exception as e:
+            logger.warning("fetch micro klines {} {} failed: {}", tf, symbol, e)
+            return []
 
     async def _fetch_positions_safe(self) -> list[dict]:
         try:

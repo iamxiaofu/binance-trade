@@ -17,8 +17,18 @@ def _klines(n: int):
     return out
 
 
+def _micro_klines(n: int):
+    out = []
+    ts = 1_700_000_000_000
+    for i in range(n):
+        c = 100.0 + i * 0.1
+        out.append([ts + i * 60_000, c - 0.1, c + 0.2, c - 0.2, c, 3.0])
+    return out
+
+
 def test_prompt_includes_enriched_main_timeframe_features():
     klines = _klines(100)
+    micro = _micro_klines(30)
     ctx = MarketContext(
         symbol="BTCUSDT",
         timestamp=klines[-1][0],
@@ -27,6 +37,8 @@ def test_prompt_includes_enriched_main_timeframe_features():
         funding_rate=0.0,
         change_24h_pct=0.0,
         recent_klines=klines,
+        micro_kline_interval="1m",
+        micro_klines=micro,
         indicators=IndicatorSnapshot(**compute_snapshot(klines)),
         position=PositionSnapshot(),
         available_margin=200.0,
@@ -36,7 +48,8 @@ def test_prompt_includes_enriched_main_timeframe_features():
         max_loss_per_trade_abs=4.0,
     )
 
-    prompt = build_user_prompt(ctx, kline_interval="5m")
+    prompt = build_user_prompt(ctx, kline_interval="5m", prompt_kline_count=20,
+                               micro_kline_count=30)
 
     assert "主周期结构化趋势特征" in prompt
     assert "趋势=up" in prompt
@@ -45,3 +58,6 @@ def test_prompt_includes_enriched_main_timeframe_features():
     assert "MACD柱变化" in prompt
     assert "Boll%B=" in prompt
     assert "量能变化" in prompt
+    assert "最近20根K线（5m级别）" in prompt
+    assert "最近30根微观K线（1m级别）" in prompt
+    assert str(round(micro[-1][4], 4)) in prompt

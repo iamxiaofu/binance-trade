@@ -126,15 +126,18 @@ class LLMConfig(_Base):
     max_retries: int = Field(ge=0, le=5)
     kline_lookback: int = Field(ge=10, le=1000)
     kline_interval: str = "5m"
+    prompt_kline_count: int = Field(default=20, ge=1, le=200)
+    micro_kline_interval: str = "1m"
+    micro_kline_lookback: int = Field(default=30, ge=0, le=300)
     indicators: list[str] = Field(default_factory=list)
     # 多周期共振：额外拉这些更高周期的指标喂给 LLM（空=不启用）
     higher_timeframes: list[str] = Field(default_factory=list)
 
-    @field_validator("kline_interval")
+    @field_validator("kline_interval", "micro_kline_interval")
     @classmethod
     def _check_interval(cls, v: str) -> str:
         if v not in INTERVAL_SECONDS:
-            raise ValueError(f"kline_interval 必须是 {list(INTERVAL_SECONDS)} 之一")
+            raise ValueError(f"interval 必须是 {list(INTERVAL_SECONDS)} 之一")
         return v
 
     @field_validator("higher_timeframes")

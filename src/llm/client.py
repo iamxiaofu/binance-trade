@@ -86,7 +86,12 @@ class LLMClient:
 
     async def decide_with_trace(self, ctx: MarketContext) -> tuple[TradeDecision, LLMTrace]:
         """对单个 symbol 做决策，并返回完整审计 trace。"""
-        user_prompt = build_user_prompt(ctx, kline_interval=self._cfg.kline_interval)
+        user_prompt = build_user_prompt(
+            ctx,
+            kline_interval=self._cfg.kline_interval,
+            prompt_kline_count=self._cfg.prompt_kline_count,
+            micro_kline_count=self._cfg.micro_kline_lookback,
+        )
         request_payload = {
             "model": self._cfg.model,
             "max_tokens": self._cfg.max_tokens,
