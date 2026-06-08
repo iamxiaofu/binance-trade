@@ -15,6 +15,7 @@ from typing import Any
 
 from src.llm.prompt import SYSTEM_PROMPT, build_user_prompt
 from src.llm.schema import MarketContext, TradeDecision
+from src.throttle.gate import NO_SIGNIFICANT_CHANGE_REASON as _NO_SIGNIFICANT_CHANGE
 
 
 def _rows(db_path: str, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -36,6 +37,11 @@ def recent_decisions(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,))
 
 
+# 集中管理 “跳过 LLM” 的原因字符串，避免前后端 SQL 拼接错位。
+SYMBOL_DISABLED_REASON = "symbol disabled"
+NO_SIGNIFICANT_CHANGE_REASON = _NO_SIGNIFICANT_CHANGE
+
+
 @dataclass(frozen=True)
 class DecisionFilters:
     symbols: list[str] = field(default_factory=list)
@@ -43,6 +49,7 @@ class DecisionFilters:
     start_ts_ms: int | None = None
     end_ts_ms: int | None = None
     hide_symbol_disabled: bool = False
+    hide_no_significant_change: bool = False
     limit: int = 100
     offset: int = 0
 
@@ -79,7 +86,10 @@ def _decision_where(filters: DecisionFilters) -> tuple[str, list[Any]]:
         args.append(filters.end_ts_ms)
     if filters.hide_symbol_disabled:
         clauses.append("NOT (skipped = 1 AND skip_reason = ?)")
-        args.append("symbol disabled")
+        args.append(SYMBOL_DISABLED_REASON)
+    if filters.hide_no_significant_change:
+        clauses.append("NOT (skipped = 1 AND skip_reason = ?)")
+        args.append(NO_SIGNIFICANT_CHANGE_REASON)
 
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
 
@@ -94,6 +104,7 @@ def search_decisions(db_path: str, filters: DecisionFilters) -> dict[str, Any]:
         start_ts_ms=filters.start_ts_ms,
         end_ts_ms=filters.end_ts_ms,
         hide_symbol_disabled=filters.hide_symbol_disabled,
+        hide_no_significant_change=filters.hide_no_significant_change,
         limit=limit,
         offset=offset,
     )
@@ -116,6 +127,7 @@ def search_decisions(db_path: str, filters: DecisionFilters) -> dict[str, Any]:
             "start_ts_ms": filters.start_ts_ms,
             "end_ts_ms": filters.end_ts_ms,
             "hide_symbol_disabled": filters.hide_symbol_disabled,
+            "hide_no_significant_change": filters.hide_no_significant_change,
         },
     }
 

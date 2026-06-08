@@ -3,6 +3,7 @@ import { computed, ref, onMounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
 import { decisionLabel, decisionTagType, llmLatencyTag, localTime } from '../labels'
+import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 
 const rows = ref([])
 const total = ref(0)
@@ -20,7 +21,9 @@ const filters = ref({
   symbols: [],
   types: [],
   range: [],
+  quickRange: DEFAULT_TIME_RANGE,
   hideSymbolDisabled: false,
+  hideNoSignificantChange: false,
 })
 const page = ref({
   limit: 100,
@@ -37,17 +40,70 @@ const decisionTypeOptions = [
 
 const symbolOptions = computed(() => cfg.value?.symbols || [])
 
-function queryParams() {
+function quickRangeBounds(value) {
+  if (!value) return null
+  const map = {
+    '1h': 60 * 60_000,
+    '3h': 3 * 60 * 60_000,
+    '12h': 12 * 60 * 60_000,
+    '1d': 24 * 60 * 60_000,
+    '7d': 7 * 24 * 60 * 60_000,
+    '30d': 30 * 24 * 60 * 60_000,
+  }
+  const span = map[value]
+  if (!span) return null
+  const end = Date.now()
+  return { start: end - span, end }
+}
+
+function activeTimeRange() {
+  if (filters.value.quickRange) return filters.value.quickRange
   const [start, end] = filters.value.range || []
-  return {
+  if (start instanceof Date && end instanceof Date) return ''
+  return ''
+}
+
+function queryParams() {
+  const params = {
     symbol: filters.value.symbols,
     type: filters.value.types,
-    start_ts_ms: start instanceof Date ? start.getTime() : undefined,
-    end_ts_ms: end instanceof Date ? end.getTime() : undefined,
     hide_symbol_disabled: filters.value.hideSymbolDisabled ? 'true' : undefined,
+    hide_no_significant_change: filters.value.hideNoSignificantChange ? 'true' : undefined,
     limit: page.value.limit,
     offset: page.value.offset,
   }
+  if (filters.value.quickRange) {
+    const bounds = quickRangeBounds(filters.value.quickRange)
+    if (bounds) {
+      params.start_ts_ms = bounds.start
+      params.end_ts_ms = bounds.end
+    }
+  } else {
+    const [start, end] = filters.value.range || []
+    if (start instanceof Date) params.start_ts_ms = start.getTime()
+    if (end instanceof Date) params.end_ts_ms = end.getTime()
+  }
+  return params
+}
+
+function onQuickRangeChange(value) {
+  filters.value.quickRange = value || ''
+  if (value) filters.value.range = []
+  search()
+}
+
+function onManualRangeChange(value) {
+  if (Array.isArray(value) && value.length === 2
+      && value[0] instanceof Date && value[1] instanceof Date) {
+    filters.value.quickRange = ''
+  }
+  search()
+}
+
+function clearTimeRange() {
+  filters.value.quickRange = ''
+  filters.value.range = []
+  search()
 }
 
 async function load() {
@@ -118,12 +174,24 @@ function search() {
 }
 
 function resetFilters() {
-  filters.value = { symbols: [], types: [], range: [], hideSymbolDisabled: false }
+  filters.value = {
+    symbols: [],
+    types: [],
+    range: [],
+    quickRange: DEFAULT_TIME_RANGE,
+    hideSymbolDisabled: false,
+    hideNoSignificantChange: false,
+  }
   search()
 }
 
 function toggleHideSymbolDisabled() {
   filters.value.hideSymbolDisabled = !filters.value.hideSymbolDisabled
+  search()
+}
+
+function toggleHideNoSignificantChange() {
+  filters.value.hideNoSignificantChange = !filters.value.hideNoSignificantChange
   search()
 }
 
@@ -155,7 +223,7 @@ onMounted(async () => {
           <el-button size="small" :loading="loading" :icon="'Refresh'" @click="load">刷新</el-button>
         </div>
       </template>
-      <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px">
+      <div class="filter-bar">
         <el-select
           v-model="filters.symbols"
           multiple
@@ -175,8 +243,31 @@ onMounted(async () => {
           start-placeholder="开始时间"
           end-placeholder="结束时间"
           style="width:360px"
-          @change="search"
+          :disabled="!!filters.quickRange"
+          @change="onManualRangeChange"
         />
+        <el-radio-group
+          v-model="filters.quickRange"
+          size="small"
+          class="quick-range-group"
+          @change="onQuickRangeChange"
+        >
+          <el-radio-button
+            v-for="item in QUICK_TIME_RANGES"
+            :key="item.value"
+            :value="item.value"
+          >
+            {{ item.label }}
+          </el-radio-button>
+        </el-radio-group>
+        <el-button
+          size="small"
+          :icon="'RefreshLeft'"
+          :disabled="!filters.quickRange && !(filters.range && filters.range.length === 2)"
+          @click="clearTimeRange"
+        >
+          清除时间
+        </el-button>
         <el-select
           v-model="filters.types"
           multiple
@@ -189,6 +280,8 @@ onMounted(async () => {
         >
           <el-option v-for="item in decisionTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
         </el-select>
+      </div>
+      <div class="filter-bar">
         <el-button
           :type="filters.hideSymbolDisabled ? 'primary' : 'default'"
           :plain="!filters.hideSymbolDisabled"
@@ -196,6 +289,14 @@ onMounted(async () => {
           @click="toggleHideSymbolDisabled"
         >
           忽略停用币种日志
+        </el-button>
+        <el-button
+          :type="filters.hideNoSignificantChange ? 'primary' : 'default'"
+          :plain="!filters.hideNoSignificantChange"
+          :icon="filters.hideNoSignificantChange ? 'Hide' : 'View'"
+          @click="toggleHideNoSignificantChange"
+        >
+          忽略 no significant change 日志
         </el-button>
         <el-button :icon="'RefreshLeft'" @click="resetFilters">重置</el-button>
       </div>
@@ -323,6 +424,19 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.filter-bar:last-of-type {
+  margin-bottom: 12px;
+}
+.quick-range-group {
+  margin-left: 4px;
+}
 .trace-alert {
   margin-top: 12px;
 }

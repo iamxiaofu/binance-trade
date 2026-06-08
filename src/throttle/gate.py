@@ -17,7 +17,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from src.llm.schema import PositionSnapshot
-from src.throttle.feature_snapshot import FeatureSnapshot
+from src.throttle.feature_snapshot import FeatureSnapshot  # noqa: F401  # 保留兼容性
+
+
+# 集中管理跳过原因字符串，便于 web 状态模块复用，避免拼写漂移。
+NO_SIGNIFICANT_CHANGE_REASON = "no significant change"
+
 
 # 浮点容差：避免 0.3% 这类边界值因二进制误差被判为未达标
 _EPS = 1e-9
@@ -284,4 +289,4 @@ def should_call_llm(
         )
 
     # 否则跳过
-    return ThrottleResult(False, "no significant change")
+    return ThrottleResult(False, NO_SIGNIFICANT_CHANGE_REASON)

@@ -315,3 +315,28 @@ async def test_decision_detail_zero_latency_marks_unavailable(db):
     assert detail is not None
     assert detail["llm_latency_ms"] == 0
     assert detail["llm_status_available"] is False
+
+
+async def test_search_decisions_hides_no_significant_change(db):
+    """hide_no_significant_change 应隐藏 skip_reason='no significant change' 的记录。"""
+    s = Store(db)
+    await s.connect()
+    await s.log_decision(
+        symbol="BNBUSDT", skipped=True, skip_reason="no significant change", ref_price=600.0,
+    )
+    await s.close()
+
+    res = status.search_decisions(db, status.DecisionFilters(hide_no_significant_change=True))
+    # 原始 db 已有 3 条；插入 1 条 no_significant_change 后变 4 条；过滤后剩 3 条。
+    assert res["total"] == 3
+    assert all(row.get("skip_reason") != "no significant change" for row in res["items"])
+
+    # 与 hide_symbol_disabled 一起勾选时，两类 skip_reason 都被过滤
+    res2 = status.search_decisions(
+        db,
+        status.DecisionFilters(hide_symbol_disabled=True, hide_no_significant_change=True),
+    )
+    assert all(
+        row.get("skip_reason") not in ("symbol disabled", "no significant change")
+        for row in res2["items"]
+    )
