@@ -22,8 +22,9 @@ const filters = ref({
   types: [],
   range: [],
   quickRange: DEFAULT_TIME_RANGE,
-  hideSymbolDisabled: false,
-  hideNoSignificantChange: false,
+  // 默认隐藏两类无信息量的跳过日志：停用币种、no significant change。
+  hideSymbolDisabled: true,
+  hideNoSignificantChange: true,
 })
 const page = ref({
   limit: 100,
@@ -179,8 +180,9 @@ function resetFilters() {
     types: [],
     range: [],
     quickRange: DEFAULT_TIME_RANGE,
-    hideSymbolDisabled: false,
-    hideNoSignificantChange: false,
+    // 重置也保留默认隐藏两类无信息量日志，避免重置后看到大量 skip。
+    hideSymbolDisabled: true,
+    hideNoSignificantChange: true,
   }
   search()
 }

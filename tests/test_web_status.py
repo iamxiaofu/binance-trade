@@ -340,3 +340,22 @@ async def test_search_decisions_hides_no_significant_change(db):
         row.get("skip_reason") not in ("symbol disabled", "no significant change")
         for row in res2["items"]
     )
+
+
+async def test_default_filters_hide_noisy_skip_reasons(db):
+    """前端默认行为：两个 hide_* 都为 true，应同时过滤两类 skip 日志。"""
+    s = Store(db)
+    await s.connect()
+    await s.log_decision(
+        symbol="BNBUSDT", skipped=True, skip_reason="no significant change", ref_price=600.0,
+    )
+    await s.close()
+
+    res = status.search_decisions(
+        db,
+        status.DecisionFilters(hide_symbol_disabled=True, hide_no_significant_change=True),
+    )
+    assert all(
+        row.get("skip_reason") not in ("symbol disabled", "no significant change")
+        for row in res["items"]
+    )
