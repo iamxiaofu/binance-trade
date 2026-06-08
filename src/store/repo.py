@@ -584,6 +584,16 @@ class Store:
         row.llm_error = (llm_error or "")[:200]
         await self._add(row)
 
+    async def log_audit(self, *, symbol: str, action: str, reason: str = "") -> None:
+        """轻量审计行（不是决策、也不是拒单）。例如 LLM profile 切换记录。"""
+        row = DecisionRow(
+            symbol=symbol[:20],
+            skipped=False,
+            action=action[:16],
+            reason=reason[:500],
+        )
+        await self._add(row)
+
     # ---------- 拒单 ----------
     async def log_reject(self, *, symbol: str, verdict: Verdict, decision: TradeDecision | None) -> None:
         row = RejectRow(

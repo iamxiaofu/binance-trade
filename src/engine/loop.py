@@ -2381,12 +2381,10 @@ class TradingEngine:
             logger.warning("failed to persist LLM active runtime settings: {}", e)
         # 审计：写到 decisions 表里便于复盘
         try:
-            await self._store.log_decision(
+            await self._store.log_audit(
                 symbol="__LLM_SWITCH__",
-                skipped=False,
                 action="LLM_SWITCH",
                 reason=f"profile: {name} (source={source})",
-                ref_price=0.0,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("failed to log LLM switch audit: {}", e)

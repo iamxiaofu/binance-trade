@@ -127,3 +127,33 @@
 - **热替换中请求被丢弃**：替换窗口由 `_llm_lock` 串行化（一个完整 `decide_with_trace` 时长，通常 1-5s），不会出现两个 LLMClient 同时调用。
 - **第三方中转 base_url**：用户自填，文档明确"中转等同把 key 托管给第三方"。
 - **审计**：web 端 `commands.result` 字段不写 key；`decisions.action="LLM_SWITCH"` 只记 profile 名。
+
+## 2026-06-08 续：生产启用 keyring 模式
+
+依赖 `dbus-daemon` + `gnome-keyring`（在仓库外安装，不在 venv 依赖里）：
+
+```bash
+dnf install -y libsecret dbus-daemon gnome-keyring
+# venv 里 keyring + secretstorage
+.venv/bin/python -m ensurepip
+.venv/bin/python -m pip install keyring secretstorage
+```
+
+启动 wrapper：见 `scripts/start_with_keyring.sh`。在 system instance systemd 下不会
+自动注入 `DBUS_SESSION_BUS_ADDRESS`，wrapper 主动选 `/run/user/0/bus`（Rocky/RHEL
+默认 dbus-broker user scope），再以 `--login --unlock` 模式起 keyring（unattended
+server 用空密码，让 login collection 持久可用，避免 `KeyringLocked`）。
+
+systemd 单元 `ExecStart` 由原 `/data0/binance-trade/.venv/bin/python ...` 改为
+`/data0/binance-trade/scripts/start_with_keyring.sh /data0/binance-trade/.venv/bin/python ...`，
+已应用到 `binance-trade.service` 与 `binance-trade-web.service`。
+
+`ProtectSystem=full` 让 `/root` 不可写，python-keyring 试图在那里建 cache 会
+`Read-only file system`，但走的是 dbus 上的 `SecretService` backend，**不影响
+keyring 读写**。无需放宽保护。
+
+修复的 bug：`Store.log_decision()` 没有 `action` 字段，engine 启动期 hot-replace
+audit 时报 `unexpected keyword argument 'action'`。新增 `Store.log_audit()` 专门
+写"非决策/非拒单"的轻量审计行（LLM profile 切换等），loop 切到新方法。
+
+`log_audit` 字段全部走 `DecisionRow` ORM，不引入新表，决策日志前端自然能展示。

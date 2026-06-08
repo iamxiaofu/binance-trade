@@ -65,7 +65,11 @@ async def test_store_llm_profile_crud(tmp_path):
         await s.close()
 
 
-def test_fernet_roundtrip(fernet_env):
+def test_fernet_roundtrip(monkeypatch):
+    """强制走 Fernet 后端（与机器是否装 keyring 无关）。"""
+    monkeypatch.setenv("LLM_KEYRING_MASTER_KEY", "KXSIvd3t8TTEjuyz8A0daMTgpm4Ezcoix2BzelW-XxE=")
+    monkeypatch.setattr(kr, "_probe", lambda: kr._FernetBackend(b"KXSIvd3t8TTEjuyz8A0daMTgpm4Ezcoix2BzelW-XxE="))
+    kr.reset_for_test()
     ks, status = kr.get_keyring_store()
     assert status["backend"] == "fernet"
     assert status["available"] is True
@@ -83,7 +87,8 @@ def test_fernet_ciphertext_does_not_leak_plaintext(fernet_env):
 
 
 def test_unavailable_when_no_backend(monkeypatch):
-    monkeypatch.delenv("LLM_KEYRING_MASTER_KEY", raising=False)
+    """强制走 _Unavailable（与机器环境无关）。"""
+    monkeypatch.setattr(kr, "_probe", lambda: kr._Unavailable())
     kr.reset_for_test()
     ks, status = kr.get_keyring_store()
     assert status["backend"] == "unavailable"
