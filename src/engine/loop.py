@@ -46,7 +46,14 @@ class TradingEngine:
         self._client = ExchangeClient(settings, creds)
         self._market = MarketData(self._client, settings)
         self._executor = Executor(self._client, settings)
+        # 启动期使用 yaml 默认；启动后如果 DB 里有 active profile，会被替换。
         self._llm = LLMClient(settings.llm, creds.anthropic_api_key)
+        # 热替换守护：lock 让「关旧 + 开新」与「正在调用 LLM」互斥。
+        self._llm_lock = asyncio.Lock()
+        # 单调递增，每次成功替换 +1；web 端通过 /api/llm/status.active.version
+        # 感知"热替换是否真的发生了"。
+        self._llm_version = 0
+        self._llm_profile_name = ""
         self._store = Store(settings.storage.db_path)
         self._notifier = Notifier(
             settings.notify, creds.telegram_bot_token, creds.telegram_chat_id
@@ -91,6 +98,12 @@ class TradingEngine:
         self._reconcile_task = asyncio.create_task(
             self._reconcile_loop(), name="exchange-reconciler"
         )
+        # 启动末尾：把 DB 里的 active LLM profile 应用上（首次启动时把 yaml 默认
+        # 写一条 default profile 进去，便于 web 端识别当前生效配置）。
+        try:
+            await self._bootstrap_llm_profile()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("llm profile bootstrap failed: {}", e)
         logger.info("engine started (mode={}, db={}, equity={:.2f})",
                     self._settings.mode.value, self._settings.storage.db_path,
                     self.runtime.current_equity)
@@ -307,6 +320,8 @@ class TradingEngine:
         if name == "STOP_ENGINE":
             await self.stop("web stop-engine")
             return "trading engine stopped; positions/orders untouched"
+        if name == "SWITCH_LLM_PROFILE":
+            return await self._switch_llm_profile(arg)
         if name == "REPAIR_SL_TP":
             return await self._repair_sl_tp(arg)
         if name == "PROTECT_POSITION":
@@ -1696,7 +1711,9 @@ class TradingEngine:
             logger.warning("context unavailable for {}, skip", symbol)
             return
 
-        decision, llm_trace = await self._llm.decide_with_trace(ctx)
+        # 调用 LLM 期间持有锁；热替换会等待当前决策完成。
+        async with self._llm_lock:
+            decision, llm_trace = await self._llm.decide_with_trace(ctx)
         feature_snapshot_json = (
             current_feature_snapshot.model_dump_json() if current_feature_snapshot is not None else ""
         )
@@ -2283,3 +2300,114 @@ class TradingEngine:
         except Exception as e:
             logger.error("kill switch flatten failed: {}", e)
         await self._notifier.send(Event.KILL_SWITCH, reason)
+
+    # ---------- LLM profile 热替换 ----------
+    async def _bootstrap_llm_profile(self) -> None:
+        """启动时把 DB 中 active profile 应用到 engine；首次启动时把 yaml 默认写一条。"""
+        active = await self._store.get_active_llm_profile()
+        if active is not None:
+            try:
+                await self._apply_llm_profile(active, source="db")
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "failed to apply stored active profile {}: {}; falling back to yaml",
+                    active.get("name"), e,
+                )
+        # 首次启动或 active profile 失效：把 yaml 默认写一条 default profile。
+        s = self._settings.llm
+        await self._ensure_default_profile_from_yaml(s, self._creds.anthropic_api_key)
+
+    async def _ensure_default_profile_from_yaml(self, llm_cfg, api_key: str) -> None:
+        """把 yaml + 环境变量 keyring 写一条 default profile，标记 active。"""
+        from src.llm.keyring_store import get_keyring_store
+        ks, st = get_keyring_store()
+        if not st.get("available"):
+            logger.warning(
+                "keyring unavailable, skip writing default profile: {}", st
+            )
+            return
+        existing = await self._store.get_llm_profile("default")
+        if existing is None:
+            ref = ks.set("default", api_key)
+            await self._store.upsert_llm_profile(
+                name="default",
+                provider=llm_cfg.provider,
+                model=llm_cfg.model,
+                base_url=llm_cfg.base_url,
+                timeout=llm_cfg.timeout,
+                max_tokens=llm_cfg.max_tokens,
+                max_retries=llm_cfg.max_retries,
+                keyring_ref=ref,
+            )
+        await self._store.activate_llm_profile("default")
+        active = await self._store.get_llm_profile("default")
+        assert active is not None
+        await self._apply_llm_profile(active, source="yaml-default")
+
+    async def _apply_llm_profile(self, prof: dict, source: str) -> None:
+        """从 profile dict 构造新的 LLMClient，原子替换。"""
+        from src.llm.client import LLMClient
+        from src.llm.keyring_store import get_keyring_store
+        ks, _ = get_keyring_store()
+        try:
+            api_key = ks.get(prof["keyring_ref"])
+        except (KeyError, KeyringUnavailable) as e:
+            raise RuntimeError(f"keyring 解密失败: {e}") from e
+        new_client = LLMClient.from_profile(prof, self._settings.llm, api_key)
+        await self._replace_llm_client(new_client, prof["name"], source=source)
+
+    async def _replace_llm_client(
+        self, new_client, name: str, source: str
+    ) -> None:
+        """加锁替换 + 增 version + 落 audit。"""
+        async with self._llm_lock:
+            old = self._llm
+            self._llm = new_client
+            self._llm_version += 1
+            self._llm_profile_name = name
+        try:
+            await old.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("old LLMClient close failed: {}", e)
+        # 把 version/name 写到 runtime_settings，web 进程能感知"是否真的热替换了"。
+        try:
+            await self._store.set_runtime_settings({
+                "llm.active_name": name,
+                "llm.active_version": str(self._llm_version),
+                "llm.active_source": source,
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.warning("failed to persist LLM active runtime settings: {}", e)
+        # 审计：写到 decisions 表里便于复盘
+        try:
+            await self._store.log_decision(
+                symbol="__LLM_SWITCH__",
+                skipped=False,
+                action="LLM_SWITCH",
+                reason=f"profile: {name} (source={source})",
+                ref_price=0.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("failed to log LLM switch audit: {}", e)
+        logger.warning(
+            "LLM profile switched: name={} source={} version={}",
+            name, source, self._llm_version,
+        )
+
+    async def _switch_llm_profile(self, arg: str) -> str:
+        name = (arg or "").strip()
+        if not name:
+            raise ValueError("SWITCH_LLM_PROFILE requires a profile name")
+        prof = await self._store.get_llm_profile(name)
+        if prof is None:
+            raise ValueError(f"llm profile not found: {name!r}")
+        from src.llm.keyring_store import get_keyring_store
+        ks, st = get_keyring_store()
+        if not st.get("available"):
+            raise ValueError(
+                f"keyring backend unavailable: {st.get('hint') or st.get('backend')}"
+            )
+        # db 里已经由 web 端 activate 过；这里就是读 → 构造 → 替换
+        await self._apply_llm_profile(prof, source="command")
+        return f"llm profile switched: {name} (version={self._llm_version})"

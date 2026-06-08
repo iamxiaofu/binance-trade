@@ -10,6 +10,7 @@ const routes = [
   { path: '/orders', name: 'orders', component: () => import('./views/Orders.vue'), meta: { title: '交易记录' } },
   { path: '/pnl', name: 'pnl', component: () => import('./views/Pnl.vue'), meta: { title: '盈亏统计' } },
   { path: '/control', name: 'control', component: () => import('./views/Control.vue'), meta: { title: '操作面板' } },
+  { path: '/llm', name: 'llm', component: () => import('./views/LLM.vue'), meta: { title: 'LLM 配置' } },
 ]
 
 export default createRouter({

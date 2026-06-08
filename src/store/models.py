@@ -267,6 +267,28 @@ class RuntimeSettingRow(Base):
     updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
 
 
+class LLMProfileRow(Base):
+    """运行期可热替换的 LLM profile 表。
+
+    key 通过 keyring_ref 引用，明文不落库；同一时刻 is_active 只能有 1 个，
+    由 Store 写事务保证。
+    """
+    __tablename__ = "llm_profiles"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), default="anthropic")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    base_url: Mapped[str] = mapped_column(String(256), default="")
+    timeout: Mapped[float] = mapped_column(Float, default=60.0)
+    max_tokens: Mapped[int] = mapped_column(Integer, default=1024)
+    max_retries: Mapped[int] = mapped_column(Integer, default=2)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # keyring 引用，格式 "profile://<service>/<name>"，明文不写库
+    keyring_ref: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+
+
 class ControlCommandRow(Base):
     """Web 操作面板下发的命令队列。
 

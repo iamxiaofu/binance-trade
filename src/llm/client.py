@@ -78,15 +78,79 @@ def _build_tool() -> dict:
     }
 
 
+class _LLMRuntime:
+    """LLMClient 运行时视图：仅暴露 ``decide_with_trace`` 真正用到的字段。
+
+    既能包成 LLMConfig（启动期）也能包成一个 profile（运行期热替换），
+    避免在 LLMClient 内部做两套路径。
+    """
+
+    def __init__(self, *, model, max_tokens, max_retries, timeout, base_url,
+                 kline_interval, prompt_kline_count, micro_kline_lookback):
+        self.model = model
+        self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.base_url = base_url
+        self.kline_interval = kline_interval
+        self.prompt_kline_count = prompt_kline_count
+        self.micro_kline_lookback = micro_kline_lookback
+
+    @classmethod
+    def from_config(cls, cfg: LLMConfig) -> "_LLMRuntime":
+        return cls(
+            model=cfg.model,
+            max_tokens=cfg.max_tokens,
+            max_retries=cfg.max_retries,
+            timeout=cfg.timeout,
+            base_url=cfg.base_url,
+            kline_interval=cfg.kline_interval,
+            prompt_kline_count=cfg.prompt_kline_count,
+            micro_kline_lookback=cfg.micro_kline_lookback,
+        )
+
+    @classmethod
+    def from_profile(cls, profile: dict, engine_cfg: LLMConfig) -> "_LLMRuntime":
+        """profile 来自 llm_profiles 表，``engine_cfg`` 提供不变的工程参数。"""
+        return cls(
+            model=profile["model"],
+            max_tokens=int(profile["max_tokens"]),
+            max_retries=int(profile["max_retries"]),
+            timeout=float(profile["timeout"]),
+            base_url=(profile.get("base_url") or None),
+            kline_interval=engine_cfg.kline_interval,
+            prompt_kline_count=engine_cfg.prompt_kline_count,
+            micro_kline_lookback=engine_cfg.micro_kline_lookback,
+        )
+
+
 class LLMClient:
     def __init__(self, cfg: LLMConfig, api_key: str):
-        self._cfg = cfg
+        self._cfg = _LLMRuntime.from_config(cfg)
         # base_url 为空 → 官方 api.anthropic.com；否则指向 Anthropic 兼容中转端点。
         kwargs = {"api_key": api_key, "timeout": cfg.timeout}
         if cfg.base_url:
             kwargs["base_url"] = cfg.base_url
         self._client = AsyncAnthropic(**kwargs)
         self._tool = _build_tool()
+
+    @classmethod
+    def from_profile(
+        cls, profile: dict, engine_cfg: LLMConfig, api_key: str
+    ) -> "LLMClient":
+        """从 profile dict + 工程 cfg 构造一个 LLMClient。
+
+        profile 字段：model/max_tokens/max_retries/timeout/base_url。
+        工程 cfg（kline_interval 等）由 engine 透传，保证 prompt 结构不变。
+        """
+        obj = cls.__new__(cls)
+        obj._cfg = _LLMRuntime.from_profile(profile, engine_cfg)
+        kwargs = {"api_key": api_key, "timeout": obj._cfg.timeout}
+        if obj._cfg.base_url:
+            kwargs["base_url"] = obj._cfg.base_url
+        obj._client = AsyncAnthropic(**kwargs)
+        obj._tool = _build_tool()
+        return obj
 
     async def decide(self, ctx: MarketContext) -> TradeDecision:
         """对单个 symbol 做决策。任何失败都降级为 HOLD。"""

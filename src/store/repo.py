@@ -30,6 +30,7 @@ from src.store.models import (
     PositionClaimRow,
     PositionSnapshotRow,
     RejectRow,
+    LLMProfileRow,
     RuntimeSettingRow,
     SymbolRow,
     TradeRow,
@@ -1506,6 +1507,174 @@ class Store:
         async with self._sessionmaker() as session:
             rows = (await session.execute(select(RuntimeSettingRow))).scalars().all()
             return {row.key: row.value for row in rows}
+
+
+    # ---------- LLM profile 持久化 ----------
+    # 设计要点：
+    # - key 通过 keyring_ref 引用，明文不落库；调用方负责先写 keyring 再 upsert。
+    # - 同一时刻 is_active 只能为 True，由 upsert_llm_profile + activate_llm_profile 事务保证。
+    # - list/get/activate 永远不返回 key 明文（key 也不在 ORM 字段里）。
+    async def list_llm_profiles(self) -> list[dict[str, Any]]:
+        """返回全部 LLM profile（不含 key 明文，key_present 仅表示是否存了 keyring）。"""
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(
+                select(LLMProfileRow).order_by(LLMProfileRow.name)
+            )).scalars().all()
+            return [
+                {
+                    "name": r.name,
+                    "provider": r.provider,
+                    "model": r.model,
+                    "base_url": r.base_url or "",
+                    "timeout": r.timeout,
+                    "max_tokens": r.max_tokens,
+                    "max_retries": r.max_retries,
+                    "is_active": bool(r.is_active),
+                    "key_present": bool(r.keyring_ref),
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
+                }
+                for r in rows
+            ]
+
+    async def get_llm_profile(self, name: str) -> dict[str, Any] | None:
+        """获取单个 LLM profile（不含 key 明文）。"""
+        async with self._sessionmaker() as session:
+            r = await session.get(LLMProfileRow, name)
+            if r is None:
+                return None
+            return {
+                "name": r.name,
+                "provider": r.provider,
+                "model": r.model,
+                "base_url": r.base_url or "",
+                "timeout": r.timeout,
+                "max_tokens": r.max_tokens,
+                "max_tokens": r.max_tokens,
+                "max_retries": r.max_retries,
+                "is_active": bool(r.is_active),
+                "keyring_ref": r.keyring_ref,
+                "key_present": bool(r.keyring_ref),
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+
+    async def upsert_llm_profile(
+        self,
+        *,
+        name: str,
+        provider: str,
+        model: str,
+        base_url: str | None,
+        timeout: float,
+        max_tokens: int,
+        max_retries: int,
+        keyring_ref: str,
+    ) -> dict[str, Any]:
+        """插入或更新一条 profile。is_active 不会被这里修改。
+
+        调用方职责：
+        1) 先把 api_key 写进 keyring，得到 keyring_ref；
+        2) 再调本方法落 DB；
+        3) 写失败时记得把 keyring 项删掉。
+        """
+        import time as _t
+        now = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
+        async with self._sessionmaker() as session:
+            row = await session.get(LLMProfileRow, name)
+            if row is None:
+                row = LLMProfileRow(
+                    name=name,
+                    provider=provider,
+                    model=model,
+                    base_url=base_url or "",
+                    timeout=timeout,
+                    max_tokens=max_tokens,
+                    max_retries=max_retries,
+                    keyring_ref=keyring_ref,
+                    is_active=False,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+            else:
+                row.provider = provider
+                row.model = model
+                row.base_url = base_url or ""
+                row.timeout = timeout
+                row.max_tokens = max_tokens
+                row.max_retries = max_retries
+                # 留空表示不更新；非空才覆盖
+                if keyring_ref:
+                    row.keyring_ref = keyring_ref
+                row.updated_at = now
+            await session.commit()
+            return await self.get_llm_profile(name)
+
+    async def delete_llm_profile(self, name: str) -> bool:
+        """删除一条 profile；is_active 不会被自动转移。"""
+        async with self._sessionmaker() as session:
+            row = await session.get(LLMProfileRow, name)
+            if row is None:
+                return False
+            if bool(row.is_active):
+                raise ValueError(
+                    f"cannot delete active profile {name!r}; switch first"
+                )
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    async def activate_llm_profile(self, name: str) -> dict[str, Any]:
+        """把 is_active 标志从旧的切到 name；事务内互斥。
+
+        返回新的 active profile（不含 key 明文）。
+        找不到 name 时抛 ValueError，事务回滚。
+        """
+        import time as _t
+        now = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
+        async with self._sessionmaker() as session:
+            target = await session.get(LLMProfileRow, name)
+            if target is None:
+                raise ValueError(f"llm profile not found: {name!r}")
+            # 取消其它 is_active
+            others = (await session.execute(
+                select(LLMProfileRow).where(LLMProfileRow.is_active == True)  # noqa: E712
+            )).scalars().all()
+            for r in others:
+                if r.name != name:
+                    r.is_active = False
+                    r.updated_at = now
+            target.is_active = True
+            target.updated_at = now
+            await session.commit()
+        prof = await self.get_llm_profile(name)
+        assert prof is not None
+        return prof
+
+    async def get_active_llm_profile(self) -> dict[str, Any] | None:
+        """返回当前 active profile（若无则 None）。"""
+        async with self._sessionmaker() as session:
+            row = (await session.execute(
+                select(LLMProfileRow).where(LLMProfileRow.is_active == True)  # noqa: E712
+            )).scalars().first()
+            if row is None:
+                return None
+            return {
+                "name": row.name,
+                "provider": row.provider,
+                "model": row.model,
+                "base_url": row.base_url or "",
+                "timeout": row.timeout,
+                "max_tokens": row.max_tokens,
+                "max_retries": row.max_retries,
+                "is_active": True,
+                "keyring_ref": row.keyring_ref,
+                "key_present": bool(row.keyring_ref),
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+
 
     # ---------- 未完成挂单 ----------
     async def snapshot_open_orders(self, orders: list[dict]) -> None:

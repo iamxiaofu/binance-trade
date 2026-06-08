@@ -56,4 +56,20 @@ export const api = {
     req(`/api/ticker/${symbol}?${qs({ source })}`),
   command: (name, arg = '') =>
     req(`/api/command/${name}?arg=${encodeURIComponent(arg)}`, { method: 'POST' }),
+
+  // LLM profile 管理
+  llmStatus: () => req('/api/llm/status'),
+  llmProfiles: () => req('/api/llm/profiles'),
+  llmCreate: (payload) =>
+    req('/api/llm/profiles', { method: 'POST', body: JSON.stringify(payload) }),
+  llmUpdate: (name, payload) =>
+    req(`/api/llm/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify(payload),
+    }),
+  llmDelete: (name) =>
+    req(`/api/llm/profiles/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  llmTest: (name) =>
+    req(`/api/llm/profiles/${encodeURIComponent(name)}/test`, { method: 'POST' }),
+  llmActivate: (name) =>
+    req(`/api/llm/profiles/${encodeURIComponent(name)}/activate`, { method: 'POST' }),
 }

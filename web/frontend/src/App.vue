@@ -16,6 +16,7 @@ const menu = [
   { index: '/orders', title: '交易记录', icon: 'List' },
   { index: '/pnl', title: '盈亏统计', icon: 'Money' },
   { index: '/control', title: '操作面板', icon: 'SetUp' },
+  { index: '/llm', title: 'LLM 配置', icon: 'Cpu' },
 ]
 
 const lastUpdateText = computed(() =>
