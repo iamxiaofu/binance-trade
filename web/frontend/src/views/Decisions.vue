@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
 import { decisionLabel, decisionTagType, llmLatencyTag, localTime } from '../labels'
@@ -8,6 +8,29 @@ import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
+// 实时刷新：开启后每 3s 静默重拉一次，不重置滚动位置；只在第一页时启用，避免翻页时被强制顶回第一页。
+const liveRefresh = ref(false)
+let liveTimer = null
+function startLiveRefresh() {
+  stopLiveRefresh()
+  liveTimer = setInterval(() => {
+    if (!liveRefresh.value) return
+    if (page.value.offset !== 0) return
+    // 静默拉取：直接覆盖 rows/total，不翻转 loading（避免表格 v-loading 闪烁）
+    api.decisions(queryParams()).then((res) => {
+      rows.value = res.items || []
+      total.value = res.total || 0
+    }).catch(() => {})
+  }, 3000)
+}
+function stopLiveRefresh() {
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null }
+}
+function toggleLiveRefresh() {
+  liveRefresh.value = !liveRefresh.value
+  if (liveRefresh.value) startLiveRefresh()
+  else stopLiveRefresh()
+}
 const detailVisible = ref(false)
 const detail = ref(null)
 const ctxPretty = ref('')
@@ -214,6 +237,9 @@ onMounted(async () => {
   cfg.value = await api.config().catch(() => null)
   await load()
 })
+onUnmounted(() => {
+  stopLiveRefresh()
+})
 </script>
 
 <template>
@@ -223,6 +249,15 @@ onMounted(async () => {
         <div style="display:flex; justify-content:space-between; align-items:center">
           <span>决策日志（含跳过 LLM 记录）</span>
           <el-button size="small" :loading="loading" :icon="'Refresh'" @click="load">刷新</el-button>
+          <el-button
+            size="small"
+            :type="liveRefresh ? 'success' : 'default'"
+            :plain="!liveRefresh"
+            :icon="liveRefresh ? 'VideoPlay' : 'VideoPause'"
+            :title="liveRefresh ? '点击停止实时刷新' : '点击开启：每 3 秒自动刷新（仅首页）'"
+            style="margin-left:6px"
+            @click="toggleLiveRefresh"
+          >{{ liveRefresh ? '实时刷新中' : '实时刷新' }}</el-button>
         </div>
       </template>
       <div class="filter-bar">
