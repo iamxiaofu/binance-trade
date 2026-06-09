@@ -64,6 +64,7 @@ class TradingEngine:
         self.runtime = RuntimeState()
         self._stopped = asyncio.Event()
         self._state_sync_lock = asyncio.Lock()
+        self._just_adopted: dict[str, bool] = {}  # B4: 标记本周期刚接管的 symbol
         self._reconcile_task: asyncio.Task | None = None
         self._cycle_leader_snapshot: FeatureSnapshot | None = None
 
@@ -1059,6 +1060,72 @@ class TradingEngine:
             return normalize_position(raw)
         return None
 
+    async def _precheck_before_attach_sl_tp(
+        self,
+        *,
+        symbol: str,
+        decision: TradeDecision,
+        open_result: dict,
+    ) -> dict[str, Any]:
+        """C2：下 SL/TP 之前做交易所侧二次确认。
+
+        检查项：
+        1) 持仓方向/数量与本地 OPEN 结果一致（防 race 后被自动减仓 / 仓位已
+           被外部 close）。
+        2) 同方向、同种类的 reduce-only 条件单还没挂（防重复挂）。
+        3) entry_price 漂移在合理范围内（防均价差异导致触发价乱算）。
+
+        返回 {ok: bool, qty, entry, reason}
+        """
+        from src.exchange.positions import normalize_position as _np
+        side = "long" if decision.action == Action.OPEN_LONG else "short"
+        close_side = "sell" if side == "long" else "buy"
+        expected_qty = float(open_result.get("qty") or 0.0)
+        expected_entry = float(open_result.get("price") or 0.0)
+        # 1) 拉交易所侧实情
+        try:
+            raw_positions = await self._client.fetch_positions([symbol])
+        except Exception as e:
+            return {"ok": False, "reason": f"fetch_positions failed: {e}"}
+        live = next((_np(r) for r in raw_positions if _np(r)["symbol"] == symbol), None)
+        if live is None or live["contracts"] <= 0:
+            return {"ok": False, "reason": f"{symbol} 交易所侧已无持仓，跳过 SL/TP"}
+        if live["side"] != side:
+            return {
+                "ok": False,
+                "reason": f"{symbol} 持仓方向 {live['side']} 与决策 {side} 不一致",
+            }
+        live_qty = live["contracts"]
+        qty_tol = max(expected_qty * 1e-6, 1e-12)
+        if abs(live_qty - expected_qty) > qty_tol:
+            logger.warning(
+                "{} pre-attach qty drift: local={} exchange={} (use exchange value)",
+                symbol, expected_qty, live_qty,
+            )
+        live_entry = live["entry_price"]
+        # 2) 检查已挂条件单
+        try:
+            live_conds = await self._client.fetch_open_condition_orders(symbol)
+        except Exception as e:
+            logger.warning("{} pre-attach fetch_open_condition_orders failed: {}", symbol, e)
+            live_conds = []
+        active_sl_tp = [
+            o for o in live_conds
+            if o.get("side", "").lower() == close_side.lower()
+            and o.get("type", "").upper() in ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+            and o.get("status") in ("open", "placed", "new")
+        ]
+        if active_sl_tp:
+            details = ", ".join(
+                f"{o.get('type', '').upper()}@{o.get('stopPrice') or o.get('price')}"
+                for o in active_sl_tp
+            )
+            return {
+                "ok": False,
+                "reason": f"已存在 {len(active_sl_tp)} 个活跃条件单 ({details})，避免重复挂",
+            }
+        return {"ok": True, "qty": live_qty, "entry": live_entry, "side": side}
+
     async def _handle_missing_stop_after_open(
         self,
         *,
@@ -1825,10 +1892,31 @@ class TradingEngine:
                 f"notional={result['notional']:.2f}"
             )
             if self._settings.execution.attach_sl_tp:
-                specs = self._planned_protection_specs(decision, result["price"])
+                # C2：下 SL/TP 之前用交易所侧最新持仓 + 现存条件单做二次确认。
+                # 防止 race：本地 order 已成但 entry_price / qty 与交易所侧略有不一致
+                # （均价计算方式差异、cumulative qty 漂移等），或重复挂保护单。
+                try:
+                    precheck = await self._precheck_before_attach_sl_tp(
+                        symbol=symbol,
+                        decision=decision,
+                        open_result=result,
+                    )
+                except Exception as e:
+                    logger.warning("{} pre-attach sl/tp check failed: {}; fall through", symbol, e)
+                    precheck = {"ok": True, "qty": float(result["qty"]), "entry": float(result["price"])}
+                if not precheck.get("ok"):
+                    await self._handle_unprotected_open_failure(
+                        decision=decision,
+                        open_result=result,
+                        reason=f"pre-attach sl/tp check failed: {precheck.get('reason', '')}",
+                    )
+                    return
+                attach_qty = float(precheck.get("qty") or result["qty"])
+                attach_entry = float(precheck.get("entry") or result["price"])
+                specs = self._planned_protection_specs(decision, attach_entry)
                 reject_reason = self._protection_specs_reject_reason(
                     symbol=symbol,
-                    qty=float(result["qty"]),
+                    qty=attach_qty,
                     specs=specs,
                 )
                 if reject_reason:
@@ -1839,7 +1927,7 @@ class TradingEngine:
                     )
                     return
                 sltp = await self._executor.place_sl_tp(
-                    decision=decision, entry_price=result["price"], qty=result["qty"]
+                    decision=decision, entry_price=attach_entry, qty=attach_qty
                 )
                 trade_id = int((logged or {}).get("trade_id") or 0)
                 for o in sltp:
@@ -1849,9 +1937,13 @@ class TradingEngine:
                         o["leverage"] = decision.leverage
                         o["margin"] = float(o.get("notional") or 0.0) / decision.leverage
                     await self._store.log_order(o)
+                # 用 attach_qty 校正 open_result 给后续缺单检查用
+                attach_result = dict(result)
+                attach_result["qty"] = attach_qty
+                attach_result["price"] = attach_entry
                 await self._handle_missing_stop_after_open(
                     decision=decision,
-                    open_result=result,
+                    open_result=attach_result,
                     protection_orders=sltp,
                 )
 
@@ -2091,6 +2183,16 @@ class TradingEngine:
             await self._sync_condition_history(symbol, active_orders)
             if not await self._should_enforce_position_protection(symbol, reason):
                 continue
+            # B4: 刚做完孤儿接管的 symbol，需要重新拉一次 active_orders，
+            # 否则后续 has_stop 判断仍会用旧列表，导致已挂的 SL 被误判缺失。
+            if self._just_adopted.pop(symbol, False):
+                try:
+                    active_orders = await self._active_protection_orders(symbol)
+                except Exception as e:
+                    logger.warning(
+                        "reconcile {} post-adopt active protection query failed: {}",
+                        symbol, e,
+                    )
 
             side = position["side"]
             qty = float(position["contracts"] or 0.0)
@@ -2138,7 +2240,15 @@ class TradingEngine:
                 )
 
     async def _should_enforce_position_protection(self, symbol: str, reason: str) -> bool:
-        """Only auto-fix/close positions that are both enabled and locally managed."""
+        """Only auto-fix/close positions that are both enabled and locally managed.
+
+        B4 修复：将孤儿持仓的"禁用"路径拆成"先尝试接管，失败再禁用"。
+        - 旧行为：看到交易所持仓 + 本地无 trade + 无 active claim → 直接禁用币种，
+          导致 MAKER race 留下的部分成交仓位被丢在交易所 6 小时无 SL/TP。
+        - 新行为：先查最近 N 分钟是否有收尾的 canceled/error/filled claim，
+          且 claim 的 planned_qty 与当前持仓同量级 → 调 ``_adopt_orphan_position``
+          建接管 trade + 触发 SL/TP 补单。完全无 claim 关联才走禁用。
+        """
         if not self._symbol_enabled.get(symbol, False):
             logger.warning(
                 "{} live position detected during {}, but symbol is disabled; "
@@ -2174,6 +2284,12 @@ class TradingEngine:
             )
             return False
 
+        # B4：尝试孤儿接管。返回 True 表示已接管成功（_enforce_exchange_invariants
+        # 会继续做 SL/TP 修补）；返回 False 才走禁用。
+        adopted = await self._adopt_orphan_position(symbol, reason=reason)
+        if adopted:
+            return True
+
         self._symbol_enabled[symbol] = False
         await self._store.set_symbol_enabled(symbol, False)
         message = (
@@ -2183,6 +2299,153 @@ class TradingEngine:
         logger.error(message)
         await self._notifier.send(Event.ERROR, message)
         return False
+
+    async def _adopt_orphan_position(self, symbol: str, *, reason: str) -> bool:
+        # 进入接管前标记"刚接管"：外层 _enforce_exchange_invariants 会基于这个
+        # 标记重新拉一次 active_orders，避免用 adoption 前那批已过期的数据。
+        if not hasattr(self, "_just_adopted"):
+            self._just_adopted = {}
+        self._just_adopted[symbol] = True
+
+        """B4：孤儿持仓接管。
+
+        触发条件：交易所确有 0<qty 的持仓 + 本地无 open trade + 无 active claim
+        + 最近 15 分钟内有收尾的 canceled/error/filled claim，且方向匹配。
+
+        行为：
+        1) 通过 ``ensure_takeover_trade`` 建一条 source='orphan_adoption' 的 open trade
+        2) 触发 _repair_sl_tp 流程补 SL/TP（沿用 latest_open_decision 模板的 stop/take pct）
+        3) 自动重新启用该币种
+
+        返回 True 表示已接管（外层继续走 SL/TP 修补）；False 表示不该接管。
+        """
+        try:
+            claim = await self._store.latest_finished_position_claim(symbol, within_ms=900_000)
+        except Exception as e:
+            logger.warning("{} orphan adopt: claim query failed: {}", symbol, e)
+            return False
+        if not claim:
+            return False
+        # 只在 claim 来自策略（source=strategy）且有非零 planned_qty 时接管，
+        # 避免误把人工外部开仓的仓位也接管进来。
+        if claim.get("source") not in ("strategy", "manual", ""):
+            return False
+        if claim.get("planned_qty", 0) <= 0:
+            return False
+
+        # 拉交易所侧实情做交叉验证
+        position = await self._fetch_exchange_position(symbol)
+        if position is None:
+            return False
+        side = position.get("side", "")
+        qty = float(position.get("contracts") or 0.0)
+        entry = float(position.get("entry_price") or 0.0)
+        if side not in ("long", "short") or qty <= 0 or entry <= 0:
+            return False
+        if claim.get("side") and side != claim.get("side"):
+            logger.warning(
+                "{} orphan adopt skipped: claim side={} but exchange side={}",
+                symbol, claim.get("side"), side,
+            )
+            return False
+        # claim 的 planned_qty 应与当前 qty 同量级（至少 0.1x，否则可能是另一笔仓位）
+        planned = float(claim.get("planned_qty") or 0.0)
+        if planned <= 0:
+            return False
+        ratio = qty / planned
+        if ratio < 0.05 or ratio > 1.5:
+            logger.warning(
+                "{} orphan adopt skipped: claim planned={} but exchange qty={} (ratio {:.2f})",
+                symbol, planned, qty, ratio,
+            )
+            return False
+
+        # 1) 接管 trade 行
+        leverage = int(position.get("leverage") or 0)
+        try:
+            trade_id = await self._store.ensure_takeover_trade(
+                symbol=symbol,
+                direction=side,
+                qty=qty,
+                entry_price=entry,
+                leverage=leverage,
+                source="orphan_adoption",
+            )
+        except Exception as e:
+            logger.warning("{} orphan adopt: ensure_takeover_trade failed: {}", symbol, e)
+            return False
+
+        # 2) 重新启用 + 准备 SL/TP
+        self._symbol_enabled[symbol] = True
+        await self._store.set_symbol_enabled(symbol, True)
+        mark = await self._current_mark_price(symbol, position)
+        position["markPrice"] = mark
+        self.runtime.positions[symbol] = position
+        message = (
+            f"{symbol} orphan position adopted: side={side} qty={qty} entry={entry} "
+            f"leverage={leverage} trade_id={trade_id} reason={reason}"
+        )
+        logger.warning(message)
+        await self._notifier.send(Event.ERROR, message)
+
+        # 3) 触发 SL/TP 补单。优先用最近 OPEN 决策的 stop/take pct 算触发价
+        # （MAKER race 留下的孤儿最常见），再用 _repair_sl_tp 兜底（适用于人工
+        # 外部开仓后被识别的场景）。
+        placed_specs: list[tuple[str, str, float]] = []
+        try:
+            decision = await self._store.latest_open_decision(symbol)
+        except Exception as e:
+            logger.warning("{} orphan adopt: latest_open_decision failed: {}", symbol, e)
+            decision = None
+        if decision and decision.get("stop_loss_pct", 0) > 0:
+            # 构造一个临时的"决策视图"给 _planned_protection_specs 用
+            from src.llm.schema import Action, TradeDecision as _TD
+            try:
+                tdec = _TD(
+                    symbol=symbol,
+                    action=Action.OPEN_LONG if side == "long" else Action.OPEN_SHORT,
+                    confidence=1.0,
+                    size_pct=0.0,
+                    leverage=leverage or 1,
+                    stop_loss_pct=float(decision.get("stop_loss_pct") or 0.0),
+                    take_profit_pct=float(decision.get("take_profit_pct") or 0.0),
+                    reason="orphan_adoption",
+                )
+                placed_specs = self._planned_protection_specs(tdec, entry)
+            except Exception as e:
+                logger.warning("{} orphan adopt: build specs failed: {}", symbol, e)
+
+        try:
+            if placed_specs:
+                results = await self._executor.place_protection_orders(
+                    symbol=symbol,
+                    pos_side=side,
+                    qty=qty,
+                    specs=placed_specs,
+                )
+                for order in results:
+                    order["trade_id"] = trade_id
+                    if leverage > 0:
+                        order["leverage"] = leverage
+                        order["margin"] = float(order.get("notional") or 0.0) / leverage
+                    await self._store.log_order(order)
+                placed = [
+                    f"{o['kind']}@{float(o.get('price') or 0.0):.2f}"
+                    for o in results if o.get("status") == "placed"
+                ]
+                logger.warning(
+                    "{} orphan adopt: placed SL/TP from latest decision: {}",
+                    symbol, placed,
+                )
+            else:
+                # 兜底走 _repair_sl_tp
+                repair_msg = await self._repair_sl_tp(symbol)
+                logger.warning("{} orphan adopt: repair_sl_tp -> {}", symbol, repair_msg)
+        except Exception as e:
+            logger.warning("{} orphan adopt: SL/TP placement failed: {}", symbol, e)
+            # 接管成功但 SL/TP 失败时仍返回 True —— _enforce_exchange_invariants
+            # 会再走 _handle_missing_stop_after_open 路径决定是否进一步禁用。
+        return True
 
     async def _snapshot(self) -> None:
         """刷新持仓/余额快照，更新运行态权益与回撤。

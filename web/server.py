@@ -290,6 +290,18 @@ async def _status_summary() -> dict[str, Any]:
         summary["condition_orders"] = []
         summary["condition_orders_error"] = ""
         summary["positions_synced_at_ms"] = None
+    # B5：补 symbol_enabled + 标注「持仓 + 禁用」的孤儿币种，方便前端定位。
+    try:
+        symbol_enabled = await _effective_symbol_enabled()
+    except Exception as e:
+        logger.warning("summary symbol_enabled unavailable: {}", e)
+        symbol_enabled = {}
+    summary["symbol_enabled"] = symbol_enabled
+    disabled_with_position = sorted({
+        pos["symbol"] for pos in summary.get("positions", [])
+        if symbol_enabled.get(pos["symbol"]) is False
+    })
+    summary["disabled_with_position"] = disabled_with_position
     return summary
 
 

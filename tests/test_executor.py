@@ -7,6 +7,9 @@ import pytest
 
 from src.exchange.filters import SymbolFilters
 from src.config.schema import ExecutionMode
+import time
+
+import ccxt.async_support as ccxt
 from src.execution.executor import Executor, realized_pnl
 from src.llm.schema import Action, TradeDecision
 
@@ -263,9 +266,11 @@ class MakerPartialClient(FakeClient):
 
 
 async def test_maker_open_partial_fill_cancels_rest(settings):
+    """单次 attempt 内部分成交：撤剩余，返回 partial 状态。"""
     settings.execution.entry_mode = ExecutionMode.MAKER_FIRST
     settings.execution.maker_timeout_seconds = 0.05
     settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 0  # 限制只发 1 次，模拟单 attempt 场景
     client = MakerPartialClient()
     ex = Executor(client, settings)
 
@@ -282,6 +287,41 @@ async def test_maker_open_partial_fill_cancels_rest(settings):
     assert client.created[0][3] == "limit"
     assert client.created[0][5]["timeInForce"] == "GTX"
     assert client.canceled == [("BTCUSDT", "maker-1")]
+
+
+async def test_maker_open_accumulates_partial_fills_across_attempts(settings):
+    """B2 修复：跨 attempt 累计真实成交，达到计划量后提前收尾为 filled。"""
+    settings.execution.entry_mode = ExecutionMode.MAKER_FIRST
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 4
+    client = MakerPartialClient()
+    ex = Executor(client, settings)
+
+    # 每次 attempt 返回 0.02 部分成交，3 次累计 0.06 >= 0.05 → filled
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    assert res["status"] == "filled"
+    assert res["qty"] == pytest.approx(0.06)
+    assert res["remaining_qty"] == pytest.approx(0.0)
+    # 3 次 attempt 后累计达到计划量，应该停止重试
+    assert len(client.created) == 3
+
+
+async def test_maker_open_partial_cumulative_below_target_returns_partial(settings):
+    """跨 attempt 累计成交仍不足计划量时返回 partial。"""
+    settings.execution.entry_mode = ExecutionMode.MAKER_FIRST
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 2  # 共 3 次 attempt
+    client = MakerPartialClient()  # 每次 0.02
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.10, price=100.0)
+
+    assert res["status"] == "partial"
+    assert res["qty"] == pytest.approx(0.06)  # 3 × 0.02
+    assert res["remaining_qty"] == pytest.approx(0.04)
 
 
 class MakerUnfilledClient(MakerPartialClient):
@@ -315,6 +355,126 @@ async def test_maker_open_unfilled_cancels_without_open(settings):
     assert client.canceled == [("BTCUSDT", "maker-1")]
 
 
+
+class MakerNotFoundThenFilledClient(MakerPartialClient):
+    """B1 修复：fetch_order 抛 OrderNotFound 时回退到 myTrades 拿到成交。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fetch_order_calls = 0
+
+    async def fetch_order(self, symbol, order_id, params=None):
+        self.fetch_order_calls += 1
+        # 模拟订单被部分成交后被交易所自动取消，fetch_order 返回 -2013
+        raise ccxt.OrderNotFound(f"{symbol} order {order_id} not found")
+
+
+async def test_maker_wait_fill_recovers_via_my_trades_on_order_not_found(settings):
+    """B1 修复核心测试：fetch_order 抛 OrderNotFound 时，回退到 myTrades 拿真实成交。"""
+    settings.execution.entry_mode = ExecutionMode.MAKER_ONLY
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 0
+    client = MakerNotFoundThenFilledClient()
+    # 准备 myTrades 返回值：0.03 @ 100
+    client._mytrades = [
+        {"amount": 0.03, "price": 100.0, "fee": {"cost": 0.001, "currency": "USDT"},
+         "takerOrMaker": "maker"},
+    ]
+    original_fetch_order_trades = client.fetch_order_trades
+    async def _ft(symbol, order_id, limit=100):
+        return client._mytrades
+    client.fetch_order_trades = _ft  # type: ignore[assignment]
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    # 关键断言：0.03 成交被恢复，整体返回 partial
+    assert res["status"] == "partial"
+    assert res["qty"] == pytest.approx(0.03)
+    assert res["filled"] is True
+    assert res["opened"] is True
+    assert client.fetch_order_calls >= 1
+
+
+class MakerNotFoundNoTradesClient(MakerPartialClient):
+    """fetch_order 抛 OrderNotFound 且 myTrades 也无成交：走"未成交"分支。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fetch_order_calls = 0
+
+    async def fetch_order(self, symbol, order_id, params=None):
+        self.fetch_order_calls += 1
+        raise ccxt.OrderNotFound(f"{symbol} order {order_id} not found")
+
+    async def fetch_order_trades(self, symbol, order_id, limit=100):
+        return []
+
+
+async def test_maker_wait_fill_no_mytrades_treats_as_unfilled(settings):
+    """B1：fetch_order 失败且 myTrades 无成交 → 走"未成交"，不臆造成交。"""
+    settings.execution.entry_mode = ExecutionMode.MAKER_ONLY
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 0
+    client = MakerNotFoundNoTradesClient()
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    assert res["status"] == "canceled"
+    assert res["filled"] is False
+    assert res["opened"] is False
+
+
+class MakerResidualReconcileClient(MakerUnfilledClient):
+    """B3 测试：所有 attempt 内 fetch_order 都报 0 fill，但收尾时 myTrades 兜底查到成交。"""
+
+    def __init__(self):
+        super().__init__()
+        self.attempt_count = 0
+        self.mytrades_calls: list[str] = []
+
+    async def create_order(self, symbol, side, amount, order_type="market", price=None, params=None):
+        self.attempt_count += 1
+        order_id = f"maker-{self.attempt_count}"
+        self.created.append((symbol, side, amount, order_type, price, params))
+        return {
+            "id": order_id, "price": price, "filled": 0.0, "status": "open",
+            "info": {"orderId": order_id, "clientOrderId": params["newClientOrderId"]},
+        }
+
+    async def fetch_order_trades(self, symbol, order_id, limit=100):
+        self.mytrades_calls.append(order_id)
+        # 只对第一单返回成交
+        if order_id == "maker-1":
+            return [{"amount": 0.025, "price": 100.0,
+                     "fee": {"cost": 0.0008, "currency": "USDT"}}]
+        return []
+
+
+async def test_maker_residual_mytrades_reconcile_picks_up_orphan_fills(settings):
+    """B3 修复核心测试：所有 attempt 内 fetch_order 报 0 fill，
+    收尾时通过 myTrades 兜底查到第一单的 0.025 成交。
+    """
+    settings.execution.entry_mode = ExecutionMode.MAKER_ONLY
+    settings.execution.maker_timeout_seconds = 0.02
+    settings.execution.maker_poll_seconds = 0.005
+    settings.execution.maker_max_requotes = 2  # 3 次 attempt
+    client = MakerResidualReconcileClient()
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    # 收尾 myTrades 兜底拿到 0.025，返回 partial
+    assert res["status"] == "partial"
+    assert res["qty"] == pytest.approx(0.025)
+    assert res["filled"] is True
+    # 收尾时应该查过所有 attempt 的 order_id
+    assert "maker-1" in client.mytrades_calls
+
+
 async def test_close_partial_fill(settings):
     client = PartialFillClient(filled=0.02, requested_average=110.0)
     ex = Executor(client, settings)
@@ -325,3 +485,70 @@ async def test_close_partial_fill(settings):
     assert res["qty"] == pytest.approx(0.02)
     assert res["entry_price"] == pytest.approx(100.0)
     assert res["pos_side"] == "long"
+
+
+
+class MakerHardCapClient(MakerPartialClient):
+    """C1：fetch_order 持续抛瞬时错误，触发 maker wait 硬上限。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fetch_order_calls = 0
+
+    async def fetch_order(self, symbol, order_id, params=None):
+        self.fetch_order_calls += 1
+        # 模拟 ccxt RateLimitExceeded，触发 _wait_maker_fill 的 transient retry + hard cap
+        raise ccxt.RateLimitExceeded("simulated rate limit")
+
+
+async def test_maker_wait_hits_hard_cap_when_fetch_order_hangs(settings):
+    """C1：fetch_order 一直抛瞬时错误，maker wait 不应卡死，超出 hard_cap 后中止。"""
+    settings.execution.entry_mode = ExecutionMode.MAKER_ONLY
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 0
+    client = MakerHardCapClient()
+    ex = Executor(client, settings)
+
+    t0 = time.monotonic()
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+    elapsed = time.monotonic() - t0
+
+    # 硬上限 = max(timeout*2, 5s) = max(0.1, 5) = 5s。允许 6s 余量。
+    assert elapsed < 6.0, f"hard cap should abort <6s, got {elapsed:.2f}s"
+    # hard cap abort 后 status=canceled (与原 unfilled 行为一致)
+    assert res["status"] == "canceled"
+    assert res["filled"] is False
+
+
+async def test_recover_via_mytrades_aggregates_multiple_trades(settings):
+    """B1 + B3 边界：单 order 多笔成交（部分成交分批返回），加权重计算正确。"""
+    settings.execution.entry_mode = ExecutionMode.MAKER_ONLY
+    settings.execution.maker_timeout_seconds = 0.05
+    settings.execution.maker_poll_seconds = 0.01
+    settings.execution.maker_max_requotes = 0
+
+    class _MyTradesSplitClient(MakerNotFoundThenFilledClient):
+        def __init__(self):
+            super().__init__()
+            # 3 笔成交：0.01 @ 100, 0.015 @ 100.5, 0.005 @ 99.5
+            self._mytrades = [
+                {"amount": 0.01, "price": 100.0, "fee": {"cost": 0.0001, "currency": "USDT"}},
+                {"amount": 0.015, "price": 100.5, "fee": {"cost": 0.0002, "currency": "USDT"}},
+                {"amount": 0.005, "price": 99.5, "fee": {"cost": 0.0001, "currency": "USDT"}},
+            ]
+        async def fetch_order_trades(self, symbol, order_id, limit=100):
+            return self._mytrades
+    client = _MyTradesSplitClient()
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+
+    # 累加 0.01 + 0.015 + 0.005 = 0.03 < 0.05 → partial
+    assert res["status"] == "partial"
+    assert res["qty"] == pytest.approx(0.03)
+    # 加权均价 = (0.01*100 + 0.015*100.5 + 0.005*99.5) / 0.03
+    expected_avg = (0.01 * 100.0 + 0.015 * 100.5 + 0.005 * 99.5) / 0.03
+    assert res["price"] == pytest.approx(expected_avg, rel=1e-6)
+    # 手续费累加
+    assert res["fee"] == pytest.approx(0.0004)

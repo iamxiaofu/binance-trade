@@ -28,6 +28,30 @@ def _float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+# Binance USDT-M ISOLATED 模式返回的 position 字典里 leverage 字段缺失，
+# 仅靠 notional / initial_margin / isolated_wallet 可以反推。下表是常见档位。
+_LEVERAGE_LADDER = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125]
+
+
+def _derive_leverage_from_margin(
+    notional: float,
+    initial_margin: float,
+    isolated_margin: float,
+) -> int:
+    """从 notional + 保证金反推杠杆（ISOLATED 模式交易所不返回 leverage 字段时用）。"""
+    base = initial_margin if initial_margin > 0 else isolated_margin
+    if notional <= 0 or base <= 0:
+        return 0
+    raw = notional / base
+    if raw <= 1.0:
+        return 1
+    # 取最接近且不小于 raw 的档位
+    for lev in _LEVERAGE_LADDER:
+        if lev >= raw - 0.5:
+            return lev
+    return _LEVERAGE_LADDER[-1]
+
+
 def normalize_position(
     position: Mapping[str, Any] | None,
     *,
@@ -65,13 +89,20 @@ def normalize_position(
     if roi_pct is None:
         roi_pct = (unrealized_pnl / initial_margin * 100.0) if initial_margin else 0.0
 
+    # B6：leverage 字段在 ISOLATED 模式下常常为 null。从 notional/initial_margin 反推。
+    raw_lev = _float(_value(p, info, "leverage"))
+    if raw_lev > 0:
+        leverage = int(raw_lev)
+    else:
+        leverage = _derive_leverage_from_margin(notional, initial_margin, isolated_margin)
+
     return {
         "symbol": sym,
         "side": side,
         "contracts": contracts,
         "entry_price": entry,
         "mark_price": mark,
-        "leverage": int(_float(_value(p, info, "leverage"))),
+        "leverage": leverage,
         "unrealized_pnl": unrealized_pnl,
         "notional": notional,
         "initial_margin": initial_margin,

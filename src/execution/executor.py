@@ -455,6 +455,14 @@ class Executor:
 
         last_rejected: dict | None = None
         attempts = self._cfg.maker_max_requotes + 1
+        # 累计跨 attempt 的真实成交：B2/B3 修复：避免 race 下「attempt 1
+        # 已部分成交但 fetch_order 返回 -2013」导致那部分成交被后续 attempt 覆盖。
+        cumulative_filled = 0.0
+        cumulative_cost = 0.0
+        cumulative_fee = 0.0
+        cumulative_fee_asset = ""
+        winning_attempt: dict | None = None
+        attempt_order_ids: list[str] = []
         for attempt in range(attempts):
             quote = await self._policy.maker_quote(
                 client=self._client,
@@ -498,6 +506,8 @@ class Executor:
                 f"maker open {symbol}",
             )
             order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
+            if order_id:
+                attempt_order_ids.append(order_id)
             logger.info(
                 "[{}] maker OPEN {} qty={} price={} id={} attempt={}/{}",
                 symbol, side, q, limit_price, order_id, attempt + 1, attempts,
@@ -513,6 +523,7 @@ class Executor:
                 observed, q, limit_price, assume_filled_if_missing=False
             )
             if fill_qty > 0:
+                # 当前 attempt 有成交：先撤剩余，累加到跨 attempt 总额。
                 cancel_raw = None
                 if status == "partial":
                     cancel_raw = await self._cancel_regular_order_safe(symbol, order_id)
@@ -523,38 +534,29 @@ class Executor:
                 trades = await self._fetch_order_trades_safe(symbol, order_id)
                 fee, fee_asset, liquidity = self._fee_summary(observed, trades)
                 liquidity = liquidity or "maker"
-                raw = {
+                # 累加跨 attempt 真实成交
+                attempt_cost = fill_qty * (avg_px if avg_px > 0 else limit_price)
+                cumulative_filled += fill_qty
+                cumulative_cost += attempt_cost
+                cumulative_fee += fee
+                if fee_asset and not cumulative_fee_asset:
+                    cumulative_fee_asset = fee_asset
+                winning_attempt = {
+                    "fill_qty": fill_qty,
+                    "avg_px": avg_px,
+                    "status": status,
                     "order": observed,
                     "initial_order": order,
                     "cancel_remaining": cancel_raw,
                     "maker_quote": quote.__dict__,
+                    "client_order_id": self._order_client_id(observed, client_order_id),
+                    "liquidity": liquidity,
                 }
-                res = _result(
-                    symbol=symbol,
-                    kind="OPEN",
-                    side=side,
-                    qty=fill_qty,
-                    price=avg_px,
-                    notional=fill_qty * avg_px,
-                    dry_run=False,
-                    status=status,
-                    order_id=order_id,
-                    raw=raw,
-                    order_type="limit",
-                    execution_mode=mode.value,
-                    time_in_force=self._cfg.maker_time_in_force,
-                    requested_qty=q,
-                    requested_price=price,
-                    limit_price=limit_price,
-                    remaining_qty=max(q - fill_qty, 0.0),
-                    liquidity=liquidity,
-                    fee=fee,
-                    fee_asset=fee_asset,
-                    client_order_id=self._order_client_id(observed, client_order_id),
-                )
-                res["leverage"] = decision.leverage
-                res["margin"] = res["notional"] / decision.leverage if decision.leverage > 0 else 0.0
-                return res
+                # 已达到计划量，提前收尾（不再发后续 attempt）
+                if cumulative_filled >= q - 1e-12:
+                    break
+                # 否则继续下一 attempt 补足
+                continue
 
             cancel_raw = await self._cancel_regular_order_safe(symbol, order_id)
             last_rejected = {
@@ -564,6 +566,79 @@ class Executor:
                 "maker_quote": quote.__dict__,
                 "reason": "maker unfilled",
             }
+
+        # 收尾：若任一 attempt 有过成交，按累计成交出 partial/filled 结果
+        if winning_attempt is not None and cumulative_filled > 0:
+            cum_avg = (cumulative_cost / cumulative_filled) if cumulative_filled > 0 else winning_attempt["avg_px"]
+            cum_status = "filled" if cumulative_filled >= q - 1e-12 else "partial"
+            raw = {
+                "order": winning_attempt["order"],
+                "initial_order": winning_attempt["initial_order"],
+                "cancel_remaining": winning_attempt["cancel_remaining"],
+                "maker_quote": winning_attempt["maker_quote"],
+                "cumulative_filled": cumulative_filled,
+                "cumulative_cost": cumulative_cost,
+                "attempt_order_ids": attempt_order_ids,
+            }
+            res = _result(
+                symbol=symbol,
+                kind="OPEN",
+                side=side,
+                qty=cumulative_filled,
+                price=cum_avg if cum_avg > 0 else winning_attempt["avg_px"],
+                notional=cumulative_cost,
+                dry_run=False,
+                status=cum_status,
+                order_id=str(winning_attempt["order"].get("id") or ""),
+                raw=raw,
+                order_type="limit",
+                execution_mode=mode.value,
+                time_in_force=self._cfg.maker_time_in_force,
+                requested_qty=q,
+                requested_price=price,
+                limit_price=limit_price,
+                remaining_qty=max(q - cumulative_filled, 0.0),
+                liquidity=winning_attempt["liquidity"],
+                fee=cumulative_fee,
+                fee_asset=cumulative_fee_asset,
+                client_order_id=winning_attempt["client_order_id"],
+            )
+            res["leverage"] = decision.leverage
+            res["margin"] = res["notional"] / decision.leverage if decision.leverage > 0 else 0.0
+            return res
+
+        # 全部 attempt 都没看到 fill，再做一次 myTrades 全局对账（B3 修复）：
+        # 万一 _wait_maker_fill 的 _recover_via_my_trades 没命中（极少见：API 临时
+        # 把 myTrades 也搞挂了），这里兜底再查一次。
+        residual = await self._reconcile_maker_residual_fills(
+            symbol=symbol, order_ids=attempt_order_ids, fallback_price=limit_price,
+        )
+        if residual is not None and residual["filled"] > 0:
+            res = _result(
+                symbol=symbol,
+                kind="OPEN",
+                side=side,
+                qty=residual["filled"],
+                price=residual["avg_price"],
+                notional=residual["cost"],
+                dry_run=False,
+                status="partial" if residual["filled"] < q - 1e-12 else "filled",
+                order_id=str(residual["order_id"] or ""),
+                raw={"reason": "residual myTrades reconcile", "residual": residual},
+                order_type="limit",
+                execution_mode=mode.value,
+                time_in_force=self._cfg.maker_time_in_force,
+                requested_qty=q,
+                requested_price=price,
+                limit_price=limit_price,
+                remaining_qty=max(q - residual["filled"], 0.0),
+                liquidity="maker",
+                fee=residual["fee"],
+                fee_asset=residual["fee_asset"],
+            )
+            res["leverage"] = decision.leverage
+            res["margin"] = res["notional"] / decision.leverage if decision.leverage > 0 else 0.0
+            return res
 
         if mode is ExecutionMode.MAKER_FIRST and (
             self._cfg.maker_unfilled_action is MakerUnfilledAction.FALLBACK_MARKET
@@ -590,6 +665,59 @@ class Executor:
             requested_price=price,
         )
 
+    async def _reconcile_maker_residual_fills(
+        self,
+        *,
+        symbol: str,
+        order_ids: list[str],
+        fallback_price: float,
+    ) -> dict | None:
+        """MAKER 全失败收尾时，对所有尝试过的 order_id 再查一次 myTrades。
+
+        兜底用：正常路径已由 ``_wait_maker_fill._recover_via_my_trades`` 覆盖。
+        这里只处理 _recover_via_my_trades 因网络瞬时错误全失败的情况。
+        返回 {order_id, filled, cost, avg_price, fee, fee_asset} 或 None。
+        """
+        if not order_ids or not hasattr(self._client, "fetch_order_trades"):
+            return None
+        total_filled = 0.0
+        total_cost = 0.0
+        total_fee = 0.0
+        fee_asset = ""
+        first_order_id = ""
+        for oid in order_ids:
+            try:
+                trades = await self._client.fetch_order_trades(symbol, oid)
+            except Exception as e:
+                logger.warning(
+                    "[{}] residual myTrades query for {} failed: {}", symbol, oid, e,
+                )
+                continue
+            if not first_order_id and oid:
+                first_order_id = oid
+            for t in trades:
+                amount = self._safe_float(t.get("amount") or 0.0)
+                price = self._safe_float(t.get("price") or 0.0)
+                total_filled += amount
+                total_cost += amount * price
+                fee = (t.get("fee") or {}) if isinstance(t.get("fee"), dict) else {}
+                cost = self._safe_float(fee.get("cost"))
+                if cost:
+                    total_fee += abs(cost)
+                if not fee_asset:
+                    fee_asset = self._safe_str(fee.get("currency"))
+        if total_filled <= 0:
+            return None
+        avg_price = (total_cost / total_filled) if total_filled > 0 else fallback_price
+        return {
+            "order_id": first_order_id,
+            "filled": total_filled,
+            "cost": total_cost,
+            "avg_price": avg_price,
+            "fee": total_fee,
+            "fee_asset": fee_asset,
+        }
+
     async def _wait_maker_fill(
         self,
         *,
@@ -599,8 +727,21 @@ class Executor:
         requested_qty: float,
         fallback_price: float,
     ) -> dict:
+        """轮询 maker 订单直到完成/取消/超时。
+
+        重要：fetch_order 抛 -2013（OrderNotFound）不一定是「完全未成交」——Binance
+        在订单被自动取消（例如 GTX 触发、IOC 部分成交后撤单）时也会返回这个错。
+        此时必须回退到 ``fetch_order_trades(order_id)`` 查 ``myTrades`` 拿真实
+        成交数据，再把 ``observed`` 改写成「已成交 + 已取消」的状态返回，避免把
+        部分成交的仓位丢掉。
+
+        硬上限：即使所有 fetch 都 hang 也不让 maker 轮询把策略循环卡死
+        （``maker_timeout_seconds * 2``，下限 5s）。
+        """
         deadline = asyncio.get_running_loop().time() + self._cfg.maker_timeout_seconds
         observed = created_order
+        hard_cap = max(self._cfg.maker_timeout_seconds * 2.0, 5.0)
+        started = asyncio.get_running_loop().time()
         while True:
             fill_qty, _avg_px, status = self._parse_fill(
                 observed,
@@ -613,13 +754,110 @@ class Executor:
             now = asyncio.get_running_loop().time()
             if now >= deadline:
                 return observed
+            if now - started > hard_cap:
+                logger.error(
+                    "[{}] maker wait hard cap {}s exceeded for order {}; aborting wait",
+                    symbol, hard_cap, order_id,
+                )
+                return observed
             await asyncio.sleep(min(self._cfg.maker_poll_seconds, max(deadline - now, 0.0)))
-            if order_id and hasattr(self._client, "fetch_order"):
-                try:
-                    observed = await self._client.fetch_order(symbol, order_id)
-                except Exception as e:
-                    logger.warning("[{}] fetch maker order {} failed: {}", symbol, order_id, e)
+            if not order_id or not hasattr(self._client, "fetch_order"):
+                continue
+            try:
+                observed = await self._client.fetch_order(symbol, order_id)
+            except ccxt.OrderNotFound as e:
+                # 关键修复：订单在 fetch 之前已不可见（被取消/已成交后清理），
+                # 但 myTrades 仍能查到成交。回退到成交历史做一次最终判定。
+                recovered = await self._recover_via_my_trades(
+                    symbol=symbol, order_id=order_id, requested_qty=requested_qty,
+                    fallback_price=fallback_price,
+                )
+                if recovered is not None:
+                    observed = recovered
+                    logger.warning(
+                        "[{}] maker order {} disappeared ({}); recovered fills from myTrades",
+                        symbol, order_id, e,
+                    )
+                else:
+                    logger.warning(
+                        "[{}] maker order {} disappeared ({}); no myTrades fill; treat as unfilled",
+                        symbol, order_id, e,
+                    )
                     return observed
+            except (ccxt.RateLimitExceeded, ccxt.NetworkError, ccxt.DDoSProtection) as e:
+                logger.warning(
+                    "[{}] fetch maker order {} transient error: {}; retry within deadline",
+                    symbol, order_id, e,
+                )
+                continue
+            except ccxt.ExchangeError as e:
+                # 其它业务错误（账户/参数等），不再重试这一单，避免后续 attempt 误判
+                logger.warning(
+                    "[{}] fetch maker order {} exchange error: {}; aborting wait",
+                    symbol, order_id, e,
+                )
+                return observed
+
+    async def _recover_via_my_trades(
+        self,
+        *,
+        symbol: str,
+        order_id: str,
+        requested_qty: float,
+        fallback_price: float,
+    ) -> dict | None:
+        """fetch_order 失败时回退到 myTrades 拿真实成交。
+
+        返回值：构造好的 order dict（status 反映 filled/canceled+部分成交），
+        便于上层 ``_parse_fill`` 解析出 fill_qty>0；或 None（确实没有成交）。
+        """
+        if not order_id or not hasattr(self._client, "fetch_order_trades"):
+            return None
+        try:
+            trades = await self._client.fetch_order_trades(symbol, order_id)
+        except Exception as e:
+            logger.warning("[{}] myTrades recovery for {} failed: {}", symbol, order_id, e)
+            return None
+        if not trades:
+            return None
+        filled = sum(self._safe_float(t.get("amount") or 0.0) for t in trades)
+        if filled <= 0:
+            return None
+        # 重新计算加权均价与手续费
+        total_cost = 0.0
+        fee_total = 0.0
+        fee_asset = ""
+        for t in trades:
+            amount = self._safe_float(t.get("amount") or 0.0)
+            price = self._safe_float(t.get("price") or 0.0)
+            total_cost += amount * price
+            fee = (t.get("fee") or {}) if isinstance(t.get("fee"), dict) else {}
+            cost = self._safe_float(fee.get("cost"))
+            if cost:
+                fee_total += abs(cost)
+            if not fee_asset:
+                fee_asset = self._safe_str(fee.get("currency"))
+        avg_price = (total_cost / filled) if filled > 0 else fallback_price
+        # 模拟 ccxt order dict 形态，让 _parse_fill 走 partial/filled 分支
+        return {
+            "id": order_id,
+            "symbol": symbol,
+            "amount": requested_qty,
+            "price": fallback_price,
+            "average": avg_price if avg_price > 0 else fallback_price,
+            "filled": filled,
+            "remaining": max(0.0, requested_qty - filled),
+            "status": "filled" if filled >= requested_qty - 1e-12 else "canceled",
+            "info": {
+                "orderId": order_id,
+                "status": "PARTIALLY_FILLED" if filled < requested_qty - 1e-12 else "FILLED",
+                "executedQty": str(filled),
+                "cumulativeQuoteQty": str(total_cost),
+                "avgPrice": str(avg_price),
+            },
+            "fee": {"cost": fee_total, "currency": fee_asset},
+            "trades": trades,
+        }
 
     async def _cancel_regular_order_safe(self, symbol: str, order_id: str) -> dict | None:
         if not order_id or not hasattr(self._client, "cancel_order"):

@@ -494,6 +494,54 @@ class Store:
                     row.raw_json = ""
             await session.commit()
 
+    async def latest_finished_position_claim(
+        self,
+        symbol: str,
+        *,
+        within_ms: int = 900_000,
+    ) -> dict[str, Any] | None:
+        """B4 修复：最近一条已收尾的 position_claim（含 canceled/error/filled）。
+
+        用于判断「交易所确实有 0<qty<planned 的孤儿持仓」是否来源于最近一次
+        策略 OPEN 失败但留了部分成交的 MAKER 序列，从而走「接管」路径而不是
+        「禁用币种」路径。
+
+        within_ms: 仅返回 ts_ms 在此窗口内的记录。默认 15 分钟。
+        updated_at 是 String('YYYY-MM-DD HH:MM:SS')，因此用 ts_ms 做窗口过滤。
+        """
+        import time as _t
+
+        symbol = normalize_symbol(symbol)
+        now_ms = int(_t.time() * 1000)
+        threshold = now_ms - max(int(within_ms), 1)
+        finished_statuses = {"canceled", "error", "filled", "partial", "rejected", "expired"}
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(PositionClaimRow)
+                    .where(PositionClaimRow.symbol == symbol)
+                    .where(PositionClaimRow.status.in_(tuple(finished_statuses)))
+                    .where(PositionClaimRow.ts_ms >= threshold)
+                    .order_by(PositionClaimRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "ts_ms": row.ts_ms,
+                "symbol": row.symbol,
+                "side": row.side,
+                "status": row.status,
+                "source": row.source,
+                "planned_qty": row.planned_qty,
+                "filled_qty": row.filled_qty,
+                "entry_price": row.entry_price,
+                "client_order_id": row.client_order_id,
+                "reason": row.reason,
+            }
+
     async def has_active_position_claim(self, symbol: str) -> bool:
         import time as _t
 

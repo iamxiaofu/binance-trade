@@ -32,6 +32,28 @@ const isExchangeLive = computed(() => positionsSource.value === 'exchange')
 const hasMissingProtection = computed(() => positions.value.some((p) =>
   p.protection?.missing_sl || p.protection?.missing_tp
 ))
+// B5：暴露 symbol_enabled 表与「持仓 + 币种已禁用」集合。
+const symbolEnabledMap = computed(() => live.summary?.symbol_enabled || {})
+const disabledWithPosition = computed(() => new Set(live.summary?.disabled_with_position || []))
+function isSymbolDisabled(symbol) {
+  return symbolEnabledMap.value[symbol] === false
+}
+const enabling = ref({})
+async function enableSymbol(row) {
+  const symbol = row.symbol
+  if (!symbol) return
+  enabling.value = { ...enabling.value, [symbol]: true }
+  try {
+    await api.command('SET_SYMBOL_ENABLED', `${symbol}=true`)
+    ElMessage.success(`${symbol} 已重新启用，孤儿持仓将在下个周期自动接管并补 SL/TP`)
+  } catch (e) {
+    ElMessage.error(`启用 ${symbol} 失败: ${e.message}`)
+  } finally {
+    const next = { ...enabling.value }
+    delete next[symbol]
+    enabling.value = next
+  }
+}
 
 function fmt(n, d = 4) {
   if (n === null || n === undefined || n === '') return '—'
@@ -248,6 +270,29 @@ async function submitManualClose() {
         style="margin-bottom:12px"
         title="存在持仓缺少止盈或止损条件单，请检查交易所后台或重新挂保护单"
       />
+      <el-alert
+        v-if="disabledWithPosition.size > 0"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom:12px"
+      >
+        <template #title>
+          检测到 {{ disabledWithPosition.size }} 个币种被禁用但仍有交易所持仓
+          <span style="margin-left:8px">
+            <el-button
+              v-for="sym in [...disabledWithPosition]"
+              :key="sym"
+              size="small"
+              type="success"
+              :loading="enabling[sym]"
+              @click="enableSymbol({ symbol: sym })"
+            >
+              启用 {{ sym }}
+            </el-button>
+          </span>
+        </template>
+      </el-alert>
       <el-table :data="positions" stripe empty-text="当前无持仓">
         <el-table-column prop="symbol" label="标的" width="120" />
         <el-table-column label="方向" width="90">
@@ -315,6 +360,10 @@ async function submitManualClose() {
         <el-table-column label="操作" width="340" fixed="right">
           <template #default="{ row }">
             <div class="action-buttons">
+              <el-tag v-if="isSymbolDisabled(row.symbol)" type="warning" size="small"
+                effect="dark" style="margin-right:6px">
+                币种已禁用
+              </el-tag>
               <template v-if="needsRepair(row)">
                 <el-button
                   type="danger"
@@ -327,6 +376,15 @@ async function submitManualClose() {
                 </el-button>
                 <el-button size="small" @click="openTakeover(row)">接管保护</el-button>
               </template>
+              <el-button
+                v-if="isSymbolDisabled(row.symbol)"
+                size="small"
+                type="success"
+                :loading="enabling[row.symbol]"
+                @click="enableSymbol(row)"
+              >
+                启用并自动接管
+              </el-button>
               <el-tag v-else type="success" size="small">{{ missingProtectionText(row) }}</el-tag>
               <el-button type="danger" plain size="small" @click="openManualClose(row)">
                 手动平仓

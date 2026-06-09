@@ -123,6 +123,35 @@ class FakeStore:
     async def has_open_trade(self, symbol):
         return symbol in self.open_trades
 
+    def set_decision(self, symbol, **fields):
+        """测试辅助：注入最近一条 OPEN 决策模板。"""
+        base = {
+            "id": 90000 + len(getattr(self, "decisions", []) or []),
+            "symbol": symbol,
+            "action": "OPEN_LONG",
+            "stop_loss_pct": 0.02,
+            "take_profit_pct": 0.04,
+            "ref_price": 100.0,
+            "ts_ms": 1_000_000_000_000,
+            "created_at": "2026-06-09 00:00:00",
+        }
+        base.update(fields)
+        self.latest_decision = base
+
+    async def latest_open_decision(self, symbol):
+        ld = getattr(self, "latest_decision", None)
+        if ld and ld.get("symbol") == symbol:
+            return ld
+        return None
+
+    async def latest_protection_templates(self, symbol, *, dry_run=None):
+        # 向后兼容：旧测试用 self.templates = {"SL": ..., "TP": ...}（直接是模板字典）
+        # 新测试可用 self.templates_by_symbol = {"BTCUSDT": {"SL": ...}}
+        tpl = getattr(self, "templates_by_symbol", {}).get(symbol)
+        if tpl is not None:
+            return tpl
+        return getattr(self, "templates", {}) or {}
+
     async def open_trade_qty(self, symbol):
         return self.open_qty.get(symbol, 0.0) if symbol in self.open_trades else 0.0
 
@@ -142,6 +171,30 @@ class FakeStore:
 
     async def has_active_position_claim(self, symbol):
         return symbol in self.active_claims
+
+    def set_finished_claim(self, symbol, **fields):
+        """测试辅助：注入一个最近收尾的 claim，让 _adopt_orphan_position 能命中。"""
+        self.claims.append({
+            "id": 99000 + len(self.claims),
+            "symbol": symbol,
+            "ts_ms": 1_000_000_000_000,  # far in past relative to within_ms
+            "status": "canceled",
+            "source": "strategy",
+            "planned_qty": 1.0,
+            "filled_qty": 0.0,
+            "entry_price": 0.0,
+            "client_order_id": "",
+            "reason": "",
+            **fields,
+        })
+
+    async def latest_finished_position_claim(self, symbol, *, within_ms=900_000):
+        for c in reversed(self.claims):
+            if c["symbol"] == symbol and c["status"] in (
+                "canceled", "error", "filled", "partial", "rejected", "expired",
+            ):
+                return c
+        return None
 
     async def sync_condition_order_history(self, **kw):
         return 0
@@ -1311,3 +1364,143 @@ async def test_command_unknown_marked_failed(settings, creds, monkeypatch):
     await eng._process_commands()
     assert eng._store.marked[0][0] == 9
     assert eng._store.marked[0][1] == "failed"
+
+
+
+class FakeExchangeClientWithPosition(FakeClient):
+    """_adopt_orphan_position 需要的最小 ExchangeClient 接口。"""
+
+    def __init__(self, position):
+        super().__init__()
+        self._position = position
+
+    async def fetch_positions(self, symbols=None):
+        return [self._position] if self._position else []
+
+    async def fetch_position(self, symbol):
+        return self._position if self._position else None
+
+
+async def test_orphan_adoption_picks_up_managed_qty_and_repairs_sl_tp(settings, creds, monkeypatch):
+    """B4 核心测试：本地无 open trade + 无 active claim + 有最近 canceled claim +
+    交易所侧确有 0<qty<planned 的孤儿持仓 → 自动接管建 trade + 补 SL/TP，
+    不再禁用币种。
+    """
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.open_trades.discard("BTCUSDT")
+    eng._store.active_claims.discard("BTCUSDT")
+    eng._store.set_finished_claim(
+        "BTCUSDT", side="long", planned_qty=1.0, filled_qty=0.0,
+        status="canceled", source="strategy", ts_ms=1_000_000_000_000,
+    )
+    # 注入最近 OPEN 决策模板，用于 SL/TP 触发价
+    eng._store.set_decision("BTCUSDT", action="OPEN_LONG", stop_loss_pct=0.02, take_profit_pct=0.04)
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.05,
+        "entryPrice": 100.0,
+        "markPrice": 100.0,
+        "info": {"leverage": "3"},
+    }
+    fake_client = FakeExchangeClientWithPosition(pos)
+    eng._client = fake_client
+    eng.runtime.positions["BTCUSDT"] = pos
+
+    # 让 FakeExecutor.place_protection_orders 把结果回灌到 fake_client.condition_orders，
+    # 模拟交易所真有 SL/TP 挂单（_active_protection_orders 才会找到）
+    orig_place = eng._executor.place_protection_orders
+    async def place_with_side_effect(*, symbol, pos_side, qty, specs):
+        results = await orig_place(symbol=symbol, pos_side=pos_side, qty=qty, specs=specs)
+        for o in results:
+            fake_client.condition_orders.append({
+                "id": o.get("id"),
+                "symbol": "BTC/USDT:USDT",
+                "type": o.get("order_type"),
+                "side": o.get("side"),
+                "amount": o.get("qty"),
+                "stopPrice": o.get("price"),
+                "status": "open",
+                "reduceOnly": True,
+            })
+        return results
+    eng._executor.place_protection_orders = place_with_side_effect
+
+    await eng._enforce_exchange_invariants("test")
+
+    # 验证接管成功
+    assert "BTCUSDT" in eng._store.open_trades
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert any(t["source"] == "orphan_adoption" for t in eng._store.takeover_trades)
+    # 验证 SL/TP 被挂
+    sl_tp_orders = [
+        o for o in eng._store.orders
+        if o.get("kind") in ("SL", "TP")
+    ]
+    assert sl_tp_orders, "orphan adoption should place SL/TP"
+
+
+async def test_orphan_adoption_skips_when_no_recent_claim(settings, creds, monkeypatch):
+    """B4 边界：没最近 claim → 走原有"禁用"路径，保持向后兼容。"""
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.open_trades.discard("BTCUSDT")
+    eng._store.active_claims.discard("BTCUSDT")
+    pos = {
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0.05,
+        "entryPrice": 100.0, "markPrice": 100.0, "info": {"leverage": "3"},
+    }
+    eng._client = FakeExchangeClientWithPosition(pos)
+    eng.runtime.positions["BTCUSDT"] = pos
+
+    await eng._enforce_exchange_invariants("test")
+
+    # 没有 claim → 维持原"禁用"行为
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert "BTCUSDT" not in eng._store.open_trades
+
+
+async def test_orphan_adoption_skipped_on_side_mismatch(settings, creds, monkeypatch):
+    """B4 边界：claim 是 long，交易所持仓是 short → 不接管（避免反向加仓）。"""
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.open_trades.discard("BTCUSDT")
+    eng._store.active_claims.discard("BTCUSDT")
+    eng._store.set_finished_claim(
+        "BTCUSDT", side="long", planned_qty=1.0, status="canceled", source="strategy",
+    )
+    pos = {
+        "symbol": "BTC/USDT:USDT", "side": "short", "contracts": 0.05,
+        "entryPrice": 100.0, "markPrice": 100.0, "info": {"leverage": "3"},
+    }
+    eng._client = FakeExchangeClientWithPosition(pos)
+    eng.runtime.positions["BTCUSDT"] = pos
+
+    await eng._enforce_exchange_invariants("test")
+
+    # side 不匹配 → 不接管，按原"禁用"路径走
+    assert "BTCUSDT" not in eng._store.open_trades
+    assert eng._symbol_enabled["BTCUSDT"] is False
+
+
+async def test_orphan_adoption_skipped_on_qty_out_of_range(settings, creds, monkeypatch):
+    """B4 边界：claim planned=1.0，交易所 qty=5.0（10x）→ 不接管（不是同一笔）。"""
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.open_trades.discard("BTCUSDT")
+    eng._store.active_claims.discard("BTCUSDT")
+    eng._store.set_finished_claim(
+        "BTCUSDT", side="long", planned_qty=1.0, status="canceled", source="strategy",
+    )
+    pos = {
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 5.0,
+        "entryPrice": 100.0, "markPrice": 100.0, "info": {"leverage": "3"},
+    }
+    eng._client = FakeExchangeClientWithPosition(pos)
+    eng.runtime.positions["BTCUSDT"] = pos
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert "BTCUSDT" not in eng._store.open_trades
+    assert eng._symbol_enabled["BTCUSDT"] is False
