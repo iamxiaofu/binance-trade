@@ -61,3 +61,45 @@ def test_breaker_and_kill_flags():
     rt.trip_breaker()
     rt.trigger_kill()
     assert rt.halt_new_entries and rt.kill_switch
+
+
+def test_rehydrate_sets_day_key_to_today():
+    """启动时 rehydrate 应当把 day_key 设到本地"今天"，并把今日 pnl 对齐到 by_day。"""
+    import time as _t
+    rt = RuntimeState()
+    today = _t.strftime("%Y-%m-%d", _t.localtime())
+    rt.rehydrate_day_pnl({today: -1.234})
+    assert rt.day_key == today
+    assert rt.day_realized_pnl == -1.234
+
+
+def test_rehydrate_ignores_other_days_and_zero_today():
+    rt = RuntimeState()
+    rt.rehydrate_day_pnl({"2020-01-01": -999.0, "2099-12-31": 50.0})
+    # 今日 by_day 缺失 → 0
+    assert rt.day_realized_pnl == 0.0
+    # day_key 仍初始化为本地今日
+    import time as _t
+    assert rt.day_key == _t.strftime("%Y-%m-%d", _t.localtime())
+
+
+def test_rehydrate_empty_dict_only_inits_day_key():
+    rt = RuntimeState()
+    rt.rehydrate_day_pnl({})
+    assert rt.day_realized_pnl == 0.0
+    assert rt.day_key != ""
+
+
+def test_day_roll_uses_local_timezone():
+    """roll_day_if_needed 用本地时区（与本地 CST 容器一致）：now=UTC epoch 也按本地日界。"""
+    import time as _t
+    rt = RuntimeState()
+    # epoch=0 (UTC 1970-01-01 00:00) → CST 1970-01-01 08:00 仍同一天，roll 不应触发
+    rt.roll_day_if_needed(now=0)
+    rt.add_realized_pnl(-5.0)
+    assert rt.roll_day_if_needed(now=0) is False
+    assert rt.day_realized_pnl == -5.0
+    # 远未来时间（>1 天）应当 roll
+    future = _t.time() + 86400 * 2
+    assert rt.roll_day_if_needed(now=future) is True
+    assert rt.day_realized_pnl == 0.0

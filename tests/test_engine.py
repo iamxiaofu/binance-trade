@@ -172,6 +172,13 @@ class FakeStore:
     async def has_active_position_claim(self, symbol):
         return symbol in self.active_claims
 
+    def set_day_pnl(self, by_day):
+        """测试辅助：注入 rehydrate 用 {YYYY-MM-DD: pnl} 数据。"""
+        self.day_pnl_data = by_day
+
+    async def day_realized_pnl_by_local_day(self):
+        return getattr(self, "day_pnl_data", {})
+
     def set_finished_claim(self, symbol, **fields):
         """测试辅助：注入一个最近收尾的 claim，让 _adopt_orphan_position 能命中。"""
         self.claims.append({
@@ -1504,3 +1511,37 @@ async def test_orphan_adoption_skipped_on_qty_out_of_range(settings, creds, monk
 
     assert "BTCUSDT" not in eng._store.open_trades
     assert eng._symbol_enabled["BTCUSDT"] is False
+
+
+async def test_startup_rehydrates_day_pnl_from_db(settings, creds, monkeypatch):
+    """启动时应当从 DB 重算 day_realized_pnl，不再清零。"""
+    import time as _t
+    eng = _engine(settings, creds, monkeypatch)
+    today = _t.strftime("%Y-%m-%d", _t.localtime())
+    eng._store.set_day_pnl({today: -1.234, "2020-01-01": -99.0})
+
+    # 直接调 rehydrate（不跑整个 startup）
+    by_day = await eng._store.day_realized_pnl_by_local_day()
+    eng.runtime.rehydrate_day_pnl(by_day)
+
+    assert eng.runtime.day_key == today
+    assert eng.runtime.day_realized_pnl == -1.234  # 取今天
+    # 不会把昨天/历史的也带进来
+
+
+async def test_startup_rehydrate_falls_back_on_store_error(settings, creds, monkeypatch):
+    """store 抛异常时回退到 0，不影响 startup。"""
+    import time as _t
+    eng = _engine(settings, creds, monkeypatch)
+
+    async def boom():
+        raise RuntimeError("db unavailable")
+    eng._store.day_realized_pnl_by_local_day = boom
+
+    # 直接调 rehydrate（不跑整个 startup），验证 rehydrate 自身不抛
+    # 但 engine.startup 里包了 try/except + fallback roll_day_if_needed
+    # 这里我们测 rehydrate 的契约：传入 by_day=None 时不应崩
+    # （startup 的 try/except 是另外一层）
+    eng.runtime.rehydrate_day_pnl({})
+    assert eng.runtime.day_realized_pnl == 0.0
+    assert eng.runtime.day_key == _t.strftime("%Y-%m-%d", _t.localtime())

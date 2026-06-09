@@ -16,7 +16,7 @@ function fmt(value, digits = 2) {
 }
 
 function pnlClass(value) {
-  return Number(value || 0) >= 0 ? 'pnl-pos' : 'pnl-neg'
+  const n = Number(value || 0); return n > 0 ? 'pnl-pos' : n < 0 ? 'pnl-neg' : ''
 }
 
 function cssVar(name, fallback) {

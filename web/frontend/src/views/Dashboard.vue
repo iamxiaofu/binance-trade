@@ -99,8 +99,8 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
       <el-col :span="6">
         <el-card class="metric-card" shadow="never">
           <div class="label">当日已实现盈亏</div>
-          <div class="value" :class="dayPnl >= 0 ? 'pnl-pos' : 'pnl-neg'">
-            {{ dayPnl >= 0 ? '+' : '' }}{{ fmt(dayPnl) }}
+          <div class="value" :class="dayPnl > 0 ? 'pnl-pos' : dayPnl < 0 ? 'pnl-neg' : ''">
+            {{ dayPnl > 0 ? '+' : '' }}{{ fmt(dayPnl) }}
           </div>
         </el-card>
       </el-col>

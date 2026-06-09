@@ -302,7 +302,7 @@ onUnmounted(() => {
       </span>
       <el-tag v-if="change24h !== null" :type="Number(change24h) >= 0 ? 'success' : 'danger'"
               effect="dark">
-        24h {{ Number(change24h) >= 0 ? '+' : '' }}{{ Number(change24h).toFixed(2) }}%
+        24h {{ Number(change24h) > 0 ? '+' : '' }}{{ Number(change24h).toFixed(2) }}%
       </el-tag>
     </div>
 

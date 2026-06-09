@@ -647,3 +647,45 @@ async def test_log_decision_persists_latency_fields(store):
     assert row.llm_attempts == 1
     assert row.llm_status == "ok"
     assert row.llm_error == ""
+
+
+import datetime as _dt
+
+
+async def _seed_trade(store, *, day_dt, symbol, direction, net_pnl, status="closed"):
+    from src.store.models import TradeRow
+    ts_ms = int(day_dt.timestamp() * 1000)
+    async with store._sessionmaker() as session:
+        session.add(TradeRow(
+            ts_ms=ts_ms, opened_at_ms=ts_ms,
+            created_at=day_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            opened_at=day_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            closed_at_ms=ts_ms if status == "closed" else 0,
+            closed_at=day_dt.strftime("%Y-%m-%d %H:%M:%S") if status == "closed" else "",
+            symbol=symbol, direction=direction, status=status, dry_run=False,
+            qty_opened=0.1, qty_closed=0.1 if status == "closed" else 0.0,
+            entry_price=100.0, exit_price=100.0,
+            net_realized_pnl=net_pnl,
+        ))
+        await session.commit()
+
+
+async def test_day_realized_pnl_by_local_day_aggregates_close_only(store):
+    today = _dt.datetime.now()
+    yesterday = today - _dt.timedelta(days=1)
+    day_before = today - _dt.timedelta(days=2)
+    await _seed_trade(store, day_dt=today, symbol="BTCUSDT", direction="long", net_pnl=-1.5)
+    await _seed_trade(store, day_dt=yesterday, symbol="BTCUSDT", direction="long", net_pnl=0.5)
+    await _seed_trade(store, day_dt=day_before, symbol="ETHUSDT", direction="short", net_pnl=-2.0)
+    # open trade 应被忽略
+    await _seed_trade(store, day_dt=today, symbol="SOLUSDT", direction="long",
+                      net_pnl=99.0, status="open")
+    out = await store.day_realized_pnl_by_local_day()
+    assert out[today.strftime("%Y-%m-%d")] == pytest.approx(-1.5)
+    assert out[yesterday.strftime("%Y-%m-%d")] == pytest.approx(0.5)
+    assert out[day_before.strftime("%Y-%m-%d")] == pytest.approx(-2.0)
+
+
+async def test_day_realized_pnl_by_local_day_empty_when_no_trades(store):
+    out = await store.day_realized_pnl_by_local_day()
+    assert out == {}

@@ -73,8 +73,10 @@ class RuntimeState:
 
     # ---------- 盈亏 / 回撤 ----------
     def roll_day_if_needed(self, now: float | None = None) -> bool:
-        """跨自然日时重置当日盈亏。返回是否发生了滚动。"""
-        key = time.strftime("%Y-%m-%d", time.gmtime(now if now is not None else time.time()))
+        """跨自然日时重置当日盈亏（按本地时区，凌晨 0:00 滚动）。返回是否发生了滚动。"""
+        key = time.strftime("%Y-%m-%d", time.localtime(
+            now if now is not None else time.time()
+        ))
         if key != self.day_key:
             self.day_key = key
             self.day_realized_pnl = 0.0
@@ -83,6 +85,19 @@ class RuntimeState:
 
     def add_realized_pnl(self, pnl: float) -> None:
         self.day_realized_pnl += pnl
+
+    def rehydrate_day_pnl(self, by_day: dict[str, float], now: float | None = None) -> None:
+        """从 DB 拉到的 {YYYY-MM-DD: pnl} 重算 day_key 与 day_realized_pnl。
+
+        启动时调用一次，把"今天"按本地日界对齐到 DB 真实值，避免重启后
+        当日盈亏清零、日亏熔断失真、前端"+0.00"假象。by_day 为空时仅
+        初始化 day_key。
+        """
+        key = time.strftime("%Y-%m-%d", time.localtime(
+            now if now is not None else time.time()
+        ))
+        self.day_key = key
+        self.day_realized_pnl = float(by_day.get(key, 0.0))
 
     def update_equity(self, equity: float) -> None:
         """更新当前权益、峰值并计算回撤百分比。"""

@@ -7,6 +7,8 @@
 使重启后内存态与交易所一致。
 """
 from __future__ import annotations
+import time  # noqa: F811  # for day_realized_pnl_by_local_day
+import time as _t
 
 import json
 from pathlib import Path
@@ -120,8 +122,6 @@ def _parse_bool(raw: str | None, default: bool = False) -> bool:
 
 
 def _now_iso_utc() -> str:
-    import time as _t
-
     return _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
 
 
@@ -541,6 +541,30 @@ class Store:
                 "client_order_id": row.client_order_id,
                 "reason": row.reason,
             }
+
+    async def day_realized_pnl_by_local_day(self) -> dict[str, float]:
+        """按本地时区日界（凌晨 0:00 滚动）聚合 trades.net_realized_pnl。
+
+        返回 {YYYY-MM-DD: pnl}，仅包含 closed_at_ms > 0 的 trade。供启动时把
+        runtime.day_realized_pnl 重新对齐到 DB 真实数据，避免重启后日亏熔断
+        与前端"当日已实现盈亏"失真（详见
+        docs/ops/2026-06-09-day-pnl-rehydrate.md）。
+        """
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TradeRow.closed_at_ms,
+                        TradeRow.net_realized_pnl,
+                    ).where(TradeRow.closed_at_ms > 0)
+                )
+            ).all()
+        out: dict[str, float] = {}
+        for ts_ms, pnl in rows:
+            local = time.localtime(int(ts_ms) / 1000.0)
+            key = f"{local.tm_year:04d}-{local.tm_mon:02d}-{local.tm_mday:02d}"
+            out[key] = out.get(key, 0.0) + float(pnl or 0.0)
+        return out
 
     async def has_active_position_claim(self, symbol: str) -> bool:
         import time as _t

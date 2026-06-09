@@ -80,7 +80,19 @@ class TradingEngine:
             self._market.ensure_symbol(symbol)
         await self._market.refresh_all(self._symbols)
         await self._restore_decision_snapshots()
-        self.runtime.roll_day_if_needed()
+        # 启动时从 DB 重算当日盈亏，避免重启后 day_realized_pnl=0 失真
+        # （日亏熔断、前端"当日已实现盈亏"都依赖此值）。失败时退回到 0，
+        # 不影响其它启动流程。
+        try:
+            by_day = await self._store.day_realized_pnl_by_local_day()
+            self.runtime.rehydrate_day_pnl(by_day)
+            logger.info(
+                "day pnl rehydrated from db: day={} pnl={:.4f} (history days={})",
+                self.runtime.day_key, self.runtime.day_realized_pnl, len(by_day),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("day pnl rehydrate failed, fallback to 0: {}", e)
+            self.runtime.roll_day_if_needed()
         if self._settings.storage.reconcile_on_start:
             try:
                 positions = await self._client.fetch_positions(self._symbols)

@@ -64,7 +64,7 @@ function fmt(n, d = 4) {
 function fmtPct(n) {
   if (n === null || n === undefined || n === '') return '—'
   const v = Number(n)
-  return Number.isFinite(v) ? `${v >= 0 ? '+' : ''}${v.toFixed(2)}%` : '—'
+  return Number.isFinite(v) ? `${v > 0 ? '+' : ''}${v.toFixed(2)}%` : '—'
 }
 
 function fmtTime(ts) {
