@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
 import {
@@ -26,8 +26,18 @@ const trades = ref([])
 const tradeTotal = ref(0)
 const orders = ref([])
 const rejects = ref([])
+const rawLoaded = ref(false)
 const cfg = ref(null)
-const loading = ref(false)
+const tradeLoading = ref(false)
+const rawLoading = ref(false)
+const loading = computed(() => tab.value === 'trades' ? tradeLoading.value : rawLoading.value)
+const TRADE_SEARCH_DEBOUNCE_MS = 200
+const RAW_LIST_LIMIT = 100
+let tradeSearchTimer = null
+let tradeAbortController = null
+let tradeRequestSeq = 0
+let rawAbortController = null
+let rawRequestSeq = 0
 const filters = ref({
   symbols: [],
   directions: [],
@@ -36,7 +46,7 @@ const filters = ref({
   range: [],
 })
 const page = ref({
-  limit: 100,
+  limit: 25,
   offset: 0,
 })
 
@@ -61,6 +71,31 @@ const exitReasonOptions = [
 const symbolOptions = computed(() => cfg.value?.symbols || [])
 const currentPage = computed(() => Math.floor(page.value.offset / page.value.limit) + 1)
 
+function clearTradeSearchTimer() {
+  if (tradeSearchTimer) {
+    clearTimeout(tradeSearchTimer)
+    tradeSearchTimer = null
+  }
+}
+
+function abortTradeRequest() {
+  if (tradeAbortController) {
+    tradeAbortController.abort()
+    tradeAbortController = null
+  }
+}
+
+function abortRawRequest() {
+  if (rawAbortController) {
+    rawAbortController.abort()
+    rawAbortController = null
+  }
+}
+
+function isAbortError(e) {
+  return e?.name === 'AbortError'
+}
+
 function queryParams() {
   const [start, end] = filters.value.range || []
   return {
@@ -84,47 +119,77 @@ function pnlClass(value) {
   return Number(value || 0) >= 0 ? 'pnl-pos' : 'pnl-neg'
 }
 
-async function loadTrades() {
-  const res = await api.trades(queryParams())
-  trades.value = res.items || []
-  tradeTotal.value = Number(res.total || 0)
+async function loadTrades(options = {}) {
+  const silent = Boolean(options.silent)
+  clearTradeSearchTimer()
+  abortTradeRequest()
+  const controller = new AbortController()
+  tradeAbortController = controller
+  const seq = ++tradeRequestSeq
+  if (!silent) tradeLoading.value = true
+  try {
+    const res = await api.trades(queryParams(), { signal: controller.signal })
+    if (seq !== tradeRequestSeq) return
+    trades.value = res.items || []
+    tradeTotal.value = Number(res.total || 0)
+  } catch (e) {
+    if (!isAbortError(e) && seq === tradeRequestSeq && !silent) {
+      ElMessage.error(e.message)
+    }
+  } finally {
+    if (seq === tradeRequestSeq) {
+      if (tradeAbortController === controller) tradeAbortController = null
+      if (!silent) tradeLoading.value = false
+    }
+  }
 }
 
-async function loadRaw() {
-  const [o, r] = await Promise.all([api.orders(150), api.rejects(150)])
-  orders.value = o
-  rejects.value = r
+async function loadRaw(options = {}) {
+  const silent = Boolean(options.silent)
+  abortRawRequest()
+  const controller = new AbortController()
+  rawAbortController = controller
+  const seq = ++rawRequestSeq
+  if (!silent) rawLoading.value = true
+  try {
+    const [o, r] = await Promise.all([
+      api.orders(RAW_LIST_LIMIT, { signal: controller.signal }),
+      api.rejects(RAW_LIST_LIMIT, { signal: controller.signal }),
+    ])
+    if (seq !== rawRequestSeq) return
+    orders.value = o
+    rejects.value = r
+    rawLoaded.value = true
+  } catch (e) {
+    if (!isAbortError(e) && seq === rawRequestSeq && !silent) {
+      ElMessage.error(e.message)
+    }
+  } finally {
+    if (seq === rawRequestSeq) {
+      if (rawAbortController === controller) rawAbortController = null
+      if (!silent) rawLoading.value = false
+    }
+  }
 }
 
 async function load() {
-  loading.value = true
-  try {
-    if (tab.value === 'trades') {
-      await loadTrades()
-    } else {
-      await loadRaw()
-    }
-  } catch (e) {
-    ElMessage.error(e.message)
-  } finally {
-    loading.value = false
+  if (tab.value === 'trades') {
+    abortRawRequest()
+    await loadTrades()
+    return
   }
-}
-
-async function loadAll() {
-  loading.value = true
-  try {
-    await Promise.all([loadTrades(), loadRaw()])
-  } catch (e) {
-    ElMessage.error(e.message)
-  } finally {
-    loading.value = false
-  }
+  clearTradeSearchTimer()
+  abortTradeRequest()
+  await loadRaw()
 }
 
 function search() {
   page.value.offset = 0
-  loadTrades().catch((e) => ElMessage.error(e.message))
+  clearTradeSearchTimer()
+  tradeSearchTimer = setTimeout(() => {
+    tradeSearchTimer = null
+    loadTrades()
+  }, TRADE_SEARCH_DEBOUNCE_MS)
 }
 
 function resetFilters() {
@@ -134,18 +199,26 @@ function resetFilters() {
 
 function handlePageChange(nextPage) {
   page.value.offset = (nextPage - 1) * page.value.limit
-  loadTrades().catch((e) => ElMessage.error(e.message))
+  clearTradeSearchTimer()
+  loadTrades()
 }
 
 function handleSizeChange(size) {
   page.value.limit = size
   page.value.offset = 0
-  loadTrades().catch((e) => ElMessage.error(e.message))
+  clearTradeSearchTimer()
+  loadTrades()
 }
 
 onMounted(async () => {
   cfg.value = await api.config().catch(() => null)
-  await loadAll()
+  await loadTrades()
+})
+
+onUnmounted(() => {
+  clearTradeSearchTimer()
+  abortTradeRequest()
+  abortRawRequest()
 })
 </script>
 
@@ -156,8 +229,8 @@ onMounted(async () => {
         <div style="display:flex; justify-content:space-between; align-items:center">
           <el-radio-group v-model="tab" @change="load">
             <el-radio-button value="trades">交易汇总（{{ tradeTotal }}）</el-radio-button>
-            <el-radio-button value="orders">订单流水（{{ orders.length }}）</el-radio-button>
-            <el-radio-button value="rejects">风控拒单（{{ rejects.length }}）</el-radio-button>
+            <el-radio-button value="orders">订单流水{{ rawLoaded ? `（${orders.length}）` : '' }}</el-radio-button>
+            <el-radio-button value="rejects">风控拒单{{ rawLoaded ? `（${rejects.length}）` : '' }}</el-radio-button>
           </el-radio-group>
           <el-button size="small" :loading="loading" :icon="'Refresh'" @click="load">刷新</el-button>
         </div>
@@ -338,7 +411,7 @@ onMounted(async () => {
             :total="tradeTotal"
             :current-page="currentPage"
             :page-size="page.limit"
-            :page-sizes="[50, 100, 200, 500]"
+            :page-sizes="[25, 50, 100]"
             @current-change="handlePageChange"
             @size-change="handleSizeChange"
           />

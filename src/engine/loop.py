@@ -39,6 +39,7 @@ _COMMAND_POLL_INTERVAL_SECONDS = 1.0
 _ENTRY_CLAIM_TTL_MS = 300_000
 _POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS = (0.0, 0.3, 0.7, 1.2, 2.0, 3.0)
 _EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0, 5.0)
+_EXCHANGE_FLAT_MIN_OPEN_AGE_MS = 60_000
 
 
 class TradingEngine:
@@ -2017,9 +2018,13 @@ class TradingEngine:
                 decision=decision, qty=verdict.qty, price=ctx.last_price
             )
             logged = await self._store.log_order(result)
+            claim_status = (
+                "protecting" if result.get("filled")
+                else str(result.get("status") or "unknown")
+            )
             await self._store.finish_position_claim(
                 claim_id,
-                status=str(result.get("status") or "unknown"),
+                status=claim_status,
                 filled_qty=float(result.get("qty") or 0.0) if result.get("filled") else 0.0,
                 entry_price=float(result.get("price") or 0.0),
                 client_order_id=str(result.get("client_order_id") or ""),
@@ -2060,10 +2065,20 @@ class TradingEngine:
                     logger.warning("{} pre-attach sl/tp check failed: {}; fall through", symbol, e)
                     precheck = {"ok": True, "qty": float(result["qty"]), "entry": float(result["price"])}
                 if not precheck.get("ok"):
+                    failure_reason = f"pre-attach sl/tp check failed: {precheck.get('reason', '')}"
                     await self._handle_unprotected_open_failure(
                         decision=decision,
                         open_result=result,
-                        reason=f"pre-attach sl/tp check failed: {precheck.get('reason', '')}",
+                        reason=failure_reason,
+                    )
+                    await self._store.finish_position_claim(
+                        claim_id,
+                        status="error",
+                        filled_qty=float(result.get("qty") or 0.0),
+                        entry_price=float(result.get("price") or 0.0),
+                        client_order_id=str(result.get("client_order_id") or ""),
+                        reason=failure_reason[:240],
+                        raw=result.get("raw") if isinstance(result.get("raw"), dict) else None,
                     )
                     return
                 attach_qty = float(precheck.get("qty") or result["qty"])
@@ -2075,10 +2090,20 @@ class TradingEngine:
                     specs=specs,
                 )
                 if reject_reason:
+                    failure_reason = f"protection order below exchange minimum: {reject_reason}"
                     await self._handle_unprotected_open_failure(
                         decision=decision,
                         open_result=result,
-                        reason=f"protection order below exchange minimum: {reject_reason}",
+                        reason=failure_reason,
+                    )
+                    await self._store.finish_position_claim(
+                        claim_id,
+                        status="error",
+                        filled_qty=float(result.get("qty") or 0.0),
+                        entry_price=float(result.get("price") or 0.0),
+                        client_order_id=str(result.get("client_order_id") or ""),
+                        reason=failure_reason[:240],
+                        raw=result.get("raw") if isinstance(result.get("raw"), dict) else None,
                     )
                     return
                 sltp = await self._executor.place_sl_tp(
@@ -2096,11 +2121,37 @@ class TradingEngine:
                 attach_result = dict(result)
                 attach_result["qty"] = attach_qty
                 attach_result["price"] = attach_entry
+                missing_stop = (
+                    decision.stop_loss_pct > 0
+                    and not any(
+                        order.get("kind") == "SL" and order.get("status") == "placed"
+                        for order in sltp
+                    )
+                )
                 await self._handle_missing_stop_after_open(
                     decision=decision,
                     open_result=attach_result,
                     protection_orders=sltp,
                 )
+                if missing_stop:
+                    await self._store.finish_position_claim(
+                        claim_id,
+                        status="error",
+                        filled_qty=float(result.get("qty") or 0.0),
+                        entry_price=float(result.get("price") or 0.0),
+                        client_order_id=str(result.get("client_order_id") or ""),
+                        reason="SL protection was not confirmed after open",
+                        raw=result.get("raw") if isinstance(result.get("raw"), dict) else None,
+                    )
+                    return
+            await self._store.finish_position_claim(
+                claim_id,
+                status=str(result.get("status") or "filled"),
+                filled_qty=float(result.get("qty") or 0.0),
+                entry_price=float(result.get("price") or 0.0),
+                client_order_id=str(result.get("client_order_id") or ""),
+                raw=result.get("raw") if isinstance(result.get("raw"), dict) else None,
+            )
 
     async def _handle_close(self, symbol: str) -> None:
         raw = self.runtime.positions.get(symbol)
@@ -2331,6 +2382,28 @@ class TradingEngine:
             return False, None
         return True, None
 
+    async def _exchange_flat_defer_reason(self, symbol: str, reason: str) -> str:
+        """Return a non-empty reason when local flat reconciliation is unsafe."""
+        try:
+            if await self._store.has_recent_entry_claim(symbol):
+                return "recent entry claim still inside TTL"
+        except Exception as e:
+            logger.warning(
+                "{} exchange-flat recent claim guard failed during {}: {}",
+                symbol, reason, e,
+            )
+            return "recent entry claim guard failed"
+        try:
+            if await self._store.has_fresh_open_trade(symbol, _EXCHANGE_FLAT_MIN_OPEN_AGE_MS):
+                return f"fresh local open trade <{_EXCHANGE_FLAT_MIN_OPEN_AGE_MS}ms"
+        except Exception as e:
+            logger.warning(
+                "{} exchange-flat fresh trade guard failed during {}: {}",
+                symbol, reason, e,
+            )
+            return "fresh local open trade guard failed"
+        return ""
+
     async def _enforce_exchange_invariants(self, reason: str) -> None:
         positions = {}
         for raw in await self._client.fetch_positions(self._tracked_symbols()):
@@ -2345,27 +2418,48 @@ class TradingEngine:
                 continue
             position = positions.get(symbol)
             if position is None:
-                needs_flat_confirm = bool(active_orders)
+                flat_checked_at_ms = int(time.time() * 1000)
+                has_local_open = False
                 try:
-                    needs_flat_confirm = needs_flat_confirm or await self._store.has_open_trade(symbol)
+                    has_local_open = await self._store.has_open_trade(symbol)
                 except Exception as e:
-                    needs_flat_confirm = True
+                    has_local_open = True
                     logger.warning(
                         "{} local open trade check failed during {}; confirm exchange flat first: {}",
                         symbol, reason, e,
                     )
-                if needs_flat_confirm:
-                    flat_confirmed, live_position = await self._confirm_exchange_flat(symbol, reason)
-                    if live_position is not None:
-                        position = live_position
-                    elif not flat_confirmed:
-                        continue
+                if not active_orders and not has_local_open:
+                    continue
+
+                defer_reason = await self._exchange_flat_defer_reason(symbol, reason)
+                if defer_reason:
+                    logger.warning(
+                        "{} exchange-flat reconcile deferred during {}: {}",
+                        symbol, reason, defer_reason,
+                    )
+                    continue
+
+                flat_confirmed, live_position = await self._confirm_exchange_flat(symbol, reason)
+                if live_position is not None:
+                    position = live_position
+                elif not flat_confirmed:
+                    continue
                 if position is None:
+                    defer_reason = await self._exchange_flat_defer_reason(symbol, reason)
+                    if defer_reason:
+                        logger.warning(
+                            "{} exchange-flat reconcile deferred after confirm during {}: {}",
+                            symbol, reason, defer_reason,
+                        )
+                        continue
                     await self._sync_condition_history(symbol, active_orders)
                     live_ids = {str(order.get("id") or "") for order in active_orders}
                     await self._store.mark_symbol_conditions_not_live(symbol, live_ids)
                     closed = await self._store.reconcile_symbol_flat(
-                        symbol, reason="EXCHANGE_FLAT"
+                        symbol,
+                        reason="EXCHANGE_FLAT",
+                        opened_before_ms=flat_checked_at_ms,
+                        min_open_age_ms=_EXCHANGE_FLAT_MIN_OPEN_AGE_MS,
                     )
                     if closed:
                         logger.warning(

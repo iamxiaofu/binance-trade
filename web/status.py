@@ -13,9 +13,16 @@ import sqlite3
 import time
 from typing import Any
 
+from loguru import logger
+
 from src.llm.prompt import SYSTEM_PROMPT, build_user_prompt
 from src.llm.schema import MarketContext, TradeDecision
 from src.throttle.gate import NO_SIGNIFICANT_CHANGE_REASON as _NO_SIGNIFICANT_CHANGE
+
+
+_SLOW_DECISION_QUERY_MS = 500.0
+_SLOW_TRADE_QUERY_MS = 500.0
+_SUMMARY_RECENT_DECISION_LIMIT = 5
 
 
 def _rows(db_path: str, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -220,6 +227,7 @@ def _decision_where(filters: DecisionFilters) -> tuple[str, list[Any]]:
 
 def search_decisions(db_path: str, filters: DecisionFilters) -> dict[str, Any]:
     """服务端筛选决策日志，返回分页结果。"""
+    started = time.perf_counter()
     limit = max(1, min(int(filters.limit or 100), 500))
     offset = max(0, int(filters.offset or 0))
     filters = DecisionFilters(
@@ -240,6 +248,15 @@ def search_decisions(db_path: str, filters: DecisionFilters) -> dict[str, Any]:
     )
     total_rows = _rows(db_path, f"SELECT COUNT(*) AS total FROM decisions{where_sql}", tuple(args))
     total = int(total_rows[0]["total"]) if total_rows else 0
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if elapsed_ms >= _SLOW_DECISION_QUERY_MS:
+        logger.warning(
+            "slow decision search {:.1f}ms limit={} offset={} symbols={} types={} "
+            "start_ts_ms={} end_ts_ms={} hide_symbol_disabled={} hide_no_significant_change={}",
+            elapsed_ms, limit, offset, filters.symbols, filters.types,
+            filters.start_ts_ms, filters.end_ts_ms,
+            filters.hide_symbol_disabled, filters.hide_no_significant_change,
+        )
     return {
         "items": items,
         "total": total,
@@ -376,6 +393,7 @@ def _trade_where(filters: TradeFilters) -> tuple[str, list[Any]]:
 
 def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
     """服务端筛选交易组，返回聚合交易和明细订单。"""
+    started = time.perf_counter()
     limit = max(1, min(int(filters.limit or 100), 500))
     offset = max(0, int(filters.offset or 0))
     filters = TradeFilters(
@@ -389,6 +407,7 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
         offset=offset,
     )
     where_sql, args = _trade_where(filters)
+    order_count = 0
     items = _rows(
         db_path,
         f"SELECT * FROM trades{where_sql} ORDER BY opened_at_ms DESC, id DESC LIMIT ? OFFSET ?",
@@ -401,14 +420,24 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
         placeholders = ",".join("?" for _ in ids)
         order_rows = _rows(
             db_path,
-            f"SELECT * FROM orders WHERE trade_id IN ({placeholders}) ORDER BY ts_ms, id",
+            f"SELECT * FROM orders WHERE trade_id IN ({placeholders}) ORDER BY trade_id, ts_ms, id",
             tuple(ids),
         )
+        order_count = len(order_rows)
         by_trade: dict[int, list[dict[str, Any]]] = {}
         for row in order_rows:
             by_trade.setdefault(int(row.get("trade_id") or 0), []).append(row)
         for item in items:
             item["orders"] = by_trade.get(int(item["id"]), [])
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if elapsed_ms >= _SLOW_TRADE_QUERY_MS:
+        logger.warning(
+            "slow trade search {:.1f}ms limit={} offset={} total={} rows={} orders={} "
+            "symbols={} directions={} statuses={} exit_reasons={} start_ts_ms={} end_ts_ms={}",
+            elapsed_ms, limit, offset, total, len(items), order_count,
+            filters.symbols, filters.directions, filters.statuses, filters.exit_reasons,
+            filters.start_ts_ms, filters.end_ts_ms,
+        )
     return {
         "items": items,
         "total": total,
@@ -741,7 +770,7 @@ def status_summary(db_path: str) -> dict:
     return {
         "balance": latest_balance(db_path),
         "positions": latest_positions(db_path),
-        "recent_decisions": recent_decisions(db_path, 20),
+        "recent_decisions": recent_decisions(db_path, _SUMMARY_RECENT_DECISION_LIMIT),
         "recent_orders": recent_orders(db_path, 20),
         "recent_rejects": recent_rejects(db_path, 20),
         "recent_commands": recent_commands(db_path, 10),

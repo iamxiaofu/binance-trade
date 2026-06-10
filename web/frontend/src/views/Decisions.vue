@@ -8,23 +8,37 @@ import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
+const DECISION_SEARCH_DEBOUNCE_MS = 200
 // 实时刷新：开启后每 3s 静默重拉一次，不重置滚动位置；只在第一页时启用，避免翻页时被强制顶回第一页。
 const liveRefresh = ref(false)
 let liveTimer = null
+let searchTimer = null
+let listAbortController = null
+let listRequestSeq = 0
 function startLiveRefresh() {
   stopLiveRefresh()
   liveTimer = setInterval(() => {
     if (!liveRefresh.value) return
     if (page.value.offset !== 0) return
+    if (loading.value || listAbortController) return
     // 静默拉取：直接覆盖 rows/total，不翻转 loading（避免表格 v-loading 闪烁）
-    api.decisions(queryParams()).then((res) => {
-      rows.value = res.items || []
-      total.value = res.total || 0
-    }).catch(() => {})
+    load({ silent: true }).catch(() => {})
   }, 3000)
 }
 function stopLiveRefresh() {
   if (liveTimer) { clearInterval(liveTimer); liveTimer = null }
+}
+function clearSearchTimer() {
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+}
+function abortListRequest() {
+  if (listAbortController) {
+    listAbortController.abort()
+    listAbortController = null
+  }
+}
+function isAbortError(e) {
+  return e?.name === 'AbortError'
 }
 function toggleLiveRefresh() {
   liveRefresh.value = !liveRefresh.value
@@ -51,7 +65,7 @@ const filters = ref({
   hideNoSignificantChange: true,
 })
 const page = ref({
-  limit: 100,
+  limit: 25,
   offset: 0,
 })
 
@@ -131,16 +145,28 @@ function clearTimeRange() {
   search()
 }
 
-async function load() {
-  loading.value = true
+async function load(options = {}) {
+  const silent = Boolean(options.silent)
+  clearSearchTimer()
+  abortListRequest()
+  const controller = new AbortController()
+  listAbortController = controller
+  const seq = ++listRequestSeq
+  if (!silent) loading.value = true
   try {
-    const res = await api.decisions(queryParams())
+    const res = await api.decisions(queryParams(), { signal: controller.signal })
+    if (seq !== listRequestSeq) return
     rows.value = res.items || []
     total.value = Number(res.total || 0)
   } catch (e) {
-    ElMessage.error(e.message)
+    if (!isAbortError(e) && seq === listRequestSeq && !silent) {
+      ElMessage.error(e.message)
+    }
   } finally {
-    loading.value = false
+    if (seq === listRequestSeq) {
+      if (listAbortController === controller) listAbortController = null
+      if (!silent) loading.value = false
+    }
   }
 }
 
@@ -252,9 +278,18 @@ async function refreshDetail() {
   await loadDecisionDetail(detail.value.id, false)
 }
 
-function search() {
+function search(options = {}) {
   page.value.offset = 0
-  load()
+  clearSearchTimer()
+  const immediate = Boolean(options.immediate)
+  if (immediate) {
+    load()
+    return
+  }
+  searchTimer = setTimeout(() => {
+    searchTimer = null
+    load()
+  }, DECISION_SEARCH_DEBOUNCE_MS)
 }
 
 function resetFilters() {
@@ -282,12 +317,14 @@ function toggleHideNoSignificantChange() {
 
 function handlePageChange(nextPage) {
   page.value.offset = (nextPage - 1) * page.value.limit
+  clearSearchTimer()
   load()
 }
 
 function handleSizeChange(size) {
   page.value.limit = size
   page.value.offset = 0
+  clearSearchTimer()
   load()
 }
 
@@ -299,6 +336,8 @@ onMounted(async () => {
 })
 onUnmounted(() => {
   stopLiveRefresh()
+  clearSearchTimer()
+  abortListRequest()
 })
 </script>
 
@@ -446,7 +485,7 @@ onUnmounted(() => {
           :total="total"
           :current-page="currentPage"
           :page-size="page.limit"
-          :page-sizes="[50, 100, 200, 500]"
+          :page-sizes="[25, 50, 100]"
           @current-change="handlePageChange"
           @size-change="handleSizeChange"
         />

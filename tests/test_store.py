@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.llm.schema import DECISION_REASON_MAX_LENGTH, Action, TradeDecision
@@ -44,6 +45,22 @@ async def _count(store: Store, model) -> int:
 async def test_log_skipped_decision(store):
     await store.log_decision(symbol="BTCUSDT", skipped=True, skip_reason="no change", ref_price=100.0)
     assert await _count(store, DecisionRow) == 1
+
+
+async def test_connect_creates_read_query_indexes(store):
+    async with store._engine.connect() as conn:
+        decision_rows = (await conn.execute(text("PRAGMA index_list(decisions)"))).fetchall()
+        trade_rows = (await conn.execute(text("PRAGMA index_list(trades)"))).fetchall()
+        order_rows = (await conn.execute(text("PRAGMA index_list(orders)"))).fetchall()
+    decision_names = {row[1] for row in decision_rows}
+    trade_names = {row[1] for row in trade_rows}
+    order_names = {row[1] for row in order_rows}
+    assert "ix_decisions_ts_id" in decision_names
+    assert "ix_decisions_symbol_ts_id" in decision_names
+    assert "ix_trades_opened_id" in trade_names
+    assert "ix_trades_symbol_opened_id" in trade_names
+    assert "ix_trades_status_opened_id" in trade_names
+    assert "ix_orders_trade_ts_id" in order_names
 
 
 async def test_log_actual_decision_with_context(store):
@@ -258,6 +275,37 @@ async def test_reconcile_symbol_flat_closes_orphan_open_trade(store):
     assert trade.confidence == "inferred"
 
 
+async def test_reconcile_symbol_flat_respects_time_guards(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 0.1, "price": 100.0,
+        "notional": 10.0, "dry_run": False, "status": "filled",
+        "id": "fresh-open", "raw": {},
+    })
+
+    assert await store.reconcile_symbol_flat("BTCUSDT", opened_before_ms=1) == 0
+    assert await store.reconcile_symbol_flat("BTCUSDT", min_open_age_ms=60_000) == 0
+
+    old_ms = int(time.time() * 1000) - 120_000
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        trade.opened_at_ms = old_ms
+        await session.commit()
+
+    changed = await store.reconcile_symbol_flat(
+        "BTCUSDT",
+        opened_before_ms=old_ms + 1,
+        min_open_age_ms=60_000,
+    )
+
+    assert changed == 1
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+    assert trade.status == "closed"
+    assert trade.exit_reason == "EXCHANGE_FLAT"
+
+
 async def test_has_open_trade_detects_local_managed_position(store):
     await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
@@ -280,6 +328,18 @@ async def test_position_claim_lifecycle(store):
     )
 
     assert await store.has_active_position_claim("BTCUSDT") is True
+    assert await store.has_recent_entry_claim("BTCUSDT") is True
+
+    await store.finish_position_claim(
+        claim_id,
+        status="protecting",
+        filled_qty=0.01,
+        entry_price=100.0,
+        client_order_id="open-1",
+    )
+
+    assert await store.has_active_position_claim("BTCUSDT") is True
+    assert await store.has_recent_entry_claim("BTCUSDT") is True
 
     await store.finish_position_claim(
         claim_id,
@@ -290,7 +350,39 @@ async def test_position_claim_lifecycle(store):
     )
 
     assert await store.has_active_position_claim("BTCUSDT") is False
+    assert await store.has_recent_entry_claim("BTCUSDT") is True
     assert await _count(store, PositionClaimRow) == 1
+
+
+async def test_recent_entry_claim_ignores_expired_or_unfilled_terminal_claims(store):
+    filled_claim = await store.begin_position_claim(
+        symbol="BTCUSDT",
+        side="long",
+        planned_qty=0.1,
+        ttl_ms=300_000,
+    )
+    await store.finish_position_claim(
+        filled_claim,
+        status="filled",
+        filled_qty=0.1,
+        entry_price=100.0,
+    )
+    empty_claim = await store.begin_position_claim(
+        symbol="ETHUSDT",
+        side="short",
+        planned_qty=1.0,
+        ttl_ms=300_000,
+    )
+    await store.finish_position_claim(empty_claim, status="rejected", filled_qty=0.0)
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        row = await session.get(PositionClaimRow, filled_claim)
+        row.expires_at_ms = 1
+        await session.commit()
+
+    assert await store.has_recent_entry_claim("BTCUSDT") is False
+    assert await store.has_recent_entry_claim("ETHUSDT") is False
 
 
 async def test_mark_condition_exit_closes_group_with_filled_price(store):

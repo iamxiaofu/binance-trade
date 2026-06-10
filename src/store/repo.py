@@ -94,11 +94,22 @@ _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("llm_status", "VARCHAR(16) NOT NULL DEFAULT ''"),
     ("llm_error", "VARCHAR(200) NOT NULL DEFAULT ''"),
 )
+_SQLITE_INDEX_DDL: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS ix_decisions_ts_id ON decisions(ts_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_decisions_symbol_ts_id ON decisions(symbol, ts_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_trades_opened_id ON trades(opened_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_trades_symbol_opened_id ON trades(symbol, opened_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_trades_status_opened_id ON trades(status, opened_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_orders_trade_ts_id ON orders(trade_id, ts_ms ASC, id ASC)",
+)
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
 _TRIGGERED_CONDITION_STATUSES = {"filled", "partial", "triggered"}
 _OPEN_TRADE_STATUSES = {"open", "partial"}
 _ACTIVE_CLAIM_STATUSES = {"opening", "submitted", "protecting"}
+_RECENT_ENTRY_CLAIM_STATUSES = _ACTIVE_CLAIM_STATUSES | {
+    "filled", "partial", "error", "canceled", "rejected", "expired",
+}
 
 
 def _safe_float(value: Any) -> float:
@@ -230,6 +241,8 @@ class Store:
         for name, ddl in _DECISION_EXTENSION_COLUMNS:
             if decision_existing and name not in decision_existing:
                 await conn.execute(text(f"ALTER TABLE decisions ADD COLUMN {name} {ddl}"))
+        for ddl in _SQLITE_INDEX_DDL:
+            await conn.execute(text(ddl))
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -579,6 +592,50 @@ class Store:
                     .where(PositionClaimRow.status.in_(tuple(_ACTIVE_CLAIM_STATUSES)))
                     .where(PositionClaimRow.expires_at_ms >= now_ms)
                     .order_by(PositionClaimRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return row is not None
+
+    async def has_recent_entry_claim(self, symbol: str) -> bool:
+        """Return True while a recent entry claim can still race exchange flat checks."""
+        import time as _t
+
+        symbol = normalize_symbol(symbol)
+        now_ms = int(_t.time() * 1000)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(PositionClaimRow.id)
+                    .where(PositionClaimRow.symbol == symbol)
+                    .where(PositionClaimRow.status.in_(tuple(_RECENT_ENTRY_CLAIM_STATUSES)))
+                    .where(PositionClaimRow.expires_at_ms >= now_ms)
+                    .where(
+                        or_(
+                            PositionClaimRow.status.in_(tuple(_ACTIVE_CLAIM_STATUSES)),
+                            PositionClaimRow.filled_qty > 0,
+                        )
+                    )
+                    .order_by(PositionClaimRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return row is not None
+
+    async def has_fresh_open_trade(self, symbol: str, max_age_ms: int) -> bool:
+        """Return True for newly opened local trades still inside the flat grace window."""
+        import time as _t
+
+        symbol = normalize_symbol(symbol)
+        threshold = int(_t.time() * 1000) - max(int(max_age_ms), 0)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(TradeRow.id)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                    .where(TradeRow.opened_at_ms >= threshold)
+                    .order_by(TradeRow.id.desc())
                     .limit(1)
                 )
             ).scalar_one_or_none()
@@ -1403,6 +1460,8 @@ class Store:
         symbol: str,
         *,
         reason: str = "EXCHANGE_FLAT",
+        opened_before_ms: int | None = None,
+        min_open_age_ms: int = 0,
     ) -> int:
         """交易所确认该币种无持仓时，关闭仍悬挂的本地 open trade。
 
@@ -1415,12 +1474,18 @@ class Store:
         now_ms = int(_t.time() * 1000)
         now = _now_iso_utc()
         async with self._sessionmaker() as session:
+            stmt = (
+                select(TradeRow)
+                .where(TradeRow.symbol == symbol)
+                .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+            )
+            if opened_before_ms is not None:
+                stmt = stmt.where(TradeRow.opened_at_ms <= int(opened_before_ms))
+            if min_open_age_ms > 0:
+                stmt = stmt.where(TradeRow.opened_at_ms <= now_ms - int(min_open_age_ms))
             trades = (
                 await session.execute(
-                    select(TradeRow)
-                    .where(TradeRow.symbol == symbol)
-                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
-                    .order_by(TradeRow.opened_at_ms.asc(), TradeRow.id.asc())
+                    stmt.order_by(TradeRow.opened_at_ms.asc(), TradeRow.id.asc())
                 )
             ).scalars().all()
             changed = 0

@@ -51,17 +51,17 @@ async function req(path, opts = {}) {
 export const api = {
   summary: () => req('/api/summary'),
   positions: () => req('/api/positions'),
-  decisions: (params = 100) => {
+  decisions: (params = 100, opts = {}) => {
     const query = typeof params === 'number' ? qs({ limit: params }) : qs(params)
-    return req(`/api/decisions?${query}`)
+    return req(`/api/decisions?${query}`, opts)
   },
   decisionDetail: (id) => req(`/api/decisions/${id}`),
-  trades: (params = 100) => {
+  trades: (params = 100, opts = {}) => {
     const query = typeof params === 'number' ? qs({ limit: params }) : qs(params)
-    return req(`/api/trades?${query}`)
+    return req(`/api/trades?${query}`, opts)
   },
-  orders: (limit = 100) => req(`/api/orders?limit=${limit}`),
-  rejects: (limit = 100) => req(`/api/rejects?limit=${limit}`),
+  orders: (limit = 100, opts = {}) => req(`/api/orders?limit=${limit}`, opts),
+  rejects: (limit = 100, opts = {}) => req(`/api/rejects?limit=${limit}`, opts),
   pnl: (params = {}) => req(`/api/pnl?${qs(params)}`),
   equity: (params = 500) => {
     const query = typeof params === 'number' ? qs({ limit: params }) : qs(params)

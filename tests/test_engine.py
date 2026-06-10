@@ -171,11 +171,29 @@ class FakeStore:
             if row["id"] == claim_id:
                 row.update(kw)
                 row["status"] = kw.get("status", row.get("status"))
-                self.active_claims.discard(row["symbol"])
+                if row["status"] in ("opening", "submitted", "protecting"):
+                    self.active_claims.add(row["symbol"])
+                else:
+                    self.active_claims.discard(row["symbol"])
                 return
 
     async def has_active_position_claim(self, symbol):
         return symbol in self.active_claims
+
+    async def has_recent_entry_claim(self, symbol):
+        for row in reversed(self.claims):
+            if row.get("symbol") != symbol:
+                continue
+            if row.get("status") in ("opening", "submitted", "protecting"):
+                return True
+            if row.get("filled_qty", 0) > 0 and row.get("status") in (
+                "filled", "partial", "error", "canceled", "rejected", "expired",
+            ):
+                return True
+        return False
+
+    async def has_fresh_open_trade(self, symbol, max_age_ms):
+        return False
 
     def set_day_pnl(self, by_day):
         """测试辅助：注入 rehydrate 用 {YYYY-MM-DD: pnl} 数据。"""
@@ -211,7 +229,14 @@ class FakeStore:
     async def sync_condition_order_history(self, **kw):
         return 0
 
-    async def reconcile_symbol_flat(self, symbol, *, reason="EXCHANGE_FLAT"):
+    async def reconcile_symbol_flat(
+        self,
+        symbol,
+        *,
+        reason="EXCHANGE_FLAT",
+        opened_before_ms=None,
+        min_open_age_ms=0,
+    ):
         self.flat_reconciles.append((symbol, reason))
         if symbol in self.open_trades:
             self.open_trades.discard(symbol)
@@ -591,6 +616,50 @@ async def test_reconcile_defers_exchange_flat_when_position_reappears(settings, 
     assert eng.runtime.positions["BTCUSDT"]["contracts"] == pytest.approx(0.1)
 
 
+async def test_reconcile_does_not_flat_trade_created_after_initial_check(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS", (0.0,))
+
+    async def has_open_trade_race(symbol):
+        eng._store.open_trades.add(symbol)
+        return False
+
+    eng._store.has_open_trade = has_open_trade_race
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._store.flat_reconciles == []
+    assert "BTCUSDT" in eng._store.open_trades
+
+
+async def test_reconcile_defers_exchange_flat_for_recent_entry_claim(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS", (0.0,))
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.claims.append({
+        "id": 1,
+        "symbol": "BTCUSDT",
+        "status": "filled",
+        "filled_qty": 0.1,
+    })
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._store.flat_reconciles == []
+    assert "BTCUSDT" in eng._store.open_trades
+
+
+async def test_reconcile_closes_old_local_trade_when_exchange_flat_confirmed(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS", (0.0,))
+    eng._store.open_trades.add("BTCUSDT")
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._store.flat_reconciles == [("BTCUSDT", "EXCHANGE_FLAT")]
+    assert "BTCUSDT" not in eng._store.open_trades
+
+
 async def test_reconcile_skips_disabled_unmanaged_position_auto_close(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._symbol_enabled["BTCUSDT"] = False
@@ -857,7 +926,8 @@ async def test_open_tiny_partial_closes_when_protection_below_min(settings, cred
     assert eng._executor.closed == 1
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert [o["kind"] for o in eng._store.orders] == ["OPEN", "CLOSE"]
-    assert eng._store.claims[0]["status"] == "partial"
+    assert eng._store.claims[0]["status"] == "error"
+    assert eng._store.claims[0]["filled_qty"] == pytest.approx(0.001)
 
 
 async def test_open_closes_position_when_stop_not_confirmed(settings, creds, monkeypatch):

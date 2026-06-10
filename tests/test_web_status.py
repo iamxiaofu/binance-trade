@@ -104,6 +104,18 @@ async def test_status_summary_shape(db):
                       "recent_rejects", "recent_commands"}
 
 
+async def test_status_summary_limits_recent_decisions(db):
+    s = Store(db)
+    await s.connect()
+    for i in range(6):
+        await s.log_decision(symbol="BTCUSDT", skipped=True, skip_reason=f"extra-{i}", ref_price=100.0 + i)
+    await s.close()
+
+    summary = status.status_summary(db)
+
+    assert len(summary["recent_decisions"]) == 5
+
+
 async def test_decision_detail_includes_llm_trace_and_data_items(db):
     detail = status.decision_detail(db, 3)
     assert detail is not None
@@ -304,6 +316,8 @@ def test_search_decisions_filters_type(db):
     res = status.search_decisions(db, status.DecisionFilters(types=["OPEN_LONG"]))
     assert res["total"] == 1
     assert res["items"][0]["action"] == "OPEN_LONG"
+    assert res["items"][0]["llm_prompt"] == "stored prompt"
+    assert "request" in res["items"][0]["llm_request_json"]
 
     skipped = status.search_decisions(db, status.DecisionFilters(types=["SKIPPED"]))
     assert skipped["total"] == 2
