@@ -52,7 +52,7 @@
   - 结果：`62 passed`
 - 完整测试：
   - `.venv/bin/python -m pytest`
-  - 结果：`275 passed, 2 warnings`
+  - 结果：`280 passed, 2 warnings`
 - 前端构建：
   - `npm run build`
   - 结果：通过；构建器仍输出依赖包 `@vueuse/core` 的 `/* #__PURE__ */` 注解位置 warning，不影响构建退出码。
@@ -62,7 +62,10 @@
 
 ## 线上状态
 
-当前仅完成代码修改，尚未重启服务；新增 SQLite 索引会在交易主进程下次 `Store.connect()` 时幂等创建。
+- 已随提交 `d051784` 推送到 `origin/main`。
+- 已于 `2026-06-10 17:47 CST` 依次重启 `binance-trade-frontend.service`、`binance-trade-web.service`、`binance-trade.service`。
+- 重启后 `binance-trade.service`、`binance-trade-web.service`、`binance-trade-frontend.service` 均为 `active`。
+- 新增 SQLite 索引已在交易主进程和 Web 进程本轮 `Store.connect()` 时幂等创建或确认存在。
 
 ## 后续注意事项
 

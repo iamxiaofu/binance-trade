@@ -48,7 +48,10 @@
 
 ## 线上状态
 
-当前仅完成代码修改，尚未重启服务。
+- 已随提交 `d051784` 推送到 `origin/main`。
+- 已于 `2026-06-10 17:47 CST` 依次重启 `binance-trade-frontend.service`、`binance-trade-web.service`、`binance-trade.service`。
+- 重启后 `binance-trade.service`、`binance-trade-web.service`、`binance-trade-frontend.service` 均为 `active`。
+- 交易主进程启动日志显示 testnet DB 已连接、启动对账完成，并继续处理 BNBUSDT/BTCUSDT 周期。
 
 ## 后续注意事项
 
