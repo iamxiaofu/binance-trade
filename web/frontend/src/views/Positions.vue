@@ -24,6 +24,13 @@ const positions = computed(() => live.positions || [])
 const positionsSource = computed(() => live.summary?.positions_source || 'db_snapshot')
 const positionsError = computed(() => live.summary?.positions_error || '')
 const conditionOrdersError = computed(() => live.summary?.condition_orders_error || '')
+const openOrders = computed(() => live.summary?.open_orders || [])
+const openOrdersError = computed(() => live.summary?.open_orders_error || '')
+const openOrdersSyncedAtMs = computed(() => live.summary?.open_orders_synced_at_ms || live.summary?.positions_synced_at_ms)
+const openOrdersSyncedText = computed(() => {
+  const ts = openOrdersSyncedAtMs.value
+  return ts ? new Date(Number(ts)).toLocaleTimeString() : '—'
+})
 const syncedAtText = computed(() => {
   const ts = live.summary?.positions_synced_at_ms
   return ts ? new Date(Number(ts)).toLocaleTimeString() : '—'
@@ -213,6 +220,7 @@ async function submitManualClose() {
   const payload = {
     symbol: row.symbol,
     confirm: true,
+    force: true,
     position: {
       side: row.side,
       qty: row.contracts,
@@ -228,6 +236,51 @@ async function submitManualClose() {
     ElMessage.error(`手动平仓命令下发失败: ${e.message}`)
   } finally {
     closeSubmitting.value = false
+  }
+}
+
+const cancelOrderSubmitting = ref({})
+function cancelOrderKey(symbol, orderId) {
+  return `${symbol}::${orderId}`
+}
+function isCancelingOrder(symbol, orderId) {
+  return Boolean(cancelOrderSubmitting.value[cancelOrderKey(symbol, orderId)])
+}
+async function cancelOpenOrder(order) {
+  if (!order || !order.id) return
+  const key = cancelOrderKey(order.symbol, order.id)
+  cancelOrderSubmitting.value = { ...cancelOrderSubmitting.value, [key]: true }
+  try {
+    const payload = {
+      symbol: order.symbol,
+      order_id: order.id,
+    }
+    if (order.client_order_id) payload.client_order_id = order.client_order_id
+    const res = await api.command('CANCEL_OPEN_ORDER', JSON.stringify(payload))
+    ElMessage.success(`${order.symbol} 撤销挂单命令已入队 (#${res.id})`)
+  } catch (e) {
+    ElMessage.error(`撤销挂单失败: ${e.message}`)
+  } finally {
+    const next = { ...cancelOrderSubmitting.value }
+    delete next[key]
+    cancelOrderSubmitting.value = next
+  }
+}
+async function cancelConditionOrder(order) {
+  if (!order || !order.id) return
+  const key = cancelOrderKey(order.symbol, order.id)
+  cancelOrderSubmitting.value = { ...cancelOrderSubmitting.value, [key]: true }
+  try {
+    const payload = { symbol: order.symbol, algo_id: order.id }
+    if (order.client_algo_id) payload.client_algo_id = order.client_algo_id
+    const res = await api.command('CANCEL_CONDITION_ORDER', JSON.stringify(payload))
+    ElMessage.success(`${order.symbol} 撤销条件单命令已入队 (#${res.id})`)
+  } catch (e) {
+    ElMessage.error(`撤销条件单失败: ${e.message}`)
+  } finally {
+    const next = { ...cancelOrderSubmitting.value }
+    delete next[key]
+    cancelOrderSubmitting.value = next
   }
 }
 </script>
@@ -432,6 +485,134 @@ async function submitManualClose() {
       </template>
     </el-dialog>
 
+    <el-card shadow="never" class="open-orders-card">
+      <template #header>
+        <div class="positions-header">
+          <span>挂单（交易所实时）</span>
+          <span class="positions-meta">
+            <el-tag :type="openOrdersError ? 'warning' : 'success'" size="small" effect="dark">
+              {{ openOrdersError ? '同步失败' : '交易所实时' }}
+            </el-tag>
+            <span>同步于 {{ openOrdersSyncedText }}</span>
+          </span>
+        </div>
+      </template>
+      <el-alert
+        v-if="openOrdersError"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom:12px"
+        :title="`交易所普通挂单同步失败：${openOrdersError}`"
+      />
+      <el-table
+        :data="openOrders"
+        stripe
+        size="small"
+        empty-text="当前无普通挂单"
+      >
+        <el-table-column prop="symbol" label="标的" width="110" />
+        <el-table-column label="方向" width="70">
+          <template #default="{ row }">
+            <el-tag :type="row.side === 'buy' ? 'success' : 'danger'" size="small">
+              {{ row.side === 'buy' ? '买' : row.side === 'sell' ? '卖' : '—' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="类型" width="110">
+          <template #default="{ row }">
+            <span class="mono">{{ row.order_type || 'LIMIT' }}</span>
+            <el-tag v-if="row.reduce_only" type="info" size="small" style="margin-left:4px">reduce-only</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="价格" width="120">
+          <template #default="{ row }">
+            <span class="mono">{{ Number(row.price || 0).toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="数量" width="110">
+          <template #default="{ row }">
+            <span class="mono">{{ Number(row.qty || 0).toFixed(4) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="已成交" width="110">
+          <template #default="{ row }">
+            <span class="mono">{{ Number(row.filled_qty || 0).toFixed(4) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag size="small">{{ row.status || 'placed' }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="100" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              type="danger"
+              size="small"
+              plain
+              :loading="isCancelingOrder(row.symbol, row.id)"
+              @click="cancelOpenOrder(row)"
+            >
+              撤销
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <div class="condition-orders-section">
+        <div class="section-title">条件单（SL/TP）</div>
+        <el-table
+          :data="live.summary?.condition_orders || []"
+          stripe
+          size="small"
+          empty-text="当前无 SL/TP 条件单"
+        >
+          <el-table-column prop="symbol" label="标的" width="110" />
+          <el-table-column label="类型" width="80">
+            <template #default="{ row }">
+              <el-tag :type="row.kind === 'SL' ? 'danger' : 'success'" size="small">
+                {{ row.kind || '—' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="方向" width="70">
+            <template #default="{ row }">
+              <span class="mono">{{ row.side === 'buy' ? '买' : row.side === 'sell' ? '卖' : '—' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="触发价" width="120">
+            <template #default="{ row }">
+              <span class="mono">{{ Number(row.trigger_price || row.price || 0).toFixed(2) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="数量" width="110">
+            <template #default="{ row }">
+              <span class="mono">{{ Number(row.qty || 0).toFixed(4) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }">
+              <el-tag size="small">{{ orderStatusLabel({ client_kind: row.kind, status: row.status || 'placed' }) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="100" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                type="danger"
+                size="small"
+                plain
+                :loading="isCancelingOrder(row.symbol, row.id)"
+                @click="cancelConditionOrder(row)"
+              >
+                撤销
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+    </el-card>
+
     <el-dialog v-model="closeVisible" title="手动平仓" width="520px">
       <el-form v-if="closeRow" label-width="120px">
         <el-form-item label="币种">
@@ -456,14 +637,14 @@ async function submitManualClose() {
         </el-form-item>
         <el-form-item>
           <el-checkbox v-model="closeConfirm">
-            确认按市价 reduce-only 平掉当前交易所持仓
+            确认强制市价 reduce-only 平掉当前交易所持仓（绕过滑点保护）
           </el-checkbox>
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="closeVisible = false">取消</el-button>
         <el-button type="danger" :loading="closeSubmitting" @click="submitManualClose">
-          确认市价平仓
+          强制市价平仓
         </el-button>
       </template>
     </el-dialog>
@@ -495,5 +676,18 @@ async function submitManualClose() {
 
 .protect-input {
   width: 180px;
+}
+
+.open-orders-card {
+  margin-top: 16px;
+}
+.condition-orders-section {
+  margin-top: 16px;
+}
+.section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 8px;
 }
 </style>

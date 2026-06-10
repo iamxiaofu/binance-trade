@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.llm.schema import Action, TradeDecision
+from src.llm.schema import DECISION_REASON_MAX_LENGTH, Action, TradeDecision
 from src.risk.manager import RejectCode, Verdict
 from src.state.runtime import RuntimeState
 from src.exchange.filters import SymbolFilters
@@ -647,6 +647,29 @@ async def test_log_decision_persists_latency_fields(store):
     assert row.llm_attempts == 1
     assert row.llm_status == "ok"
     assert row.llm_error == ""
+
+
+async def test_decision_reason_uses_expanded_limit(store):
+    assert DecisionRow.__table__.c.reason.type.length == DECISION_REASON_MAX_LENGTH
+
+    decision_reason = "x" * DECISION_REASON_MAX_LENGTH
+    d = TradeDecision(symbol="ETHUSDT", action=Action.OPEN_LONG, confidence=0.8,
+                      size_pct=0.1, leverage=3, stop_loss_pct=0.02,
+                      take_profit_pct=0.04, reason=decision_reason)
+    await store.log_decision(symbol="ETHUSDT", decision=d, ref_price=100.0)
+    await store.log_audit(
+        symbol="ETHUSDT",
+        action="PROFILE",
+        reason="y" * (DECISION_REASON_MAX_LENGTH + 50),
+    )
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        rows = (
+            await session.execute(select(DecisionRow).order_by(DecisionRow.id))
+        ).scalars().all()
+    assert rows[0].reason == decision_reason
+    assert len(rows[1].reason) == DECISION_REASON_MAX_LENGTH
 
 
 import datetime as _dt

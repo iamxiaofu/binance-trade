@@ -24,11 +24,18 @@ SYSTEM_PROMPT = """\
 3. 多周期共振(高周期与当前周期方向一致)时机会更可靠，可给更高 confidence。
 4. 关注量价配合：放量突破比缩量更可信；背离需警惕。
 5. leverage 不要超过 max_leverage_allowed（超过会被系统直接拒单）。资金量小，杠杆宜适中。
-6. size_pct 为动用可用保证金比例(0~1)，存在硬上限 max_order_margin_pct（系统按权益动态设置，
-   通常约 0.2），超过该硬上限的决策会被直接拒单（不截断、不调整）。
-7. stop_loss_pct / take_profit_pct 为相对开仓价的比例(如 0.02=2%)，结合 ATR 设置合理止损。
+6. size_pct 为动用可用保证金比例(0~1)。单笔保证金硬上限 max_order_margin_pct 按账户权益动态计算，
+   系统校验 margin_used=可用保证金×size_pct 不得超过该绝对上限；超出会直接拒单（不截断、不调整）。
+   当可用保证金≈账户权益时，max_order_margin_pct 通常约等于 size_pct 上限（常见约 0.2）。
+7. stop_loss_pct / take_profit_pct 为相对参考开仓价的价格距离小数，不是保证金比例，也不是账户权益比例。
+   0.012 必须表述为 1.20% 价格距离，不能写成 0.12%；0.02 必须表述为 2.00% 价格距离。
 8. confidence 如实反映把握(0~1)；信号矛盾或数据不足时选 HOLD 并给低 confidence。
-9. 只依据提供的数据判断，不臆造未提供的信息。
+9. OPEN_LONG/OPEN_SHORT 的 reason 必须同时写清风险换算：小数值与百分比、预估 SL/TP 触发价、
+   预估止损亏损/止盈收益 USDT、止损亏损占账户权益百分比、止损亏损占本单保证金百分比。
+10. reason 的 SL/TP 触发价必须严格按 action 方向计算：OPEN_LONG 止损低于 entry_ref、止盈高于 entry_ref；
+    OPEN_SHORT 止损高于 entry_ref、止盈低于 entry_ref。方向不满足时必须重新计算后再提交。
+11. 如果 reason 中的百分比、触发价或损益估算与结构化字段不一致，必须修正 reason 后再提交。
+12. 只依据提供的数据判断，不臆造未提供的信息。
 
 风格：专业、客观、基于证据。有把握的机会要敢于参与，不确定时也不勉强。追求长期正期望，而非频繁交易。
 """
@@ -94,12 +101,29 @@ def build_user_prompt(
 最新价: {ctx.last_price}  标记价: {ctx.mark_price}
 账户权益: {ctx.account_equity:.2f} USDT    可用保证金: {ctx.available_margin} USDT
 风控允许最大杠杆(max_leverage_allowed): {ctx.max_leverage_allowed}x
-单笔保证金硬上限: size_pct ≤ {ctx.max_order_margin_pct*100:.1f}% (即 max_order_margin_pct={ctx.max_order_margin_pct:.4f}，硬性约束，超出直接拒单)
-   对应绝对金额: {ctx.max_order_margin_abs:.2f} USDT (= {ctx.max_order_margin_pct:.4f} × 可用保证金 {ctx.available_margin:.2f})
+单笔保证金硬上限: margin_used ≤ {ctx.max_order_margin_abs:.2f} USDT (= max_order_margin_pct {ctx.max_order_margin_pct:.4f} × 账户权益 {ctx.account_equity:.2f})，硬性约束，超出直接拒单
+   size_pct 参考上限: 当可用保证金≈账户权益时约 ≤ {ctx.max_order_margin_pct*100:.1f}%；实际必须用 margin_used=可用保证金×size_pct 交叉校验
 单笔止损理论亏损上限: {ctx.max_loss_per_trade_abs:.2f} USDT（= size_pct × 可用保证金 × 杠杆 × stop_loss_pct）
 说明: 请据账户权益与上限自主决定 size_pct（占可用保证金比例）与止损距离。
 名义价值=size_pct×杠杆×可用保证金；杠杆不会放大保证金上限，但会放大名义价值与止损亏损。
 {pos_desc}
+
+风险字段语义与 reason 必填格式:
+  - 本周期估算参考开仓价 entry_ref = 最新价 {ctx.last_price}；实际成交价可能由执行层按盘口略有偏移。
+  - stop_loss_pct / take_profit_pct 是相对 entry_ref 的价格距离小数，不是保证金比例，也不是账户权益比例。
+  - 百分比换算公式: pct_percent = pct_decimal × 100。
+  - 0.012 必须写为 1.20% 价格距离，不能写成 0.12%；0.02 必须写为 2.00% 价格距离。
+  - 风险换算必须严格以 action 为方向基准，先确认 action 再计算 SL/TP。
+  - OPEN_LONG: SL=entry_ref×(1-stop_loss_pct) 且必须低于 entry_ref；TP=entry_ref×(1+take_profit_pct) 且必须高于 entry_ref。
+  - OPEN_SHORT: SL=entry_ref×(1+stop_loss_pct) 且必须高于 entry_ref；TP=entry_ref×(1-take_profit_pct) 且必须低于 entry_ref。
+  - 若计算出的 SL/TP 方向与 action 不一致，必须重新计算；不允许输出与 action 冲突的 reason。
+  - reason 中的 SL/TP 是基于 entry_ref 的预估触发价；实际成交后系统会用交易所实际 entry_price 重算保护单。
+  - margin_used=可用保证金×size_pct；notional=margin_used×leverage。
+  - sl_loss≈notional×stop_loss_pct；tp_profit≈notional×take_profit_pct。
+  - equity_loss_pct≈sl_loss÷账户权益×100；margin_loss_pct≈sl_loss÷margin_used×100。
+  - R≈tp_profit÷sl_loss。
+  - 若 action 为 OPEN_LONG/OPEN_SHORT，reason 必须包含紧凑风险块：
+    风险换算: entry_ref=...; SL_pct=小数=>百分比, SL≈...; TP_pct=小数=>百分比, TP≈...; 亏损≈...USDT(权益...%, 保证金...%); 收益≈...USDT; R≈...
 
 市场情绪/资金面: {_fmt_sentiment(ctx.sentiment)}
 

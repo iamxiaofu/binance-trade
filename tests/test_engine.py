@@ -44,11 +44,14 @@ class FakeStore:
         self.runtime_settings = {}
         self.pending = []          # 待执行命令
         self.marked = []           # (id, status, result)
+        self.marked_status_calls = []
         self.position_snapshots = []
         self.balance_snapshots = []
         self.open_order_snapshots = []
         self.open_trades = set()
         self.active_claims = set()
+        self.condition_not_live_marks = []
+        self.flat_reconciles = []
         self.claims = []
         self.takeover_trades = []
         self.open_qty = {}
@@ -112,9 +115,11 @@ class FakeStore:
         self.marked.append((cmd_id, status, result))
 
     async def mark_orders_status_by_exchange_ids(self, exchange_order_ids, status):
-        return 0
+        self.marked_status_calls.append((list(exchange_order_ids or []), status))
+        return len(exchange_order_ids or [])
 
     async def mark_symbol_conditions_not_live(self, symbol, live_exchange_order_ids, status="canceled"):
+        self.condition_not_live_marks.append((symbol, set(live_exchange_order_ids), status))
         return 0
 
     async def snapshot_open_orders(self, orders):
@@ -207,6 +212,11 @@ class FakeStore:
         return 0
 
     async def reconcile_symbol_flat(self, symbol, *, reason="EXCHANGE_FLAT"):
+        self.flat_reconciles.append((symbol, reason))
+        if symbol in self.open_trades:
+            self.open_trades.discard(symbol)
+            self.open_qty.pop(symbol, None)
+            return 1
         return 0
 
     async def ensure_takeover_trade(self, **kw):
@@ -289,6 +299,8 @@ class FakeClient:
         self.positions = []
         self.canceled_condition_symbols = []
         self.canceled_condition_orders = []
+        self.canceled_open_orders = []
+        self.canceled_all_open_symbols = []
 
     async def fetch_open_orders(self, symbol=None):
         return self.open_orders
@@ -330,13 +342,35 @@ class FakeClient:
             min_notional=Decimal("5"),
         )
 
+    async def cancel_order(self, symbol, order_id, params=None):
+        self.canceled_open_orders.append((symbol, order_id))
+        return {"id": order_id, "status": "canceled"}
+
+    async def cancel_all_orders(self, symbol=None):
+        self.canceled_all_open_symbols.append(symbol)
+        self.open_orders = []
+        return []
+
     async def cancel_condition_order(self, symbol, order_id, *, client_algo_id=""):
         self.canceled_condition_orders.append((symbol, order_id, client_algo_id))
+        return {"id": order_id, "status": "canceled"}
 
     async def cancel_all_condition_orders(self, symbol=None):
         self.canceled_condition_symbols.append(symbol)
         self.condition_orders = []
         return []
+
+
+class DelayedPositionClient(FakeClient):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+        self.fetch_positions_calls = 0
+
+    async def fetch_positions(self, symbols=None):
+        self.fetch_positions_calls += 1
+        idx = min(self.fetch_positions_calls - 1, len(self.responses) - 1)
+        return self.responses[idx]
 
 
 class FakeNotifier:
@@ -387,7 +421,7 @@ class FakeExecutor:
             for kind, otype, trigger in specs
         ]
 
-    async def close_position(self, position, *, mode=None):
+    async def close_position(self, position, *, mode=None, skip_slippage_guard=False):
         return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "filled",
                 "filled": True, "closed": True, "dry_run": False,
                 "qty": abs(float(position.get("contracts") or 0)),
@@ -450,6 +484,7 @@ async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch)
     tripped = await eng._check_circuit_breaker()
     assert tripped is True
     assert eng.runtime.halt_new_entries is True
+    assert eng.runtime.halt_new_entries_reason.startswith("circuit breaker: daily loss")
     assert eng._executor.flattened == 1
     assert any(e == Event.CIRCUIT_BREAK for e, _ in eng._notifier.events)
 
@@ -512,6 +547,7 @@ async def test_sync_open_orders_includes_condition_orders(settings, creds, monke
 
 async def test_reconcile_disables_symbol_when_stale_condition_remains(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS", (0.0,))
     eng._client.condition_orders = [
         {"id": "tp-old", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
          "side": "buy", "amount": 0.5, "stopPrice": 95.0, "status": "open",
@@ -523,6 +559,36 @@ async def test_reconcile_disables_symbol_when_stale_condition_remains(settings, 
     assert eng._client.canceled_condition_orders
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+
+
+async def test_reconcile_defers_exchange_flat_when_position_reappears(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS", (0.0,))
+    eng._store.open_trades.add("BTCUSDT")
+    position = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }
+    eng._client = DelayedPositionClient([[], [position]])
+    eng._client.condition_orders = [
+        {"id": "sl-live", "symbol": "BTC/USDT:USDT", "type": "STOP_MARKET",
+         "side": "sell", "amount": 0.1, "stopPrice": 98.0, "status": "open",
+         "reduceOnly": True},
+        {"id": "tp-live", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+         "side": "sell", "amount": 0.1, "stopPrice": 104.0, "status": "open",
+         "reduceOnly": True},
+    ]
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._store.flat_reconciles == []
+    assert eng._store.condition_not_live_marks == []
+    assert eng._client.canceled_condition_orders == []
+    assert "BTCUSDT" in eng._store.open_trades
+    assert eng.runtime.positions["BTCUSDT"]["contracts"] == pytest.approx(0.1)
 
 
 async def test_reconcile_skips_disabled_unmanaged_position_auto_close(settings, creds, monkeypatch):
@@ -598,6 +664,32 @@ async def test_reconcile_disables_managed_position_missing_stop_without_auto_clo
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
 
 
+async def test_reconcile_repairs_disabled_managed_position_missing_stop(settings, creds, monkeypatch):
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = False
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.set_decision(
+        "BTCUSDT",
+        action="OPEN_LONG",
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+    )
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    await eng._enforce_exchange_invariants("test")
+
+    assert [o["kind"] for o in eng._store.orders] == ["SL", "TP"]
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings.get("symbol.enabled.BTCUSDT") is None
+
+
 async def test_skip_logs_decision(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     # 给一个已有决策价，且价格不动 → 跳过
@@ -654,6 +746,21 @@ async def test_open_pipeline_rejects_high_leverage(settings, creds, monkeypatch)
     assert eng._executor.opened == []
     assert len(eng._store.rejects) == 1
     assert any(e == Event.REJECT for e, _ in eng._notifier.events)
+
+
+async def test_handle_open_rejects_halt_with_specific_reason(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_entries("engine stopping/restarting: signal")
+    decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_SHORT, confidence=0.9,
+                             size_pct=0.05, leverage=2, stop_loss_pct=0.02,
+                             take_profit_pct=0.04, reason="ok")
+
+    await eng._handle_open(decision, _ctx())
+
+    assert eng._executor.opened == []
+    assert eng._store.rejects[0]["verdict"].reason == (
+        "new entries halted: engine stopping/restarting: signal"
+    )
 
 
 async def test_open_rejects_stale_condition_without_position(settings, creds, monkeypatch):
@@ -777,6 +884,34 @@ async def test_open_closes_position_when_stop_not_confirmed(settings, creds, mon
     assert [o["kind"] for o in eng._store.orders] == ["OPEN", "SL", "CLOSE"]
 
 
+async def test_open_waits_for_position_visibility_before_attaching_protection(settings, creds, monkeypatch):
+    settings.risk.max_leverage = 5
+    settings.risk.min_confidence = 0.6
+    monkeypatch.setattr(
+        engine_loop,
+        "_POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS",
+        (0.0, 0.0, 0.0),
+    )
+    position = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.2,
+        "entryPrice": 100.0,
+        "markPrice": 100.0,
+    }
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = DelayedPositionClient([[], [], [position]])
+    decision = TradeDecision(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
+                             size_pct=0.05, leverage=2, stop_loss_pct=0.02,
+                             take_profit_pct=0.04, reason="ok")
+
+    await eng._handle_open(decision, _ctx())
+
+    assert eng._client.fetch_positions_calls == 3
+    assert [o["kind"] for o in eng._store.orders] == ["OPEN", "SL", "TP"]
+    assert eng._symbol_enabled["BTCUSDT"] is True
+
+
 # ---------- P0: 已实现盈亏接通日亏熔断 ----------
 async def test_close_accumulates_realized_pnl(settings, creds, monkeypatch):
     """显式 CLOSE 平仓 → 计算盈亏并累加进 day_realized_pnl。"""
@@ -841,12 +976,14 @@ async def test_command_pause_resume(settings, creds, monkeypatch):
     eng._store.pending = [{"id": 1, "command": "PAUSE", "arg": ""}]
     await eng._process_commands()
     assert eng.runtime.halt_new_entries is True
+    assert eng.runtime.halt_new_entries_reason == "strategy paused"
     assert eng._store.runtime_settings["strategy.paused"] == "true"
     assert eng._store.marked == [(1, "done", "strategy paused (persisted)")]
 
     eng._store.pending = [{"id": 2, "command": "RESUME", "arg": ""}]
     await eng._process_commands()
     assert eng.runtime.halt_new_entries is False
+    assert eng.runtime.halt_new_entries_reason == ""
     assert eng._store.runtime_settings["strategy.paused"] == "false"
     assert eng._store.marked[-1] == (2, "done", "strategy resumed (persisted)")
 
@@ -900,6 +1037,7 @@ async def test_runtime_strategy_paused_applied_on_startup(settings, creds, monke
     eng._store.runtime_settings["strategy.paused"] = "true"
     await eng._apply_runtime_settings()
     assert eng.runtime.halt_new_entries is True
+    assert eng.runtime.halt_new_entries_reason == "strategy paused"
 
 
 async def test_command_set_symbol_enabled(settings, creds, monkeypatch):
@@ -1098,6 +1236,7 @@ async def test_command_stop_engine_does_not_flatten(settings, creds, monkeypatch
     assert eng._executor.canceled == 0
     assert eng._executor.flattened == 0
     assert eng.runtime.kill_switch is False
+    assert eng.runtime.halt_new_entries_reason == "engine stopping/restarting: web stop-engine"
     assert eng._stopped.is_set() is True
     assert eng._store.marked[0][1] == "done"
 
@@ -1150,9 +1289,15 @@ class ManualCloseExecutor(FakeExecutor):
     def __init__(self, client):
         super().__init__()
         self.client = client
+        self.skip_slippage_guard_seen = None
 
-    async def close_position(self, position, *, mode=None):
-        result = await super().close_position(position, mode=mode)
+    async def close_position(self, position, *, mode=None, skip_slippage_guard=False):
+        self.skip_slippage_guard_seen = skip_slippage_guard
+        result = await super().close_position(
+            position,
+            mode=mode,
+            skip_slippage_guard=skip_slippage_guard,
+        )
         self.client.position = None
         return result
 
@@ -1211,6 +1356,36 @@ async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, m
     assert eng._store.orders == []
     assert eng._store.marked[0][1] == "failed"
     assert "空单止损必须高于当前标记价" in eng._store.marked[0][2]
+
+
+async def test_command_repair_sl_tp_keeps_active_tp_after_mark_crosses_trigger(settings, creds, monkeypatch):
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "short",
+            "contracts": 1.0,
+            "entryPrice": 100.0,
+            "markPrice": 94.0,
+        },
+        open_orders=[
+            {"id": "tp-live", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+             "side": "buy", "amount": 1.0, "stopPrice": 95.0, "status": "open",
+             "reduceOnly": True},
+        ],
+        equity=1000.0,
+    )
+    eng._store.templates = {
+        "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
+        "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
+    }
+
+    result = await eng._exec_command("REPAIR_SL_TP", "BTCUSDT")
+
+    assert eng._client.canceled == []
+    assert [o["kind"] for o in eng._store.orders] == ["SL"]
+    assert "已补挂 SL@102.00" in result
 
 
 async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, creds, monkeypatch):
@@ -1337,7 +1512,10 @@ async def test_command_close_position_closes_and_cancels_protection_without_disa
     result = await eng._exec_command("CLOSE_POSITION", json.dumps(payload))
 
     assert "手动平仓完成" in result
+    assert eng._executor.skip_slippage_guard_seen is True
     assert eng._store.orders[-1]["kind"] == "CLOSE"
+    assert eng._store.orders[-1]["raw"]["_local"]["manual_force_close"] is True
+    assert eng._store.orders[-1]["raw"]["_local"]["slippage_guard_skipped"] is True
     assert client.canceled == [("BTCUSDT", "ALL", "")]
     assert eng._symbol_enabled["BTCUSDT"] is True
     assert eng._store.runtime_settings.get("symbol.enabled.BTCUSDT") is None
@@ -1545,3 +1723,40 @@ async def test_startup_rehydrate_falls_back_on_store_error(settings, creds, monk
     eng.runtime.rehydrate_day_pnl({})
     assert eng.runtime.day_realized_pnl == 0.0
     assert eng.runtime.day_key == _t.strftime("%Y-%m-%d", _t.localtime())
+
+# ---------- 挂单取消命令 ----------
+async def test_cancel_open_order_command_cancels_via_client(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    payload = json.dumps({"symbol": "BTCUSDT", "order_id": "OID-OPEN-1"})
+    result = await eng._cancel_open_order(payload)
+    assert "BTCUSDT" in result and "OID-OPEN-1" in result
+    assert eng._client.canceled_open_orders == [("BTCUSDT", "OID-OPEN-1")]
+    assert eng._store.marked_status_calls[-1] == (["OID-OPEN-1"], "canceled")
+
+async def test_cancel_open_order_rejects_missing_identifier(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    with pytest.raises(ValueError):
+        await eng._cancel_open_order(json.dumps({"symbol": "BTCUSDT"}))
+
+async def test_cancel_condition_order_command_passes_client_algo_id(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    payload = json.dumps({
+        "symbol": "ETHUSDT",
+        "algo_id": "ALGO-1",
+        "client_algo_id": "bt-algo-1",
+    })
+    result = await eng._cancel_condition_order(payload)
+    assert "ETHUSDT" in result and "ALGO-1" in result
+    assert eng._client.canceled_condition_orders == [("ETHUSDT", "ALGO-1", "bt-algo-1")]
+    assert eng._store.marked_status_calls[-1] == (["ALGO-1"], "canceled")
+
+async def test_cancel_all_open_orders_command_clears_pending(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.open_orders = [
+        {"id": "A", "symbol": "BTC/USDT:USDT", "type": "limit", "status": "open"},
+        {"id": "B", "symbol": "BTC/USDT:USDT", "type": "limit", "status": "open"},
+    ]
+    result = await eng._cancel_all_open_orders("BTCUSDT")
+    assert "BTCUSDT" in result
+    assert eng._client.canceled_all_open_symbols == ["BTCUSDT"]
+    assert eng._client.open_orders == []

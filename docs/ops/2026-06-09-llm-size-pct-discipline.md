@@ -96,3 +96,14 @@
 - `rejects.code='ORDER_MARGIN'` 数量变化（目标：从 9/7天 降到 0-2/7天）
 - `decisions.size_pct` 分布（target: 0.05-0.20 内集中）
 - LLM reason 是否出现 "max_order_margin_pct" 字样（说明 LLM 在 reasoning 时考虑了约束）
+
+## 2026-06-09 后续校准
+
+在 LLM reason 风险换算约束中，进一步把 user prompt 从“`size_pct ≤ max_order_margin_pct`”校准为：
+
+```text
+margin_used ≤ max_order_margin_abs (= max_order_margin_pct × 账户权益)
+size_pct 参考上限: 当可用保证金≈账户权益时约 ≤ max_order_margin_pct
+```
+
+原因：代码中 `size_pct` 始终表示“动用可用保证金比例”，而风控硬上限的绝对金额按账户权益计算。可用保证金与账户权益不一致时，直接写 `size_pct ≤ max_order_margin_pct` 只是近似，不是严格公式。

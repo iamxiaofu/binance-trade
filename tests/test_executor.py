@@ -50,6 +50,14 @@ class FakeClient:
         return []
 
 
+class WideCloseSlippageClient(FakeClient):
+    async def fetch_order_book(self, symbol, limit=20):
+        return {
+            "bids": [[99.9, 1.0]],
+            "asks": [[101.0, 1.0]],
+        }
+
+
 def _decision(**kw):
     base = dict(symbol="BTCUSDT", action=Action.OPEN_LONG, confidence=0.9,
                 size_pct=0.1, leverage=3, stop_loss_pct=0.02,
@@ -71,6 +79,73 @@ async def test_open_calls_exchange_and_sets_leverage(settings):
     assert res["execution_mode"] == "MARKET_TAKER"
     assert res["liquidity"] == "taker"
     assert client.setup_called == [("BTCUSDT", 3)]
+
+
+def test_fee_summary_deduplicates_duplicate_trade_fee_sources():
+    trade = {
+        "amount": 2.494,
+        "price": 1670.48,
+        "fee": {"cost": 1.66647084, "currency": "USDT"},
+        "fees": [{"cost": 1.66647084, "currency": "USDT"}],
+        "info": {
+            "commission": "1.66647084",
+            "commissionAsset": "USDT",
+            "maker": "false",
+        },
+    }
+
+    fee, asset, liquidity = Executor._fee_summary({}, [trade])
+
+    assert fee == pytest.approx(1.66647084)
+    assert asset == "USDT"
+    assert liquidity == "taker"
+
+
+class MarketOrderWithDelayedTradesClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.fetch_order_trades_calls = 0
+
+    async def create_order(self, symbol, side, amount, order_type="market", price=None, params=None):
+        self.created.append((symbol, side, amount, order_type, params))
+        return {"id": "9370602752", "status": "closed", "info": {"orderId": "9370602752"}}
+
+    async def fetch_order_trades(self, symbol, order_id, limit=100):
+        self.fetch_order_trades_calls += 1
+        return [{
+            "amount": 2.494,
+            "price": 1670.48,
+            "fee": {"cost": 1.66647084, "currency": "USDT"},
+            "fees": [{"cost": 1.66647084, "currency": "USDT"}],
+            "info": {
+                "qty": "2.494",
+                "price": "1670.48",
+                "quoteQty": "4166.17712000",
+                "commission": "1.66647084",
+                "commissionAsset": "USDT",
+                "maker": "false",
+            },
+        }]
+
+
+async def test_market_open_uses_mytrades_for_avg_notional_and_fee(settings):
+    client = MarketOrderWithDelayedTradesClient()
+    ex = Executor(client, settings)
+
+    res = await ex.open_position(
+        decision=_decision(symbol="ETHUSDT", action=Action.OPEN_SHORT, leverage=5),
+        qty=2.494,
+        price=1668.89,
+    )
+
+    assert res["status"] == "filled"
+    assert res["qty"] == pytest.approx(2.494)
+    assert res["price"] == pytest.approx(1670.48)
+    assert res["notional"] == pytest.approx(4166.17712)
+    assert res["fee"] == pytest.approx(1.66647084)
+    assert res["fee_asset"] == "USDT"
+    assert res["liquidity"] == "taker"
+    assert client.fetch_order_trades_calls == 1
 
 
 async def test_open_rejects_below_min_notional(settings):
@@ -165,6 +240,32 @@ async def test_close_position_calls_exchange(settings):
     assert client.created[0][0:4] == ("BTCUSDT", "sell", 0.05, "market")
     assert client.created[0][4]["reduceOnly"] is True
     assert client.created[0][4]["newClientOrderId"].startswith("bt-")
+
+
+async def test_close_position_force_bypasses_slippage_guard(settings):
+    client = WideCloseSlippageClient()
+    ex = Executor(client, settings)
+    pos = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "short",
+        "contracts": 0.05,
+        "entryPrice": 101.0,
+        "markPrice": 100.0,
+    }
+
+    rejected = await ex.close_position(pos)
+
+    assert rejected["status"] == "rejected"
+    assert rejected["raw"]["reason"] == "slippage_exceeded"
+    assert client.created == []
+
+    forced = await ex.close_position(pos, skip_slippage_guard=True)
+
+    assert forced["closed"] is True
+    assert forced["side"] == "buy"
+    assert len(client.created) == 1
+    assert client.created[0][0:4] == ("BTCUSDT", "buy", 0.05, "market")
+    assert client.created[0][4]["reduceOnly"] is True
 
 
 async def test_close_no_position(settings):

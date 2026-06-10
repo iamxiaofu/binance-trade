@@ -37,6 +37,8 @@ _RECONCILE_ACTIVE_INTERVAL_SECONDS = 15.0
 _RECONCILE_IDLE_INTERVAL_SECONDS = 30.0
 _COMMAND_POLL_INTERVAL_SECONDS = 1.0
 _ENTRY_CLAIM_TTL_MS = 300_000
+_POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS = (0.0, 0.3, 0.7, 1.2, 2.0, 3.0)
+_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0, 5.0)
 
 
 class TradingEngine:
@@ -312,12 +314,12 @@ class TradingEngine:
             await self.kill("web kill-switch")
             return "kill switch executed (cancel+flatten+stop)"
         if name == "PAUSE":
-            self.runtime.halt_new_entries = True
+            self.runtime.halt_entries("strategy paused")
             await self._store.set_runtime_setting("strategy.paused", "true")
             await self._notifier.send(Event.CIRCUIT_BREAK, "paused via web (no new entries)")
             return "strategy paused (persisted)"
         if name == "RESUME":
-            self.runtime.halt_new_entries = False
+            self.runtime.resume_entries()
             await self._store.set_runtime_setting("strategy.paused", "false")
             return "strategy resumed (persisted)"
         if name == "RESUME_ALL_SYMBOLS":
@@ -337,6 +339,12 @@ class TradingEngine:
             return await self._switch_llm_profile(arg)
         if name == "REPAIR_SL_TP":
             return await self._repair_sl_tp(arg)
+        if name == "CANCEL_OPEN_ORDER":
+            return await self._cancel_open_order(arg)
+        if name == "CANCEL_CONDITION_ORDER":
+            return await self._cancel_condition_order(arg)
+        if name == "CANCEL_ALL_OPEN_ORDERS":
+            return await self._cancel_all_open_orders(arg)
         if name == "PROTECT_POSITION":
             return await self._protect_position(arg)
         if name == "CLOSE_POSITION":
@@ -351,7 +359,10 @@ class TradingEngine:
             await self._store.set_runtime_setting("strategy.paused", "false")
         else:
             paused = raw_paused.strip().lower() in ("1", "true", "yes", "on")
-            self.runtime.halt_new_entries = paused
+            if paused:
+                self.runtime.halt_entries("strategy paused")
+            else:
+                self.runtime.resume_entries()
             logger.info("runtime setting applied: strategy.paused={}", paused)
         for symbol in self._tracked_symbols():
             key = self._symbol_enabled_key(symbol)
@@ -523,7 +534,7 @@ class TradingEngine:
         await self._store.set_runtime_settings(values)
         for symbol in eligible:
             await self._store.set_symbol_enabled(symbol, True)
-        self.runtime.halt_new_entries = False
+        self.runtime.resume_entries()
         for symbol in eligible:
             self._symbol_enabled[symbol] = True
         await self._reload_symbols_from_store()
@@ -573,7 +584,7 @@ class TradingEngine:
 
     async def _cancel_and_flatten(self, source: str) -> str:
         """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
-        self.runtime.halt_new_entries = True
+        self.runtime.halt_entries("strategy paused after cancel+flatten")
         await self._store.set_runtime_setting("strategy.paused", "true")
         symbols = self._tracked_symbols()
         await self._executor.cancel_all_orders(symbols=symbols)
@@ -598,6 +609,91 @@ class TradingEngine:
             f"cancel+flatten via {source}: closed={closed}, strategy paused",
         )
         return f"open orders canceled; flattened {closed} positions; strategy paused"
+
+    async def _cancel_open_order(self, arg: str) -> str:
+        """撤销一条普通未成交挂单（限价/限价 maker 等，不含 SL/TP 算法单）。
+
+        arg 为 JSON: ``{"symbol": "BTCUSDT", "order_id": "..."}``
+        ``order_id`` 缺失时回退到 ``client_order_id``。
+        """
+        try:
+            payload = json.loads(arg or "{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"CANCEL_OPEN_ORDER requires JSON arg: {e}") from e
+        symbol = normalize_symbol(str(payload.get("symbol") or ""))
+        if not symbol:
+            raise ValueError("CANCEL_OPEN_ORDER requires symbol")
+        order_id = str(payload.get("order_id") or "")
+        client_order_id = str(payload.get("client_order_id") or "")
+        if not order_id and not client_order_id:
+            raise ValueError("CANCEL_OPEN_ORDER requires order_id or client_order_id")
+        if hasattr(self._executor, "_cancel_regular_order_safe"):
+            try:
+                res = await self._executor._cancel_regular_order_safe(
+                    symbol, order_id or client_order_id
+                )
+            except Exception as e:
+                raise RuntimeError(f"cancel open order failed: {e}") from e
+        else:
+            try:
+                res = await self._client.cancel_order(
+                    symbol,
+                    order_id or client_order_id,
+                    params={"clientOrderId": client_order_id} if (not order_id and client_order_id) else None,
+                )
+            except Exception as e:
+                raise RuntimeError(f"cancel open order failed: {e}") from e
+        if order_id:
+            await self._store.mark_orders_status_by_exchange_ids([order_id], "canceled")
+        status = (res or {}).get("status") or "submitted"
+        return f"{symbol} 已撤销挂单 {order_id or client_order_id} (status={status})"
+
+    async def _cancel_condition_order(self, arg: str) -> str:
+        """撤销一条条件单（SL/TP 算法单）。
+
+        arg 为 JSON: ``{"symbol": "BTCUSDT", "algo_id": "...", "client_algo_id": "..."}``
+        """
+        try:
+            payload = json.loads(arg or "{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"CANCEL_CONDITION_ORDER requires JSON arg: {e}") from e
+        symbol = normalize_symbol(str(payload.get("symbol") or ""))
+        if not symbol:
+            raise ValueError("CANCEL_CONDITION_ORDER requires symbol")
+        algo_id = str(payload.get("algo_id") or payload.get("order_id") or "")
+        client_algo_id = str(payload.get("client_algo_id") or "")
+        if not algo_id and not client_algo_id:
+            raise ValueError("CANCEL_CONDITION_ORDER requires algo_id or client_algo_id")
+        try:
+            res = await self._client.cancel_condition_order(
+                symbol,
+                algo_id,
+                client_algo_id=client_algo_id,
+            )
+        except Exception as e:
+            raise RuntimeError(f"cancel condition order failed: {e}") from e
+        if algo_id:
+            await self._store.mark_orders_status_by_exchange_ids([algo_id], "canceled")
+        status = (res or {}).get("status") or "submitted"
+        return f"{symbol} 已撤销条件单 {algo_id or client_algo_id} (status={status})"
+
+    async def _cancel_all_open_orders(self, arg: str) -> str:
+        """撤销某 symbol 所有普通挂单；条件单走 CANCEL_CONDITION_ORDER。"""
+        symbol = normalize_symbol(str(arg or "").strip())
+        if not symbol:
+            raise ValueError("CANCEL_ALL_OPEN_ORDERS requires a symbol")
+        try:
+            await self._client.cancel_all_orders(symbol=symbol)
+        except Exception as e:
+            raise RuntimeError(f"cancel all open orders failed: {e}") from e
+        await asyncio.sleep(0.3)
+        try:
+            remaining = await self._client.fetch_open_orders(symbol)
+        except Exception as e:
+            logger.warning("post-cancel fetch open orders {} failed: {}", symbol, e)
+            remaining = []
+        canceled_ids = {str(o.get("id") or "") for o in remaining if o.get("id")}
+        return f"{symbol} 已批量撤销普通挂单；剩余未撤 {len(remaining)}"
 
     async def _repair_sl_tp(self, arg: str) -> str:
         """补挂当前持仓缺失的 SL/TP 条件单。
@@ -962,10 +1058,23 @@ class TradingEngine:
         )
 
         estimate = realized_pnl(side=side, entry_price=entry, exit_price=mark, qty=qty)
+        # 手动平仓是用户确认后的强制退出路径：仍保留交易所持仓重拉、
+        # 页面持仓签名校验和 reduce-only，但绕过普通市价滑点预检。
         result = await self._executor.close_position(
             raw_position,
             mode=ExecutionMode.MARKET_TAKER,
+            skip_slippage_guard=True,
         )
+        raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+        local_meta = raw.get("_local") if isinstance(raw.get("_local"), dict) else {}
+        result["raw"] = {
+            **raw,
+            "_local": {
+                **local_meta,
+                "manual_force_close": True,
+                "slippage_guard_skipped": True,
+            },
+        }
         await self._store.log_order(result)
         if not result.get("filled"):
             raise ValueError(f"{symbol}: 手动平仓未成交 status={result.get('status')} raw={result.get('raw')}")
@@ -1094,14 +1203,44 @@ class TradingEngine:
         close_side = "sell" if side == "long" else "buy"
         expected_qty = float(open_result.get("qty") or 0.0)
         expected_entry = float(open_result.get("price") or 0.0)
-        # 1) 拉交易所侧实情
-        try:
-            raw_positions = await self._client.fetch_positions([symbol])
-        except Exception as e:
-            return {"ok": False, "reason": f"fetch_positions failed: {e}"}
-        live = next((_np(r) for r in raw_positions if _np(r)["symbol"] == symbol), None)
+        # 1) 拉交易所侧实情。市价成交后 positionRisk/positions 可能有短暂刷新延迟；
+        # 对“暂未看到持仓”做一个短确认窗口，避免误判成裸仓保护失败。
+        live = None
+        last_reason = ""
+        attempts = len(_POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS)
+        for attempt, delay in enumerate(_POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS, start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                raw_positions = await self._client.fetch_positions([symbol])
+            except Exception as e:
+                last_reason = f"fetch_positions failed: {e}"
+                logger.warning(
+                    "{} pre-attach position confirm attempt {}/{} failed: {}",
+                    symbol, attempt, attempts, e,
+                )
+                continue
+            live = next((_np(r) for r in raw_positions if _np(r)["symbol"] == symbol), None)
+            if live is not None and live["contracts"] > 0:
+                if attempt > 1:
+                    logger.warning(
+                        "{} pre-attach position appeared after {}/{} attempts",
+                        symbol, attempt, attempts,
+                    )
+                break
+            last_reason = f"{symbol} 交易所侧暂未显示持仓"
+            if attempt < attempts:
+                logger.warning(
+                    "{} pre-attach position not visible attempt {}/{}; retry",
+                    symbol, attempt, attempts,
+                )
         if live is None or live["contracts"] <= 0:
-            return {"ok": False, "reason": f"{symbol} 交易所侧已无持仓，跳过 SL/TP"}
+            reason = (
+                f"{symbol} 交易所侧在 {attempts} 次确认后仍无持仓，跳过 SL/TP"
+                if not last_reason.startswith("fetch_positions failed")
+                else f"{last_reason}，跳过 SL/TP"
+            )
+            return {"ok": False, "reason": reason}
         if live["side"] != side:
             return {
                 "ok": False,
@@ -1566,18 +1705,21 @@ class TradingEngine:
         if order_qty <= 0 or abs(order_qty - qty) > qty_tol:
             return f"qty {order_qty:g} != position qty {qty:g}"
         trigger = float(order.get("trigger_price") or 0.0)
-        if trigger <= 0 or entry <= 0 or mark <= 0:
-            return "invalid trigger/entry/mark"
+        if trigger <= 0 or entry <= 0:
+            return "invalid trigger/entry"
+        # Active exchange protection may remain open while price is crossing its trigger.
+        # Do not classify it as stale by current mark, or we can cancel the order that
+        # should be allowed to trigger.
         if pos_side == "long":
-            if kind == "SL" and not (trigger < mark and trigger < entry):
-                return f"long SL trigger {trigger:g} not below mark/entry"
-            if kind == "TP" and not (trigger > mark and trigger > entry):
-                return f"long TP trigger {trigger:g} not above mark/entry"
+            if kind == "SL" and not (trigger < entry):
+                return f"long SL trigger {trigger:g} not below entry"
+            if kind == "TP" and not (trigger > entry):
+                return f"long TP trigger {trigger:g} not above entry"
         elif pos_side == "short":
-            if kind == "SL" and not (trigger > mark and trigger > entry):
-                return f"short SL trigger {trigger:g} not above mark/entry"
-            if kind == "TP" and not (trigger < mark and trigger < entry):
-                return f"short TP trigger {trigger:g} not below mark/entry"
+            if kind == "SL" and not (trigger > entry):
+                return f"short SL trigger {trigger:g} not above entry"
+            if kind == "TP" and not (trigger < entry):
+                return f"short TP trigger {trigger:g} not below entry"
         else:
             return f"unknown position side {pos_side}"
         return ""
@@ -1699,7 +1841,7 @@ class TradingEngine:
             breached = f"drawdown {rt.drawdown_pct:.2f}% >= {risk.max_drawdown_pct}%"
         if breached and not rt.halt_new_entries:
             logger.warning("CIRCUIT BREAKER: {}", breached)
-            rt.trip_breaker()
+            rt.trip_breaker(breached)
             try:
                 await self._executor.flatten_all(symbols=self._tracked_symbols())
             except Exception as e:
@@ -1843,6 +1985,7 @@ class TradingEngine:
             day_realized_pnl=self.runtime.day_realized_pnl,
             drawdown_pct=self.runtime.drawdown_pct,
             halt_new_entries=self.runtime.halt_new_entries,
+            halt_new_entries_reason=self.runtime.halt_new_entries_reason,
             kill_switch=self.runtime.kill_switch,
         )
         verdict = validate(decision, rctx, self._settings)
@@ -2154,12 +2297,46 @@ class TradingEngine:
         if orders:
             await self._store.snapshot_open_orders(orders)
 
+    async def _confirm_exchange_flat(self, symbol: str, reason: str) -> tuple[bool, dict | None]:
+        """Confirm a missing exchange position before closing local state as EXCHANGE_FLAT."""
+        attempts = len(_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS)
+        saw_fetch_error = False
+        for attempt, delay in enumerate(_EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS, start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                raw_positions = await self._client.fetch_positions([symbol])
+            except Exception as e:
+                saw_fetch_error = True
+                logger.warning(
+                    "{} exchange-flat confirm attempt {}/{} failed during {}: {}",
+                    symbol, attempt, attempts, reason, e,
+                )
+                continue
+            for raw in raw_positions:
+                position = normalize_position(raw)
+                if position["symbol"] == symbol and position["contracts"] > 0:
+                    self.runtime.positions[symbol] = position
+                    logger.warning(
+                        "{} exchange-flat reconcile deferred during {}; "
+                        "position reappeared after {}/{} confirmations",
+                        symbol, reason, attempt, attempts,
+                    )
+                    return False, position
+        if saw_fetch_error:
+            logger.warning(
+                "{} exchange-flat confirm inconclusive during {}; defer local flat reconcile",
+                symbol, reason,
+            )
+            return False, None
+        return True, None
+
     async def _enforce_exchange_invariants(self, reason: str) -> None:
-        positions = {
-            normalize_position(raw)["symbol"]: normalize_position(raw)
-            for raw in await self._client.fetch_positions(self._tracked_symbols())
-            if normalize_position(raw)["contracts"] > 0
-        }
+        positions = {}
+        for raw in await self._client.fetch_positions(self._tracked_symbols()):
+            position = normalize_position(raw)
+            if position["contracts"] > 0:
+                positions[position["symbol"]] = position
         for symbol in self._tracked_symbols():
             try:
                 active_orders = await self._active_protection_orders(symbol)
@@ -2168,29 +2345,45 @@ class TradingEngine:
                 continue
             position = positions.get(symbol)
             if position is None:
-                await self._sync_condition_history(symbol, active_orders)
-                live_ids = {str(order.get("id") or "") for order in active_orders}
-                await self._store.mark_symbol_conditions_not_live(symbol, live_ids)
-                closed = await self._store.reconcile_symbol_flat(
-                    symbol, reason="EXCHANGE_FLAT"
-                )
-                if closed:
+                needs_flat_confirm = bool(active_orders)
+                try:
+                    needs_flat_confirm = needs_flat_confirm or await self._store.has_open_trade(symbol)
+                except Exception as e:
+                    needs_flat_confirm = True
                     logger.warning(
-                        "{} reconciled {} local open trade(s) as exchange flat",
-                        symbol, closed,
+                        "{} local open trade check failed during {}; confirm exchange flat first: {}",
+                        symbol, reason, e,
                     )
-                if active_orders:
-                    remaining = await self._cancel_stale_condition_orders(
-                        symbol=symbol,
-                        orders=active_orders,
-                        reason=reason,
+                if needs_flat_confirm:
+                    flat_confirmed, live_position = await self._confirm_exchange_flat(symbol, reason)
+                    if live_position is not None:
+                        position = live_position
+                    elif not flat_confirmed:
+                        continue
+                if position is None:
+                    await self._sync_condition_history(symbol, active_orders)
+                    live_ids = {str(order.get("id") or "") for order in active_orders}
+                    await self._store.mark_symbol_conditions_not_live(symbol, live_ids)
+                    closed = await self._store.reconcile_symbol_flat(
+                        symbol, reason="EXCHANGE_FLAT"
                     )
-                    if remaining:
-                        details = ", ".join(
-                            self._condition_order_label(order) for order in remaining
+                    if closed:
+                        logger.warning(
+                            "{} reconciled {} local open trade(s) as exchange flat",
+                            symbol, closed,
                         )
-                        await self._disable_symbol_due_stale_conditions(symbol, details)
-                continue
+                    if active_orders:
+                        remaining = await self._cancel_stale_condition_orders(
+                            symbol=symbol,
+                            orders=active_orders,
+                            reason=reason,
+                        )
+                        if remaining:
+                            details = ", ".join(
+                                self._condition_order_label(order) for order in remaining
+                            )
+                            await self._disable_symbol_due_stale_conditions(symbol, details)
+                    continue
 
             await self._sync_condition_history(symbol, active_orders)
             if not await self._should_enforce_position_protection(symbol, reason):
@@ -2241,6 +2434,18 @@ class TradingEngine:
                 mark=mark,
             )
             if not has_stop:
+                try:
+                    repair_msg = await self._repair_sl_tp(symbol)
+                    logger.warning(
+                        "{} SL missing during {}; protection repair result: {}",
+                        symbol, reason, repair_msg,
+                    )
+                    continue
+                except Exception as e:
+                    logger.error(
+                        "{} SL missing during {}; protection repair failed: {}",
+                        symbol, reason, e,
+                    )
                 await self._disable_symbol_due_protection_failure(
                     symbol,
                     f"SL protection missing during exchange reconcile ({reason})",
@@ -2264,10 +2469,9 @@ class TradingEngine:
         if not self._symbol_enabled.get(symbol, False):
             logger.warning(
                 "{} live position detected during {}, but symbol is disabled; "
-                "skip auto protection enforcement",
+                "continue protection ownership check while keeping new entries disabled",
                 symbol, reason,
             )
-            return False
         try:
             managed = await self._store.has_open_trade(symbol)
         except Exception as e:
@@ -2558,7 +2762,7 @@ class TradingEngine:
     async def stop(self, reason: str = "manual") -> None:
         """停止交易引擎主循环，不撤单、不平仓。"""
         logger.warning("trading engine stop requested: {}", reason)
-        self.runtime.halt_new_entries = True
+        self.runtime.halt_entries(f"engine stopping/restarting: {reason}")
         self._stopped.set()
         await self._notifier.send(Event.CIRCUIT_BREAK, f"engine stopped: {reason}")
 

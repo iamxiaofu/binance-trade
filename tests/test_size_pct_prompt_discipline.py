@@ -7,7 +7,12 @@ from src.llm.schema import (
 )
 
 
-def _ctx(pct: float = 0.2) -> MarketContext:
+def _ctx(
+    pct: float = 0.2,
+    *,
+    available_margin: float = 5018.0,
+    account_equity: float = 5018.0,
+) -> MarketContext:
     return MarketContext(
         symbol="BTCUSDT",
         timestamp=1,
@@ -25,10 +30,10 @@ def _ctx(pct: float = 0.2) -> MarketContext:
             trend_direction="up", trend_score=0.5,
         ),
         position=PositionSnapshot(has_position=False),
-        available_margin=5018.0,
+        available_margin=available_margin,
         max_leverage_allowed=5,
-        account_equity=5018.0,
-        max_order_margin_abs=5018.0 * pct,
+        account_equity=account_equity,
+        max_order_margin_abs=account_equity * pct,
         max_order_margin_pct=pct,
         max_loss_per_trade_abs=502,
     )
@@ -40,6 +45,8 @@ def test_system_prompt_explains_size_pct_hard_cap():
     # "硬上限" + "拒单" 必须同时出现（强表达）
     assert "硬上限" in SYSTEM_PROMPT
     assert "直接拒单" in SYSTEM_PROMPT or "拒单" in SYSTEM_PROMPT
+    assert "0.012 必须表述为 1.20%" in SYSTEM_PROMPT
+    assert "OPEN_LONG/OPEN_SHORT 的 reason 必须同时写清风险换算" in SYSTEM_PROMPT
 
 
 def test_user_prompt_shows_pct_and_abs():
@@ -51,8 +58,15 @@ def test_user_prompt_shows_pct_and_abs():
     assert "1003.60 USDT" in p
     # "硬上限" 字面
     assert "硬上限" in p
-    # "size_pct ≤" 表达式
-    assert "size_pct ≤" in p
+    # 硬上限以 margin_used 的绝对金额表达，size_pct 只作为可用保证金比例
+    assert "margin_used ≤ 1003.60 USDT" in p
+    assert "max_order_margin_pct 0.2000 × 账户权益 5018.00" in p
+    assert "size_pct 参考上限" in p
+    # 风险换算公式
+    assert "pct_percent = pct_decimal × 100" in p
+    assert "margin_used=可用保证金×size_pct" in p
+    assert "margin_loss_pct≈sl_loss÷margin_used×100" in p
+    assert "R≈tp_profit÷sl_loss" in p
 
 
 def test_user_prompt_pct_changes_with_config():
@@ -64,3 +78,11 @@ def test_user_prompt_pct_changes_with_config():
     # 绝对值也跟着变
     assert "501.80 USDT" in p_low
     assert "1505.40 USDT" in p_high
+
+
+def test_user_prompt_margin_cap_uses_equity_base():
+    """账户权益与可用保证金不一致时，绝对硬上限必须按权益表达。"""
+    p = build_user_prompt(_ctx(pct=0.2, available_margin=4000.0, account_equity=5000.0))
+    assert "margin_used ≤ 1000.00 USDT" in p
+    assert "max_order_margin_pct 0.2000 × 账户权益 5000.00" in p
+    assert "0.2000 × 可用保证金 4000.00" not in p

@@ -44,7 +44,7 @@ class DecisionRow(Base):
     leverage: Mapped[int] = mapped_column(Integer, default=0)
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=0.0)
     take_profit_pct: Mapped[float] = mapped_column(Float, default=0.0)
-    reason: Mapped[str] = mapped_column(String(500), default="")
+    reason: Mapped[str] = mapped_column(String(1000), default="")
 
     # 审计：完整输入上下文 JSON（便于复盘）
     context_json: Mapped[str] = mapped_column(Text, default="")

@@ -19,7 +19,7 @@ from sqlalchemy import text, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.exchange.positions import normalize_position, normalize_symbol
-from src.llm.schema import MarketContext, TradeDecision
+from src.llm.schema import DECISION_REASON_MAX_LENGTH, MarketContext, TradeDecision
 from src.risk.manager import Verdict
 from src.state.runtime import RuntimeState
 from src.store.models import (
@@ -640,7 +640,7 @@ class Store:
             row.leverage = decision.leverage
             row.stop_loss_pct = decision.stop_loss_pct
             row.take_profit_pct = decision.take_profit_pct
-            row.reason = decision.reason[:500]
+            row.reason = decision.reason[:DECISION_REASON_MAX_LENGTH]
         if ctx is not None:
             try:
                 row.context_json = ctx.model_dump_json()
@@ -662,7 +662,7 @@ class Store:
             symbol=symbol[:20],
             skipped=False,
             action=action[:16],
-            reason=reason[:500],
+            reason=reason[:DECISION_REASON_MAX_LENGTH],
         )
         await self._add(row)
 

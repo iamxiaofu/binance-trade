@@ -61,9 +61,14 @@ def test_invalid_action():
         TradeDecision.model_validate({**VALID, "action": "MOON"})
 
 
+def test_reason_accepts_expanded_limit():
+    d = TradeDecision.model_validate({**VALID, "reason": "x" * 1000})
+    assert len(d.reason) == 1000
+
+
 def test_reason_too_long():
     with pytest.raises(ValidationError):
-        TradeDecision.model_validate({**VALID, "reason": "x" * 501})
+        TradeDecision.model_validate({**VALID, "reason": "x" * 1001})
 
 
 def test_safe_hold_degrade():
@@ -77,11 +82,17 @@ def test_safe_hold_degrade():
 
 
 def test_safe_hold_long_reason_truncated():
-    d = TradeDecision.safe_hold("BTCUSDT", "x" * 600)
-    assert len(d.reason) <= 500
+    d = TradeDecision.safe_hold("BTCUSDT", "x" * 1200)
+    assert len(d.reason) <= 1000
 
 
 def test_json_schema_generated():
     schema = TradeDecision.json_schema_for_llm()
     assert schema["additionalProperties"] is False  # extra=forbid
     assert "leverage" in schema["properties"]
+    assert schema["properties"]["reason"]["maxLength"] == 1000
+    assert "0.012" in schema["properties"]["stop_loss_pct"]["description"]
+    assert "小数×100" in schema["properties"]["stop_loss_pct"]["description"]
+    assert "2.00%" in schema["properties"]["take_profit_pct"]["description"]
+    assert "OPEN_LONG 的 SL 低于 entry_ref" in schema["properties"]["reason"]["description"]
+    assert "OPEN_SHORT 的 SL 高于 entry_ref" in schema["properties"]["reason"]["description"]

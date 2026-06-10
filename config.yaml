@@ -18,7 +18,7 @@ account:
 
 # ===== 决策周期与节流 =====
 cycle:
-  interval: 5m                # 主循环周期：支持 1m/3m/5m/15m/30m/1h
+  interval: 3m                # 主循环周期：支持 1m/3m/5m/15m/30m/1h
   heartbeat_on_skip: true     # 跳过 LLM 时是否写心跳日志
 
 throttle:                     # 行情变化门槛（纯函数，全部可单测）
@@ -82,7 +82,7 @@ execution:
   maker_poll_seconds: 1
   maker_max_requotes: 4               # 最多 4 次重挂（之前 2 次）
   maker_price_offset_bps: 5          # 挂单离盘口偏移（之前 1bps 太小，1-2s 内易被 Post-Only 撤单）
-  maker_unfilled_action: CANCEL     # CANCEL | FALLBACK_MARKET（暂保守，不开兜底市价单）
+  maker_unfilled_action: FALLBACK_MARKET  # CANCEL | FALLBACK_MARKET（maker 全部未成交后市价兜底）
   # ---- 市价单滑点护栏（保护 FALLBACK_MARKET 兜底场景）----
   # 下单前用盘口估算市价单冲击价 vs 决策参考价，偏差超阈值就拒单。
   # 默认 8 bps = 0.08% 覆盖 BTC/ETH/BNB 正常+中等急跌；SOL 等中等币种单独放宽。

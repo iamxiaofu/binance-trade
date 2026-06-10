@@ -38,6 +38,7 @@ class RuntimeState:
 
     # 熔断/停机标志
     halt_new_entries: bool = False
+    halt_new_entries_reason: str = ""
     kill_switch: bool = False
 
     # 最近一次已知持仓快照（symbol → ccxt position dict）
@@ -108,8 +109,20 @@ class RuntimeState:
             self.drawdown_pct = max(0.0, (self.equity_peak - equity) / self.equity_peak * 100.0)
 
     # ---------- 熔断 ----------
-    def trip_breaker(self) -> None:
+    def halt_entries(self, reason: str = "") -> None:
         self.halt_new_entries = True
+        self.halt_new_entries_reason = reason.strip()
+
+    def resume_entries(self) -> None:
+        self.halt_new_entries = False
+        self.halt_new_entries_reason = ""
+
+    def trip_breaker(self, reason: str = "") -> None:
+        detail = reason.strip()
+        if detail and not detail.lower().startswith("circuit breaker"):
+            detail = f"circuit breaker: {detail}"
+        self.halt_entries(detail or "circuit breaker")
 
     def trigger_kill(self) -> None:
         self.kill_switch = True
+        self.halt_entries("kill switch active")

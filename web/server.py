@@ -27,7 +27,7 @@ from loguru import logger
 
 from src.config.loader import load_config
 from src.exchange.client import ExchangeClient
-from src.exchange.orders import normalize_condition_order
+from src.exchange.orders import normalize_condition_order, normalize_open_order
 from src.exchange.positions import normalize_position, normalize_symbol
 from src.features.indicators import compute_snapshot
 from src.store.repo import Store
@@ -201,6 +201,8 @@ async def _live_positions_snapshot() -> dict[str, Any]:
             condition_orders, condition_error = await _live_condition_orders(
                 client, [p["symbol"] for p in positions]
             )
+            registered = await _registered_symbols()
+            open_orders, open_orders_error = await _live_open_orders(client, registered)
             _attach_protection_orders(positions, condition_orders)
             _attach_local_trade_metadata(positions)
             _positions_cache.update({
@@ -209,6 +211,8 @@ async def _live_positions_snapshot() -> dict[str, Any]:
                 "condition_orders": condition_orders,
                 "error": "",
                 "condition_error": condition_error,
+                "open_orders": open_orders,
+                "open_orders_error": open_orders_error,
             })
         except Exception as e:
             _positions_cache["error"] = str(e)
@@ -236,6 +240,27 @@ async def _live_condition_orders(
     return orders, "; ".join(errors)
 
 
+async def _live_open_orders(
+    client: ExchangeClient,
+    symbols: list[str],
+) -> tuple[list[dict[str, Any]], str]:
+    """拉取普通未成交挂单（限价/限价 maker/...），不含 SL/TP 算法单。"""
+    merged: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for symbol in symbols:
+        try:
+            raws = await client.fetch_open_orders(symbol)
+        except Exception as e:
+            errors.append(f"{symbol} open: {e}")
+            continue
+        for raw in raws:
+            order = normalize_open_order(raw)
+            if not order["id"] and not order["client_order_id"]:
+                continue
+            key = order["id"] or f"{order['symbol']}:{order['client_order_id']}:{order['ts_ms']}"
+            merged[key] = order
+    orders = sorted(merged.values(), key=lambda x: (x["symbol"], x["side"], -(x["ts_ms"] or 0)))
+    return orders, "; ".join(errors)
 def _attach_protection_orders(positions: list[dict], orders: list[dict[str, Any]]) -> None:
     by_symbol: dict[str, list[dict[str, Any]]] = {}
     for order in orders:
@@ -283,6 +308,9 @@ async def _status_summary() -> dict[str, Any]:
         summary["condition_orders"] = live.get("condition_orders", [])
         summary["condition_orders_error"] = live.get("condition_error", "")
         summary["positions_synced_at_ms"] = live.get("ts_ms")
+        summary["open_orders"] = live.get("open_orders", [])
+        summary["open_orders_error"] = live.get("open_orders_error", "")
+        summary["open_orders_synced_at_ms"] = live.get("ts_ms")
     except Exception as e:
         logger.warning("live positions unavailable, fallback to db snapshot: {}", e)
         summary["positions_source"] = "db_snapshot"
@@ -290,6 +318,9 @@ async def _status_summary() -> dict[str, Any]:
         summary["condition_orders"] = []
         summary["condition_orders_error"] = ""
         summary["positions_synced_at_ms"] = None
+        summary["open_orders"] = []
+        summary["open_orders_error"] = ""
+        summary["open_orders_synced_at_ms"] = None
     # B5：补 symbol_enabled + 标注「持仓 + 禁用」的孤儿币种，方便前端定位。
     try:
         symbol_enabled = await _effective_symbol_enabled()
@@ -359,6 +390,21 @@ async def api_decision_detail(decision_id: int, _: str = Depends(_check_auth)):
 @app.get("/api/orders")
 async def api_orders(limit: int = 100, _: str = Depends(_check_auth)):
     return st.recent_orders(_DB, min(limit, 500))
+
+
+@app.get("/api/open-orders")
+async def api_open_orders(_: str = Depends(_check_auth)):
+    """交易所当前普通未成交挂单（限价/限价 maker/...），不含 SL/TP 算法单。
+
+    数据走 ``_live_positions_snapshot`` 缓存（默认 2s TTL），与 /api/summary 共享。
+    """
+    snapshot = await _live_positions_snapshot()
+    return {
+        "open_orders": list(snapshot.get("open_orders") or []),
+        "condition_orders": list(snapshot.get("condition_orders") or []),
+        "error": snapshot.get("open_orders_error") or snapshot.get("error") or "",
+        "synced_at_ms": snapshot.get("ts_ms"),
+    }
 
 
 @app.get("/api/trades")
@@ -559,6 +605,9 @@ _ALLOWED_COMMANDS = {
     "REPAIR_SL_TP",
     "PROTECT_POSITION",
     "CLOSE_POSITION",
+    "CANCEL_OPEN_ORDER",
+    "CANCEL_CONDITION_ORDER",
+    "CANCEL_ALL_OPEN_ORDERS",
     "CANCEL_AND_FLATTEN",
     "STOP_ENGINE",
     "SWITCH_LLM_PROFILE",

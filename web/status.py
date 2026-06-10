@@ -33,6 +33,130 @@ def _rows(db_path: str, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
         conn.close()
 
 
+_OPEN_DECISION_ORDER_WINDOW_MS = 15 * 60 * 1000
+
+
+def _order_public_fields(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    keys = (
+        "id", "ts_ms", "created_at", "symbol", "client_kind", "side",
+        "order_type", "qty", "price", "status", "exchange_order_id",
+        "trade_id",
+    )
+    return {key: row.get(key) for key in keys}
+
+
+def _decision_actual_protection(db_path: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Return actual post-fill entry/SL/TP rows derived from orders.
+
+    The decisions table intentionally stores LLM intent only. Actual protection
+    prices live in orders.price for SL/TP rows, because that is the stopPrice
+    sent to the exchange.
+    """
+    action = str(row.get("action") or "").upper()
+    if action not in ("OPEN_LONG", "OPEN_SHORT"):
+        return {
+            "status": "not_applicable",
+            "message": "非开仓决策",
+            "entry": None,
+            "sl": None,
+            "tp": None,
+            "expected": {"sl": False, "tp": False},
+        }
+
+    symbol = str(row.get("symbol") or "")
+    decision_ts = int(row.get("ts_ms") or 0)
+    decision_id = int(row.get("id") or 0)
+    expected = {
+        "sl": float(row.get("stop_loss_pct") or 0.0) > 0,
+        "tp": float(row.get("take_profit_pct") or 0.0) > 0,
+    }
+    if not symbol or decision_ts <= 0:
+        return {
+            "status": "no_entry",
+            "message": "决策缺少 symbol/ts_ms，无法匹配成交订单",
+            "entry": None,
+            "sl": None,
+            "tp": None,
+            "expected": expected,
+        }
+
+    next_rows = _rows(
+        db_path,
+        "SELECT MIN(ts_ms) AS next_ts FROM decisions "
+        "WHERE symbol = ? AND id > ? AND ts_ms > ?",
+        (symbol, decision_id, decision_ts),
+    )
+    next_ts = int(next_rows[0].get("next_ts") or 0) if next_rows else 0
+    upper_ts = decision_ts + _OPEN_DECISION_ORDER_WINDOW_MS
+    if next_ts > decision_ts:
+        upper_ts = min(upper_ts, next_ts)
+
+    open_side = "buy" if action == "OPEN_LONG" else "sell"
+    entry_rows = _rows(
+        db_path,
+        "SELECT * FROM orders "
+        "WHERE symbol = ? AND client_kind = 'OPEN' AND side = ? "
+        "AND status IN ('filled', 'partial') "
+        "AND ts_ms >= ? AND ts_ms < ? "
+        "ORDER BY ts_ms ASC, id ASC LIMIT 1",
+        (symbol, open_side, decision_ts, upper_ts),
+    )
+    if not entry_rows:
+        return {
+            "status": "no_entry",
+            "message": "未找到该决策成交后的 OPEN 订单",
+            "entry": None,
+            "sl": None,
+            "tp": None,
+            "expected": expected,
+        }
+
+    entry = entry_rows[0]
+    trade_id = int(entry.get("trade_id") or 0)
+    if trade_id > 0:
+        protection_rows = _rows(
+            db_path,
+            "SELECT * FROM orders "
+            "WHERE trade_id = ? AND client_kind IN ('SL', 'TP') "
+            "ORDER BY ts_ms ASC, id ASC",
+            (trade_id,),
+        )
+    else:
+        close_side = "sell" if action == "OPEN_LONG" else "buy"
+        protection_rows = _rows(
+            db_path,
+            "SELECT * FROM orders "
+            "WHERE symbol = ? AND side = ? AND client_kind IN ('SL', 'TP') "
+            "AND ts_ms >= ? AND ts_ms <= ? "
+            "ORDER BY ts_ms ASC, id ASC",
+            (symbol, close_side, int(entry.get("ts_ms") or decision_ts), decision_ts + _OPEN_DECISION_ORDER_WINDOW_MS),
+        )
+
+    latest: dict[str, dict[str, Any]] = {}
+    for order in protection_rows:
+        kind = str(order.get("client_kind") or "").upper()
+        if kind in ("SL", "TP"):
+            latest[kind] = order
+
+    missing = []
+    if expected["sl"] and "SL" not in latest:
+        missing.append("SL")
+    if expected["tp"] and "TP" not in latest:
+        missing.append("TP")
+    status = "missing" if missing else "complete"
+    message = "" if not missing else "缺少 " + "/".join(missing)
+    return {
+        "status": status,
+        "message": message,
+        "entry": _order_public_fields(entry),
+        "sl": _order_public_fields(latest.get("SL")),
+        "tp": _order_public_fields(latest.get("TP")),
+        "expected": expected,
+    }
+
+
 def recent_decisions(db_path: str, limit: int = 50) -> list[dict]:
     return _rows(db_path, "SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,))
 
@@ -539,6 +663,7 @@ def decision_detail(db_path: str, decision_id: int) -> dict | None:
     row["llm_status"] = row.get("llm_status") or ""
     row["llm_error"] = row.get("llm_error") or ""
     row["llm_status_available"] = bool(row["llm_status"])
+    row["actual_protection"] = _decision_actual_protection(db_path, row)
     return row
 
 

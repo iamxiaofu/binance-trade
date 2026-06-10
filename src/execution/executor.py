@@ -186,6 +186,38 @@ class Executor:
         return avg if avg > 0 else fallback_price
 
     @classmethod
+    def _trade_fill_summary(cls, trades: list[dict] | None) -> tuple[float, float, float] | None:
+        """Return (filled_qty, avg_price, notional) from exchange myTrades rows."""
+        total_qty = 0.0
+        total_cost = 0.0
+        for trade in trades or []:
+            info = cls._raw_info(trade)
+            qty = cls._safe_float(
+                trade.get("amount")
+                or trade.get("qty")
+                or info.get("qty")
+                or info.get("executedQty")
+                or 0.0
+            )
+            price = cls._safe_float(trade.get("price") or info.get("price") or 0.0)
+            cost = cls._safe_float(
+                trade.get("cost")
+                or info.get("quoteQty")
+                or info.get("quoteQuantity")
+                or info.get("cumQuote")
+                or 0.0
+            )
+            if cost <= 0 and qty > 0 and price > 0:
+                cost = qty * price
+            if qty > 0:
+                total_qty += qty
+                total_cost += abs(cost)
+        if total_qty <= 0:
+            return None
+        avg_price = (total_cost / total_qty) if total_cost > 0 else 0.0
+        return total_qty, avg_price, total_cost
+
+    @classmethod
     def _parse_fill(
         cls,
         order: dict,
@@ -241,16 +273,12 @@ class Executor:
         fee_asset = ""
         liquidity = ""
 
-        def _add_fee(fee_obj: object) -> None:
-            nonlocal fee_total, fee_asset
+        def _fee_tuple(fee_obj: object) -> tuple[float, str]:
             if not isinstance(fee_obj, dict):
-                return
+                return 0.0, ""
             cost = cls._safe_float(fee_obj.get("cost"))
-            if cost:
-                fee_total += abs(cost)
             currency = cls._safe_str(fee_obj.get("currency"))
-            if currency and not fee_asset:
-                fee_asset = currency
+            return abs(cost), currency
 
         info = cls._raw_info(order)
         if info.get("maker") is not None:
@@ -258,19 +286,36 @@ class Executor:
 
         trade_rows = trades or []
         if not trade_rows:
-            _add_fee(order.get("fee"))
-            for fee_obj in order.get("fees") or []:
-                _add_fee(fee_obj)
+            fees = order.get("fees") or []
+            if fees:
+                for fee_obj in fees:
+                    cost, asset = _fee_tuple(fee_obj)
+                    fee_total += cost
+                    if asset and not fee_asset:
+                        fee_asset = asset
+            else:
+                cost, asset = _fee_tuple(order.get("fee"))
+                fee_total += cost
+                fee_asset = fee_asset or asset
 
         for trade in trade_rows:
-            _add_fee(trade.get("fee"))
-            for fee_obj in trade.get("fees") or []:
-                _add_fee(fee_obj)
             trade_info = trade.get("info") if isinstance(trade.get("info"), dict) else {}
-            commission = cls._safe_float(trade_info.get("commission"))
-            if commission:
-                fee_total += abs(commission)
+            commission_raw = trade_info.get("commission")
+            commission = cls._safe_float(commission_raw)
             asset = cls._safe_str(trade_info.get("commissionAsset"))
+            if commission_raw is not None and str(commission_raw) != "":
+                fee_total += abs(commission)
+            else:
+                fees = trade.get("fees") or []
+                if fees:
+                    for fee_obj in fees:
+                        cost, fee_asset_item = _fee_tuple(fee_obj)
+                        fee_total += cost
+                        asset = asset or fee_asset_item
+                else:
+                    cost, fee_asset_item = _fee_tuple(trade.get("fee"))
+                    fee_total += cost
+                    asset = asset or fee_asset_item
             if asset and not fee_asset:
                 fee_asset = asset
             maker = trade_info.get("maker")
@@ -282,14 +327,29 @@ class Executor:
 
         return fee_total, fee_asset, liquidity
 
-    async def _fetch_order_trades_safe(self, symbol: str, order_id: str) -> list[dict]:
+    async def _fetch_order_trades_safe(
+        self,
+        symbol: str,
+        order_id: str,
+        *,
+        attempts: int = 1,
+        delay_seconds: float = 0.0,
+    ) -> list[dict]:
         if not order_id or not hasattr(self._client, "fetch_order_trades"):
             return []
-        try:
-            return await self._client.fetch_order_trades(symbol, order_id)
-        except Exception as e:
-            logger.debug("[{}] fetch order trades {} skipped: {}", symbol, order_id, e)
-            return []
+        attempts = max(1, attempts)
+        for attempt in range(attempts):
+            try:
+                trades = await self._client.fetch_order_trades(symbol, order_id)
+                if trades or attempt == attempts - 1:
+                    return trades
+            except Exception as e:
+                logger.debug("[{}] fetch order trades {} skipped: {}", symbol, order_id, e)
+                if attempt == attempts - 1:
+                    return []
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+        return []
 
     # ---------- 开仓 ----------
     async def open_position(
@@ -420,9 +480,19 @@ class Executor:
             ),
             f"open {symbol}",
         )
-        fill_qty, avg_px, status = self._parse_fill(order, q, price)
         order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
-        trades = await self._fetch_order_trades_safe(symbol, order_id)
+        trades = await self._fetch_order_trades_safe(
+            symbol, order_id, attempts=4, delay_seconds=0.25
+        )
+        fill_qty, avg_px, status = self._parse_fill(order, q, price)
+        trade_summary = self._trade_fill_summary(trades)
+        notional = fill_qty * avg_px
+        if trade_summary is not None:
+            trade_qty, trade_avg, trade_notional = trade_summary
+            fill_qty = trade_qty
+            avg_px = trade_avg if trade_avg > 0 else avg_px
+            notional = trade_notional if trade_notional > 0 else fill_qty * avg_px
+            status = "partial" if fill_qty < q - 1e-12 else "filled"
         fee, fee_asset, liquidity = self._fee_summary(order, trades)
         liquidity = liquidity or "taker"
         if status == "partial":
@@ -430,7 +500,7 @@ class Executor:
         else:
             logger.info("[{}] OPEN {} qty={} id={}", symbol, side, fill_qty, order.get("id"))
         res = _result(symbol=symbol, kind="OPEN", side=side, qty=fill_qty,
-                      price=avg_px, notional=fill_qty * avg_px,
+                      price=avg_px, notional=notional,
                       dry_run=False, status=status, order_id=order_id,
                       raw=order, execution_mode=ExecutionMode.MARKET_TAKER.value,
                       requested_qty=q, requested_price=price, remaining_qty=max(q - fill_qty, 0.0),
@@ -531,11 +601,25 @@ class Executor:
                         "[{}] maker OPEN partial fill {}/{} id={}, canceled rest",
                         symbol, fill_qty, q, order_id,
                     )
-                trades = await self._fetch_order_trades_safe(symbol, order_id)
+                embedded_trades = observed.get("trades") if isinstance(observed.get("trades"), list) else None
+                trades = embedded_trades or await self._fetch_order_trades_safe(
+                    symbol, order_id, attempts=3, delay_seconds=0.2
+                )
+                attempt_cost = fill_qty * (avg_px if avg_px > 0 else limit_price)
+                trade_summary = self._trade_fill_summary(trades)
+                if trade_summary is not None:
+                    trade_qty, trade_avg, trade_notional = trade_summary
+                    fill_qty = trade_qty
+                    avg_px = trade_avg if trade_avg > 0 else avg_px
+                    attempt_cost = (
+                        trade_notional
+                        if trade_notional > 0
+                        else fill_qty * (avg_px if avg_px > 0 else limit_price)
+                    )
+                    status = "partial" if fill_qty < q - 1e-12 else "filled"
                 fee, fee_asset, liquidity = self._fee_summary(observed, trades)
                 liquidity = liquidity or "maker"
                 # 累加跨 attempt 真实成交
-                attempt_cost = fill_qty * (avg_px if avg_px > 0 else limit_price)
                 cumulative_filled += fill_qty
                 cumulative_cost += attempt_cost
                 cumulative_fee += fee
@@ -686,26 +770,21 @@ class Executor:
         fee_asset = ""
         first_order_id = ""
         for oid in order_ids:
-            try:
-                trades = await self._client.fetch_order_trades(symbol, oid)
-            except Exception as e:
-                logger.warning(
-                    "[{}] residual myTrades query for {} failed: {}", symbol, oid, e,
-                )
+            trades = await self._fetch_order_trades_safe(
+                symbol, oid, attempts=2, delay_seconds=0.1
+            )
+            trade_summary = self._trade_fill_summary(trades)
+            if trade_summary is None:
                 continue
+            filled, avg_price, cost = trade_summary
             if not first_order_id and oid:
                 first_order_id = oid
-            for t in trades:
-                amount = self._safe_float(t.get("amount") or 0.0)
-                price = self._safe_float(t.get("price") or 0.0)
-                total_filled += amount
-                total_cost += amount * price
-                fee = (t.get("fee") or {}) if isinstance(t.get("fee"), dict) else {}
-                cost = self._safe_float(fee.get("cost"))
-                if cost:
-                    total_fee += abs(cost)
-                if not fee_asset:
-                    fee_asset = self._safe_str(fee.get("currency"))
+            total_filled += filled
+            total_cost += cost if cost > 0 else filled * (avg_price or fallback_price)
+            fee, asset, _liquidity = self._fee_summary({}, trades)
+            total_fee += fee
+            if asset and not fee_asset:
+                fee_asset = asset
         if total_filled <= 0:
             return None
         avg_price = (total_cost / total_filled) if total_filled > 0 else fallback_price
@@ -813,31 +892,16 @@ class Executor:
         """
         if not order_id or not hasattr(self._client, "fetch_order_trades"):
             return None
-        try:
-            trades = await self._client.fetch_order_trades(symbol, order_id)
-        except Exception as e:
-            logger.warning("[{}] myTrades recovery for {} failed: {}", symbol, order_id, e)
+        trades = await self._fetch_order_trades_safe(
+            symbol, order_id, attempts=3, delay_seconds=0.2
+        )
+        trade_summary = self._trade_fill_summary(trades)
+        if trade_summary is None:
             return None
-        if not trades:
-            return None
-        filled = sum(self._safe_float(t.get("amount") or 0.0) for t in trades)
-        if filled <= 0:
-            return None
-        # 重新计算加权均价与手续费
-        total_cost = 0.0
-        fee_total = 0.0
-        fee_asset = ""
-        for t in trades:
-            amount = self._safe_float(t.get("amount") or 0.0)
-            price = self._safe_float(t.get("price") or 0.0)
-            total_cost += amount * price
-            fee = (t.get("fee") or {}) if isinstance(t.get("fee"), dict) else {}
-            cost = self._safe_float(fee.get("cost"))
-            if cost:
-                fee_total += abs(cost)
-            if not fee_asset:
-                fee_asset = self._safe_str(fee.get("currency"))
-        avg_price = (total_cost / filled) if filled > 0 else fallback_price
+        filled, avg_price, total_cost = trade_summary
+        fee_total, fee_asset, _liquidity = self._fee_summary({}, trades)
+        if avg_price <= 0:
+            avg_price = fallback_price
         # 模拟 ccxt order dict 形态，让 _parse_fill 走 partial/filled 分支
         return {
             "id": order_id,
@@ -1031,6 +1095,7 @@ class Executor:
         position: dict,
         *,
         mode: ExecutionMode | str | None = None,
+        skip_slippage_guard: bool = False,
     ) -> dict:
         """平掉单个持仓（reduceOnly）。position 为 ccxt position dict。
 
@@ -1038,10 +1103,24 @@ class Executor:
         """
         selected = ExecutionMode(mode or self._cfg.normal_exit_mode or ExecutionMode.MARKET_TAKER)
         if selected is ExecutionMode.MARKET_TAKER:
-            return await self._close_market_position(position, mode=selected)
-        return await self._close_maker_position(position, mode=selected)
+            return await self._close_market_position(
+                position,
+                mode=selected,
+                skip_slippage_guard=skip_slippage_guard,
+            )
+        return await self._close_maker_position(
+            position,
+            mode=selected,
+            skip_slippage_guard=skip_slippage_guard,
+        )
 
-    async def _close_market_position(self, position: dict, *, mode: ExecutionMode) -> dict:
+    async def _close_market_position(
+        self,
+        position: dict,
+        *,
+        mode: ExecutionMode,
+        skip_slippage_guard: bool = False,
+    ) -> dict:
         symbol = (position.get("symbol") or "").replace("/USDT:USDT", "USDT")
         contracts = abs(float(position.get("contracts") or 0))
         pos_side = (position.get("side") or "").lower()  # long/short
@@ -1053,7 +1132,7 @@ class Executor:
         close_side = "sell" if pos_side == "long" else "buy"
         mark = float(position.get("markPrice") or position.get("entryPrice") or 0)
         # 市价平仓滑点预检：用 mark 价作为 ref，盘口估算平仓冲击价超阈值则拒单。
-        if mark > 0:
+        if mark > 0 and not skip_slippage_guard:
             ok, _est, reason = await self._preflight_market_slippage(
                 symbol=symbol, side=close_side, ref_price=mark, qty=contracts,
             )
@@ -1069,6 +1148,11 @@ class Executor:
                     execution_mode=mode.value,
                     requested_qty=contracts, requested_price=mark,
                 )
+        elif mark > 0:
+            logger.warning(
+                "[{}] market CLOSE skipping slippage guard for force close qty={} ref={}",
+                symbol, contracts, mark,
+            )
         client_order_id = self._client_order_id(symbol=symbol, kind="CLOSE", side=close_side)
 
         order = await self._with_retry(
@@ -1078,15 +1162,25 @@ class Executor:
             ),
             f"close {symbol}",
         )
-        fill_qty, avg_px, status = self._parse_fill(order, contracts, mark)
         order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
-        trades = await self._fetch_order_trades_safe(symbol, order_id)
+        trades = await self._fetch_order_trades_safe(
+            symbol, order_id, attempts=4, delay_seconds=0.25
+        )
+        fill_qty, avg_px, status = self._parse_fill(order, contracts, mark)
+        trade_summary = self._trade_fill_summary(trades)
+        notional = fill_qty * avg_px
+        if trade_summary is not None:
+            trade_qty, trade_avg, trade_notional = trade_summary
+            fill_qty = trade_qty
+            avg_px = trade_avg if trade_avg > 0 else avg_px
+            notional = trade_notional if trade_notional > 0 else fill_qty * avg_px
+            status = "partial" if fill_qty < contracts - 1e-12 else "filled"
         fee, fee_asset, liquidity = self._fee_summary(order, trades)
         liquidity = liquidity or "taker"
         logger.info("[{}] CLOSE {} qty={} id={} status={}",
                     symbol, close_side, fill_qty, order.get("id"), status)
         res = _result(symbol=symbol, kind="CLOSE", side=close_side, qty=fill_qty,
-                      price=avg_px, notional=fill_qty * avg_px,
+                      price=avg_px, notional=notional,
                       dry_run=False, status=status, order_id=order_id,
                       raw=order, execution_mode=mode.value,
                       requested_qty=contracts, requested_price=mark,
@@ -1097,7 +1191,13 @@ class Executor:
         res["pos_side"] = pos_side
         return res
 
-    async def _close_maker_position(self, position: dict, *, mode: ExecutionMode) -> dict:
+    async def _close_maker_position(
+        self,
+        position: dict,
+        *,
+        mode: ExecutionMode,
+        skip_slippage_guard: bool = False,
+    ) -> dict:
         symbol = (position.get("symbol") or "").replace("/USDT:USDT", "USDT")
         contracts = abs(float(position.get("contracts") or 0))
         pos_side = (position.get("side") or "").lower()
@@ -1156,7 +1256,18 @@ class Executor:
                 cancel_raw = None
                 if status == "partial":
                     cancel_raw = await self._cancel_regular_order_safe(symbol, order_id)
-                trades = await self._fetch_order_trades_safe(symbol, order_id)
+                embedded_trades = observed.get("trades") if isinstance(observed.get("trades"), list) else None
+                trades = embedded_trades or await self._fetch_order_trades_safe(
+                    symbol, order_id, attempts=3, delay_seconds=0.2
+                )
+                notional = fill_qty * avg_px
+                trade_summary = self._trade_fill_summary(trades)
+                if trade_summary is not None:
+                    trade_qty, trade_avg, trade_notional = trade_summary
+                    fill_qty = trade_qty
+                    avg_px = trade_avg if trade_avg > 0 else avg_px
+                    notional = trade_notional if trade_notional > 0 else fill_qty * avg_px
+                    status = "partial" if fill_qty < q - 1e-12 else "filled"
                 fee, fee_asset, liquidity = self._fee_summary(observed, trades)
                 liquidity = liquidity or "maker"
                 raw = {
@@ -1171,7 +1282,7 @@ class Executor:
                     side=close_side,
                     qty=fill_qty,
                     price=avg_px,
-                    notional=fill_qty * avg_px,
+                    notional=notional,
                     dry_run=False,
                     status=status,
                     order_id=order_id,
@@ -1210,7 +1321,11 @@ class Executor:
             self._cfg.maker_unfilled_action is MakerUnfilledAction.FALLBACK_MARKET
         ):
             logger.warning("[{}] maker close unfilled, falling back to MARKET_TAKER", symbol)
-            return await self._close_market_position(position, mode=ExecutionMode.MARKET_TAKER)
+            return await self._close_market_position(
+                position,
+                mode=ExecutionMode.MARKET_TAKER,
+                skip_slippage_guard=skip_slippage_guard,
+            )
 
         res = _result(
             symbol=symbol,

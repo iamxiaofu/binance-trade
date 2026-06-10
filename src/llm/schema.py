@@ -116,6 +116,9 @@ class MarketContext(BaseModel):
 
 
 # ---------- 输出：LLM 必须返回的决策 ----------
+DECISION_REASON_MAX_LENGTH = 1000
+
+
 class Action(str, Enum):
     OPEN_LONG = "OPEN_LONG"
     OPEN_SHORT = "OPEN_SHORT"
@@ -127,14 +130,44 @@ class TradeDecision(BaseModel):
     """LLM 决策输出。extra=forbid → 多余字段直接拒绝。"""
     model_config = {"extra": "forbid"}
 
-    symbol: str
-    action: Action
-    confidence: float = Field(ge=0.0, le=1.0)
-    size_pct: float = Field(ge=0.0, le=1.0)        # 占可用保证金比例
-    leverage: int = Field(ge=1, le=125)            # 物理上限；业务上限在 risk 层
-    stop_loss_pct: float = Field(ge=0.0, le=1.0)
-    take_profit_pct: float = Field(ge=0.0, le=1.0)
-    reason: str = Field(max_length=500)
+    symbol: str = Field(description="交易标的，例如 BTCUSDT。")
+    action: Action = Field(description="本周期动作：OPEN_LONG、OPEN_SHORT、CLOSE 或 HOLD。")
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="决策置信度，0~1；低于系统 min_confidence 会被视为不开仓。",
+    )
+    size_pct: float = Field(
+        ge=0.0, le=1.0,
+        description="动用可用保证金比例；0.15 表示使用可用保证金的 15%，不是权益亏损比例。",
+    )
+    leverage: int = Field(
+        ge=1, le=125,
+        description="建议杠杆；超过系统 max_leverage 会被直接拒单，不会截断。",
+    )
+    stop_loss_pct: float = Field(
+        ge=0.0, le=1.0,
+        description=(
+            "相对参考开仓价的价格止损距离小数，不是保证金比例或权益比例；"
+            "百分比=小数×100；0.012 必须解释为 1.20% 价格距离。"
+        ),
+    )
+    take_profit_pct: float = Field(
+        ge=0.0, le=1.0,
+        description=(
+            "相对参考开仓价的价格止盈距离小数，不是保证金比例或权益比例；"
+            "百分比=小数×100；0.02 必须解释为 2.00% 价格距离。"
+        ),
+    )
+    reason: str = Field(
+        max_length=DECISION_REASON_MAX_LENGTH,
+        description=(
+            "中文决策理由。OPEN_LONG/OPEN_SHORT 必须包含风险换算："
+            "stop_loss_pct/take_profit_pct 的小数值与百分比、预估 SL/TP 触发价、"
+            "预估止损亏损/止盈收益 USDT、亏损占账户权益百分比、亏损占本单保证金百分比。"
+            "预估触发价必须与 action 方向一致：OPEN_LONG 的 SL 低于 entry_ref、TP 高于 entry_ref；"
+            "OPEN_SHORT 的 SL 高于 entry_ref、TP 低于 entry_ref。"
+        ),
+    )
 
     @field_validator("symbol")
     @classmethod
@@ -156,7 +189,7 @@ class TradeDecision(BaseModel):
             leverage=1,
             stop_loss_pct=0.0,
             take_profit_pct=0.0,
-            reason=f"[degraded] {reason}"[:500],
+            reason=f"[degraded] {reason}"[:DECISION_REASON_MAX_LENGTH],
         )
 
     @classmethod

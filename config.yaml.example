@@ -18,7 +18,7 @@ account:
 
 # ===== 决策周期与节流 =====
 cycle:
-  interval: 5m                # 主循环周期：支持 1m/3m/5m/15m/30m/1h
+  interval: 3m                # 主循环周期：支持 1m/3m/5m/15m/30m/1h
   heartbeat_on_skip: true     # 跳过 LLM 时是否写心跳日志
 
 throttle:                     # 行情变化门槛（纯函数，全部可单测）
@@ -81,7 +81,7 @@ execution:
   maker_poll_seconds: 1
   maker_max_requotes: 2
   maker_price_offset_bps: 1
-  maker_unfilled_action: CANCEL     # CANCEL | FALLBACK_MARKET
+  maker_unfilled_action: FALLBACK_MARKET  # CANCEL | FALLBACK_MARKET
   partial_fill_action: PROTECT_AND_CANCEL_REST
   attach_sl_tp: true          # 是否同时挂止盈止损单
   rate_limit_backoff: 1.5     # 限频指数退避基数

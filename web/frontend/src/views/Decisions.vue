@@ -33,6 +33,7 @@ function toggleLiveRefresh() {
 }
 const detailVisible = ref(false)
 const detail = ref(null)
+const detailLoading = ref(false)
 const ctxPretty = ref('')
 const llmPromptPretty = ref('')
 const llmRequestPretty = ref('')
@@ -143,53 +144,112 @@ async function load() {
   }
 }
 
-async function showDetail(row) {
+function priceText(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n === 0) return '—'
+  return String(value)
+}
+
+function protectionOrderText(order, expected) {
+  if (!expected) return '未要求'
+  if (!order) return '缺失'
+  const status = order.status ? ` ${order.status}` : ''
+  return `${priceText(order.price)}${status}`
+}
+
+function actualProtectionText(protection) {
+  if (!protection || protection.status === 'not_applicable') return '—'
+  if (!protection.entry) return protection.message || '未找到成交 OPEN'
+  const expected = protection.expected || {}
+  return [
+    `入场 ${priceText(protection.entry.price)}${protection.entry.status ? ` ${protection.entry.status}` : ''}`,
+    `SL ${protectionOrderText(protection.sl, expected.sl)}`,
+    `TP ${protectionOrderText(protection.tp, expected.tp)}`,
+  ].join(' | ')
+}
+
+function actualProtectionStatusLabel(protection) {
+  const status = protection?.status || 'not_applicable'
+  const map = {
+    complete: '已匹配',
+    missing: '有缺失',
+    no_entry: '未成交',
+    not_applicable: '不适用',
+  }
+  return map[status] || status
+}
+
+function actualProtectionTagType(protection) {
+  const status = protection?.status || 'not_applicable'
+  if (status === 'complete') return 'success'
+  if (status === 'missing') return 'danger'
+  if (status === 'no_entry') return 'warning'
+  return 'info'
+}
+
+function hydrateDetailView() {
+  llmDataRows.value = detail.value.llm_data_items || []
+  llmPromptPretty.value = [
+    '【System Prompt】',
+    detail.value.llm_system_prompt || '(无)',
+    '',
+    '【User Prompt + 数据】',
+    detail.value.llm_user_prompt || '(无)',
+  ].join('\n')
   try {
-    detail.value = await api.decisionDetail(row.id)
-    llmDataRows.value = detail.value.llm_data_items || []
-    llmPromptPretty.value = [
-      '【System Prompt】',
-      detail.value.llm_system_prompt || '(无)',
-      '',
-      '【User Prompt + 数据】',
-      detail.value.llm_user_prompt || '(无)',
-    ].join('\n')
-    try {
-      ctxPretty.value = JSON.stringify(JSON.parse(detail.value.context_json || '{}'), null, 2)
-    } catch (_) {
-      ctxPretty.value = detail.value.context_json || '(无)'
-    }
-    try {
-      featureSnapshotPretty.value = JSON.stringify(
-        JSON.parse(detail.value.feature_snapshot_json || '{}'),
-        null,
-        2,
-      )
-    } catch (_) {
-      featureSnapshotPretty.value = detail.value.feature_snapshot_json || '(无)'
-    }
-    try {
-      llmRequestPretty.value = JSON.stringify(
-        JSON.parse(detail.value.llm_request_effective_json || '{}'),
-        null,
-        2,
-      )
-    } catch (_) {
-      llmRequestPretty.value = detail.value.llm_request_effective_json || '(无)'
-    }
-    try {
-      llmResponsePretty.value = JSON.stringify(
-        JSON.parse(detail.value.llm_response_effective_json || '{}'),
-        null,
-        2,
-      )
-    } catch (_) {
-      llmResponsePretty.value = detail.value.llm_response_effective_json || '(无)'
-    }
-    detailVisible.value = true
+    ctxPretty.value = JSON.stringify(JSON.parse(detail.value.context_json || '{}'), null, 2)
+  } catch (_) {
+    ctxPretty.value = detail.value.context_json || '(无)'
+  }
+  try {
+    featureSnapshotPretty.value = JSON.stringify(
+      JSON.parse(detail.value.feature_snapshot_json || '{}'),
+      null,
+      2,
+    )
+  } catch (_) {
+    featureSnapshotPretty.value = detail.value.feature_snapshot_json || '(无)'
+  }
+  try {
+    llmRequestPretty.value = JSON.stringify(
+      JSON.parse(detail.value.llm_request_effective_json || '{}'),
+      null,
+      2,
+    )
+  } catch (_) {
+    llmRequestPretty.value = detail.value.llm_request_effective_json || '(无)'
+  }
+  try {
+    llmResponsePretty.value = JSON.stringify(
+      JSON.parse(detail.value.llm_response_effective_json || '{}'),
+      null,
+      2,
+    )
+  } catch (_) {
+    llmResponsePretty.value = detail.value.llm_response_effective_json || '(无)'
+  }
+}
+
+async function loadDecisionDetail(id, openDialog = false) {
+  detailLoading.value = true
+  try {
+    detail.value = await api.decisionDetail(id)
+    hydrateDetailView()
+    if (openDialog) detailVisible.value = true
   } catch (e) {
     ElMessage.error(e.message)
+  } finally {
+    detailLoading.value = false
   }
+}
+
+async function showDetail(row) {
+  await loadDecisionDetail(row.id, true)
+}
+
+async function refreshDetail() {
+  if (!detail.value?.id) return
+  await loadDecisionDetail(detail.value.id, false)
 }
 
 function search() {
@@ -393,8 +453,23 @@ onUnmounted(() => {
       </div>
     </el-card>
 
-    <el-dialog v-model="detailVisible" title="决策详情" width="90vw">
+    <el-dialog v-model="detailVisible" width="90vw">
+      <template #header>
+        <div class="dialog-header">
+          <span>决策详情</span>
+          <el-button
+            size="small"
+            :icon="'Refresh'"
+            :loading="detailLoading"
+            :disabled="!detail?.id"
+            @click="refreshDetail"
+          >
+            刷新保护价
+          </el-button>
+        </div>
+      </template>
       <template v-if="detail">
+        <div class="detail-body" v-loading="detailLoading">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="ID">{{ detail.id }}</el-descriptions-item>
           <el-descriptions-item label="本地时间">{{ localTime(detail.ts_ms, detail.created_at) }}</el-descriptions-item>
@@ -406,6 +481,17 @@ onUnmounted(() => {
           <el-descriptions-item label="杠杆">{{ detail.leverage }}x</el-descriptions-item>
           <el-descriptions-item label="参考价">{{ detail.ref_price }}</el-descriptions-item>
           <el-descriptions-item label="SL/TP">{{ detail.stop_loss_pct }} / {{ detail.take_profit_pct }}</el-descriptions-item>
+          <el-descriptions-item label="成交后保护价" :span="2">
+            <el-tag
+              size="small"
+              :type="actualProtectionTagType(detail.actual_protection)"
+            >
+              {{ actualProtectionStatusLabel(detail.actual_protection) }}
+            </el-tag>
+            <span class="actual-protection mono">
+              {{ actualProtectionText(detail.actual_protection) }}
+            </span>
+          </el-descriptions-item>
           <el-descriptions-item label="LLM耗时">
             <el-tag v-if="!detail.skipped" :type="llmLatencyTag(detail).type" size="small">
               {{ llmLatencyTag(detail).label }}
@@ -455,6 +541,7 @@ onUnmounted(() => {
             <pre class="detail-pre">{{ ctxPretty }}</pre>
           </el-tab-pane>
         </el-tabs>
+        </div>
       </template>
     </el-dialog>
   </div>
@@ -476,6 +563,19 @@ onUnmounted(() => {
 }
 .trace-alert {
   margin-top: 12px;
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-right: 28px;
+}
+
+.actual-protection {
+  margin-left: 8px;
+  word-break: break-word;
 }
 
 .decision-detail-tabs {

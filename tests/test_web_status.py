@@ -113,6 +113,97 @@ async def test_decision_detail_includes_llm_trace_and_data_items(db):
     fields = {item["field"] for item in detail["llm_data_items"]}
     assert {"last_price", "mark_price", "recent_klines_last20",
             "micro_klines_last30"}.issubset(fields)
+    assert detail["actual_protection"]["status"] == "no_entry"
+
+
+async def test_decision_detail_includes_actual_protection_prices(db):
+    s = Store(db)
+    await s.connect()
+    await s.log_decision(
+        symbol="SOLUSDT",
+        decision=TradeDecision(
+            symbol="SOLUSDT",
+            action=Action.OPEN_SHORT,
+            confidence=0.7,
+            size_pct=0.1,
+            leverage=3,
+            stop_loss_pct=0.002,
+            take_profit_pct=0.0045,
+            reason="short setup",
+        ),
+        ref_price=598.61,
+    )
+    decision_id = status.search_decisions(
+        db,
+        status.DecisionFilters(symbols=["SOLUSDT"], types=["OPEN_SHORT"], limit=1),
+    )["items"][0]["id"]
+    opened = await s.log_order({
+        "symbol": "SOLUSDT", "kind": "OPEN", "side": "sell",
+        "order_type": "market", "qty": 3.13, "price": 598.58,
+        "notional": 1873.56, "dry_run": False, "status": "filled",
+        "id": "open-sol", "raw": {}, "leverage": 3,
+    })
+    old_sl = await s.log_order({
+        "symbol": "SOLUSDT", "kind": "SL", "side": "buy",
+        "order_type": "STOP_MARKET", "qty": 3.13, "price": 599.78,
+        "notional": 1877.31, "dry_run": False, "status": "canceled",
+        "id": "old-sl-sol", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    tp = await s.log_order({
+        "symbol": "SOLUSDT", "kind": "TP", "side": "buy",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 3.13, "price": 595.89,
+        "notional": 1865.14, "dry_run": False, "status": "placed",
+        "id": "tp-sol", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await s.log_decision(
+        symbol="SOLUSDT",
+        decision=TradeDecision(
+            symbol="SOLUSDT",
+            action=Action.HOLD,
+            confidence=0.4,
+            size_pct=0.0,
+            leverage=1,
+            stop_loss_pct=0.0,
+            take_profit_pct=0.0,
+            reason="hold",
+        ),
+        ref_price=599.0,
+    )
+    next_decision_id = status.search_decisions(
+        db,
+        status.DecisionFilters(symbols=["SOLUSDT"], types=["HOLD"], limit=1),
+    )["items"][0]["id"]
+    repaired_sl = await s.log_order({
+        "symbol": "SOLUSDT", "kind": "SL", "side": "buy",
+        "order_type": "STOP_MARKET", "qty": 3.13, "price": 599.78,
+        "notional": 1877.31, "dry_run": False, "status": "placed",
+        "id": "new-sl-sol", "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await s.close()
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE decisions SET ts_ms = 1000 WHERE id = ?", (decision_id,))
+        conn.execute("UPDATE decisions SET ts_ms = 2000 WHERE id = ?", (next_decision_id,))
+        conn.execute("UPDATE orders SET ts_ms = 1500 WHERE id = ?", (opened["order_id"],))
+        conn.execute("UPDATE orders SET ts_ms = 1600 WHERE id = ?", (old_sl["order_id"],))
+        conn.execute("UPDATE orders SET ts_ms = 1700 WHERE id = ?", (tp["order_id"],))
+        conn.execute("UPDATE orders SET ts_ms = 5000 WHERE id = ?", (repaired_sl["order_id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    detail = status.decision_detail(db, decision_id)
+    protection = detail["actual_protection"]
+    assert protection["status"] == "complete"
+    assert protection["entry"]["price"] == pytest.approx(598.58)
+    assert protection["entry"]["trade_id"] == opened["trade_id"]
+    assert protection["sl"]["price"] == pytest.approx(599.78)
+    assert protection["sl"]["status"] == "placed"
+    assert protection["sl"]["exchange_order_id"] == "new-sl-sol"
+    assert protection["tp"]["price"] == pytest.approx(595.89)
+    assert protection["tp"]["status"] == "placed"
+    assert protection["expected"] == {"sl": True, "tp": True}
 
 
 async def test_balance_history_ascending(db):

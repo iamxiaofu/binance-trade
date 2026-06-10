@@ -97,6 +97,20 @@ def test_kill_switch_blocks_everything(settings):
 def test_halt_new_entries(settings):
     v = validate(_decision(), _ctx(halt_new_entries=True), settings)
     assert v.code is RejectCode.HALT_NEW_ENTRIES
+    assert v.reason == "new entries halted"
+
+
+def test_halt_new_entries_uses_specific_reason(settings):
+    v = validate(
+        _decision(),
+        _ctx(
+            halt_new_entries=True,
+            halt_new_entries_reason="engine stopping/restarting: signal",
+        ),
+        settings,
+    )
+    assert v.code is RejectCode.HALT_NEW_ENTRIES
+    assert v.reason == "new entries halted: engine stopping/restarting: signal"
 
 
 def test_daily_loss_breach(settings):

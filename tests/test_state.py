@@ -58,9 +58,15 @@ def test_equity_peak_and_drawdown():
 def test_breaker_and_kill_flags():
     rt = RuntimeState()
     assert not rt.halt_new_entries and not rt.kill_switch
-    rt.trip_breaker()
+    rt.trip_breaker("daily loss -21.00 <= -20.00")
+    assert rt.halt_new_entries
+    assert rt.halt_new_entries_reason == "circuit breaker: daily loss -21.00 <= -20.00"
+    rt.resume_entries()
+    assert not rt.halt_new_entries
+    assert rt.halt_new_entries_reason == ""
     rt.trigger_kill()
     assert rt.halt_new_entries and rt.kill_switch
+    assert rt.halt_new_entries_reason == "kill switch active"
 
 
 def test_rehydrate_sets_day_key_to_today():

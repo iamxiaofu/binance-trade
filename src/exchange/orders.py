@@ -90,3 +90,36 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
         "position_side": str(_value(o, info, "positionSide") or ""),
         "ts_ms": ts_ms,
     }
+
+
+def normalize_open_order(order: Mapping[str, Any] | None) -> dict[str, Any]:
+    """归一化 ccxt 拉到的「普通未成交挂单」（限价/限价 maker/reduce-only 等）。
+
+    不包含 SL/TP 算法单（走 ``normalize_condition_order``）。
+    """
+    o = order or {}
+    info = o.get("info") if isinstance(o.get("info"), Mapping) else {}
+    order_type = str(_value(o, info, "type", "orderType") or "").upper()
+    qty = abs(_float(_value(o, info, "amount", "quantity", "origQty")))
+    price = _float(_value(o, info, "price"))
+    filled_qty = abs(_float(_value(o, info, "filled", "executedQty")))
+    avg_price = _float(_value(o, info, "average", "avgPrice"))
+    ts_ms = int(_float(_value(o, info, "updateTime", "timestamp", "time", "createTime")))
+
+    return {
+        "id": str(_value(o, info, "id", "orderId") or ""),
+        "symbol": normalize_symbol(_value(o, info, "symbol")),
+        "side": str(_value(o, info, "side") or "").lower(),
+        "order_type": order_type or "LIMIT",
+        "qty": qty,
+        "price": price,
+        "filled_qty": filled_qty,
+        "avg_price": avg_price,
+        "status": _status(o, info),
+        "raw_status": str(_value(o, info, "status") or ""),
+        "time_in_force": str(_value(o, info, "timeInForce") or "").upper(),
+        "reduce_only": _bool(_value(o, info, "reduceOnly")),
+        "client_order_id": str(_value(o, info, "clientOrderId", "origClientOrderId") or ""),
+        "position_side": str(_value(o, info, "positionSide") or ""),
+        "ts_ms": ts_ms,
+    }

@@ -17,7 +17,7 @@ from src.llm.schema import Action, TradeDecision
 
 
 class RejectCode(str, Enum):
-    HALT_NEW_ENTRIES = "HALT_NEW_ENTRIES"      # 熔断后停开新仓
+    HALT_NEW_ENTRIES = "HALT_NEW_ENTRIES"      # 运行态暂停新开仓
     DAILY_LOSS = "DAILY_LOSS"                  # 当日亏损达上限
     KILL_SWITCH = "KILL_SWITCH"
     LOW_CONFIDENCE = "LOW_CONFIDENCE"          # 置信度不足，视为 HOLD
@@ -60,7 +60,8 @@ class RiskContext:
     total_open_margin: float = 0.0          # 全账户当前持仓估算占用保证金
     day_realized_pnl: float = 0.0           # 当日已实现盈亏(USDT，亏损为负)
     drawdown_pct: float = 0.0               # 当前账户回撤(%)
-    halt_new_entries: bool = False          # 熔断后置 True
+    halt_new_entries: bool = False          # 暂停新开仓后置 True
+    halt_new_entries_reason: str = ""
     kill_switch: bool = False
     # 估算强平价用：维持保证金率，默认 0.5%（币安永续常见量级，可由交易所覆盖）
     maintenance_margin_rate: float = 0.005
@@ -101,7 +102,9 @@ def validate(
     if ctx.kill_switch:
         return Verdict.reject(RejectCode.KILL_SWITCH, "kill switch active")
     if ctx.halt_new_entries:
-        return Verdict.reject(RejectCode.HALT_NEW_ENTRIES, "new entries halted (circuit breaker)")
+        reason = ctx.halt_new_entries_reason.strip()
+        message = f"new entries halted: {reason}" if reason else "new entries halted"
+        return Verdict.reject(RejectCode.HALT_NEW_ENTRIES, message)
     # 日亏限额 = 权益 × daily_max_loss_pct（随资金缩放）
     daily_max_loss = ctx.equity_base * (risk.daily_max_loss_pct / 100.0)
     if daily_max_loss > 0 and ctx.day_realized_pnl <= -abs(daily_max_loss):
