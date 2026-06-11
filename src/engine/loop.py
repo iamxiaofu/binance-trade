@@ -40,6 +40,8 @@ _ENTRY_CLAIM_TTL_MS = 300_000
 _POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS = (0.0, 0.3, 0.7, 1.2, 2.0, 3.0)
 _EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0, 5.0)
 _EXCHANGE_FLAT_MIN_OPEN_AGE_MS = 60_000
+_POST_CLOSE_RECONCILE_GRACE_SECONDS = 30.0
+_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0)
 
 
 class TradingEngine:
@@ -68,6 +70,7 @@ class TradingEngine:
         self._stopped = asyncio.Event()
         self._state_sync_lock = asyncio.Lock()
         self._just_adopted: dict[str, bool] = {}  # B4: 标记本周期刚接管的 symbol
+        self._recent_explicit_closes: dict[str, float] = {}
         self._reconcile_task: asyncio.Task | None = None
         self._cycle_leader_snapshot: FeatureSnapshot | None = None
 
@@ -2162,6 +2165,8 @@ class TradingEngine:
             raw,
             mode=self._settings.execution.normal_exit_mode,
         )
+        if result.get("filled") and result.get("status") != "partial":
+            self._mark_recent_explicit_close(symbol)
         await self._store.log_order(result)
         if result["filled"]:
             # 计算本次平仓已实现盈亏并累加（驱动日亏熔断）
@@ -2205,6 +2210,21 @@ class TradingEngine:
             )
 
     # ---------- 辅助 ----------
+    def _mark_recent_explicit_close(self, symbol: str) -> None:
+        self._recent_explicit_closes[normalize_symbol(symbol)] = (
+            time.monotonic() + _POST_CLOSE_RECONCILE_GRACE_SECONDS
+        )
+
+    def _has_recent_explicit_close(self, symbol: str) -> bool:
+        symbol = normalize_symbol(symbol)
+        deadline = self._recent_explicit_closes.get(symbol)
+        if deadline is None:
+            return False
+        if time.monotonic() <= deadline:
+            return True
+        self._recent_explicit_closes.pop(symbol, None)
+        return False
+
     def _position_notional(self, symbol: str) -> float:
         p = self.runtime.positions.get(symbol)
         if not p:
@@ -2382,6 +2402,66 @@ class TradingEngine:
             return False, None
         return True, None
 
+    async def _confirm_unmanaged_live_position(
+        self,
+        symbol: str,
+        position: dict | None,
+        reason: str,
+    ) -> tuple[bool, dict | None]:
+        """Confirm an unmanaged live position before disabling the symbol."""
+        attempts = len(_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS)
+        min_confirmations = min(2, attempts)
+        expected_side = (position or {}).get("side") or ""
+        saw_fetch_error = False
+        confirmations = 0
+        latest_position: dict | None = None
+        for attempt, delay in enumerate(_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS, start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                raw_positions = await self._client.fetch_positions([symbol])
+            except Exception as e:
+                saw_fetch_error = True
+                logger.warning(
+                    "{} unmanaged-live confirm attempt {}/{} failed during {}: {}",
+                    symbol, attempt, attempts, reason, e,
+                )
+                continue
+            matched = None
+            for raw in raw_positions:
+                current = normalize_position(raw)
+                if current["symbol"] != symbol or current["contracts"] <= 0:
+                    continue
+                if expected_side and current.get("side") != expected_side:
+                    logger.warning(
+                        "{} unmanaged-live confirm deferred during {}; side changed {} -> {}",
+                        symbol, reason, expected_side, current.get("side") or "",
+                    )
+                    self.runtime.positions[symbol] = current
+                    return False, current
+                matched = current
+                break
+            if matched is None:
+                self.runtime.positions.pop(symbol, None)
+                logger.warning(
+                    "{} unmanaged-live confirm deferred during {}; position disappeared "
+                    "after {}/{} confirmations",
+                    symbol, reason, attempt, attempts,
+                )
+                return False, None
+            confirmations += 1
+            latest_position = matched
+            self.runtime.positions[symbol] = matched
+
+        if confirmations >= min_confirmations and latest_position is not None:
+            return True, latest_position
+        if saw_fetch_error:
+            logger.warning(
+                "{} unmanaged-live confirm inconclusive during {}; defer symbol disable",
+                symbol, reason,
+            )
+        return False, latest_position
+
     async def _exchange_flat_defer_reason(self, symbol: str, reason: str) -> str:
         """Return a non-empty reason when local flat reconciliation is unsafe."""
         try:
@@ -2480,7 +2560,7 @@ class TradingEngine:
                     continue
 
             await self._sync_condition_history(symbol, active_orders)
-            if not await self._should_enforce_position_protection(symbol, reason):
+            if not await self._should_enforce_position_protection(symbol, reason, position):
                 continue
             # B4: 刚做完孤儿接管的 symbol，需要重新拉一次 active_orders，
             # 否则后续 has_stop 判断仍会用旧列表，导致已挂的 SL 被误判缺失。
@@ -2550,7 +2630,12 @@ class TradingEngine:
                     reason,
                 )
 
-    async def _should_enforce_position_protection(self, symbol: str, reason: str) -> bool:
+    async def _should_enforce_position_protection(
+        self,
+        symbol: str,
+        reason: str,
+        position: dict | None = None,
+    ) -> bool:
         """Only auto-fix/close positions that are both enabled and locally managed.
 
         B4 修复：将孤儿持仓的"禁用"路径拆成"先尝试接管，失败再禁用"。
@@ -2566,6 +2651,13 @@ class TradingEngine:
                 "continue protection ownership check while keeping new entries disabled",
                 symbol, reason,
             )
+        if self._has_recent_explicit_close(symbol):
+            logger.warning(
+                "{} live position detected during {}, but explicit close completed recently; "
+                "defer unmanaged-position handling",
+                symbol, reason,
+            )
+            return False
         try:
             managed = await self._store.has_open_trade(symbol)
         except Exception as e:
@@ -2600,6 +2692,15 @@ class TradingEngine:
         if adopted:
             return True
 
+        confirmed, live_position = await self._confirm_unmanaged_live_position(
+            symbol,
+            position,
+            reason,
+        )
+        if not confirmed:
+            return False
+        if live_position is not None:
+            self.runtime.positions[symbol] = live_position
         self._symbol_enabled[symbol] = False
         await self._store.set_symbol_enabled(symbol, False)
         message = (

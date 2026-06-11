@@ -395,7 +395,10 @@ class DelayedPositionClient(FakeClient):
     async def fetch_positions(self, symbols=None):
         self.fetch_positions_calls += 1
         idx = min(self.fetch_positions_calls - 1, len(self.responses) - 1)
-        return self.responses[idx]
+        response = self.responses[idx]
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FakeNotifier:
@@ -706,6 +709,7 @@ async def test_reconcile_closes_old_local_trade_when_exchange_flat_confirmed(set
 
 async def test_reconcile_skips_disabled_unmanaged_position_auto_close(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
     eng._symbol_enabled["BTCUSDT"] = False
     eng._client.positions = [{
         "symbol": "BTC/USDT:USDT",
@@ -723,6 +727,7 @@ async def test_reconcile_skips_disabled_unmanaged_position_auto_close(settings, 
 
 async def test_reconcile_disables_enabled_unmanaged_position_without_auto_close(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
     eng._symbol_enabled["BTCUSDT"] = True
     eng._client.positions = [{
         "symbol": "BTC/USDT:USDT",
@@ -738,6 +743,73 @@ async def test_reconcile_disables_enabled_unmanaged_position_without_auto_close(
     assert eng._symbol_enabled["BTCUSDT"] is False
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
     assert any("no local open trade" in msg for _event, msg in eng._notifier.events)
+
+
+async def test_reconcile_defers_unmanaged_disable_after_recent_explicit_close(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    position = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }
+    eng.runtime.positions["BTCUSDT"] = position
+
+    await eng._handle_close("BTCUSDT")
+
+    eng._client.positions = [position]
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.runtime_settings.get("symbol.enabled.BTCUSDT") is None
+    assert not any("no local open trade" in msg for _event, msg in eng._notifier.events)
+
+
+async def test_reconcile_defers_unmanaged_disable_when_confirm_becomes_flat(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
+    eng._symbol_enabled["BTCUSDT"] = True
+    position = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }
+    eng._client = DelayedPositionClient([[position], []])
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.runtime_settings.get("symbol.enabled.BTCUSDT") is None
+    assert "BTCUSDT" not in eng.runtime.positions
+    assert not any("no local open trade" in msg for _event, msg in eng._notifier.events)
+
+
+async def test_reconcile_defers_unmanaged_disable_when_confirm_errors(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
+    eng._symbol_enabled["BTCUSDT"] = True
+    position = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }
+    eng._client = DelayedPositionClient([
+        [position],
+        RuntimeError("temporary fetch failure"),
+        RuntimeError("temporary fetch failure"),
+    ])
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.runtime_settings.get("symbol.enabled.BTCUSDT") is None
+    assert not any("no local open trade" in msg for _event, msg in eng._notifier.events)
 
 
 async def test_reconcile_waits_for_active_opening_claim(settings, creds, monkeypatch):
@@ -1743,6 +1815,7 @@ async def test_orphan_adoption_picks_up_managed_qty_and_repairs_sl_tp(settings, 
 async def test_orphan_adoption_skips_when_no_recent_claim(settings, creds, monkeypatch):
     """B4 边界：没最近 claim → 走原有"禁用"路径，保持向后兼容。"""
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
     eng._symbol_enabled["BTCUSDT"] = True
     eng._store.open_trades.discard("BTCUSDT")
     eng._store.active_claims.discard("BTCUSDT")
@@ -1763,6 +1836,7 @@ async def test_orphan_adoption_skips_when_no_recent_claim(settings, creds, monke
 async def test_orphan_adoption_skipped_on_side_mismatch(settings, creds, monkeypatch):
     """B4 边界：claim 是 long，交易所持仓是 short → 不接管（避免反向加仓）。"""
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
     eng._symbol_enabled["BTCUSDT"] = True
     eng._store.open_trades.discard("BTCUSDT")
     eng._store.active_claims.discard("BTCUSDT")
@@ -1786,6 +1860,7 @@ async def test_orphan_adoption_skipped_on_side_mismatch(settings, creds, monkeyp
 async def test_orphan_adoption_skipped_on_qty_out_of_range(settings, creds, monkeypatch):
     """B4 边界：claim planned=1.0，交易所 qty=5.0（10x）→ 不接管（不是同一笔）。"""
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop, "_UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS", (0.0, 0.0))
     eng._symbol_enabled["BTCUSDT"] = True
     eng._store.open_trades.discard("BTCUSDT")
     eng._store.active_claims.discard("BTCUSDT")
