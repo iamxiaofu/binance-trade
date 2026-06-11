@@ -553,6 +553,50 @@ async def test_record_balance_snapshot_updates_runtime(settings, creds, monkeypa
     assert eng._store.balance_snapshots[0]["available_margin"] == pytest.approx(300.0)
 
 
+async def test_record_balance_snapshot_skips_when_total_missing(settings, creds, monkeypatch):
+    """`bal['total']` 中没有 USDT 键（旧 `or 0.0` 兜底会写 0）。"""
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.current_equity = 200.0
+    eng.runtime.equity_peak = 200.0
+
+    await eng._record_balance_snapshot({"total": {"BTC": 1.0}, "free": {}})
+
+    assert eng._store.balance_snapshots == []
+    # runtime 不被无效值覆盖
+    assert eng.runtime.current_equity == pytest.approx(200.0)
+
+
+async def test_record_balance_snapshot_skips_when_total_is_none(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.current_equity = 200.0
+
+    await eng._record_balance_snapshot({"total": {"USDT": None}, "free": {"USDT": 0.0}})
+
+    assert eng._store.balance_snapshots == []
+    assert eng.runtime.current_equity == pytest.approx(200.0)
+
+
+async def test_record_balance_snapshot_skips_when_total_dict_empty(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.current_equity = 200.0
+
+    await eng._record_balance_snapshot({"total": {}, "free": {}})
+
+    assert eng._store.balance_snapshots == []
+    assert eng.runtime.current_equity == pytest.approx(200.0)
+
+
+async def test_record_balance_snapshot_skips_when_free_negative(settings, creds, monkeypatch):
+    """可用保证金为负视为脏数据，不写库。"""
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.current_equity = 200.0
+
+    await eng._record_balance_snapshot({"total": {"USDT": 321.0}, "free": {"USDT": -1.0}})
+
+    assert eng._store.balance_snapshots == []
+    assert eng.runtime.current_equity == pytest.approx(200.0)
+
+
 async def test_sync_open_orders_includes_condition_orders(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._client.open_orders = [

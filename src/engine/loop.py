@@ -2795,15 +2795,34 @@ class TradingEngine:
             logger.warning("balance snapshot failed: {}", e)
 
     async def _record_balance_snapshot(self, balance: dict) -> None:
-        total = (balance.get("total") or {}).get(self._settings.account.quote_asset) or 0.0
-        free = (balance.get("free") or {}).get(self._settings.account.quote_asset) or 0.0
-        total = float(total)
+        # 兜底：ccxt 在限频/限流/接口偶发残缺时，`bal['total'][USDT]`
+        # 可能为 None / 缺失 / <= 0。若按"or 0.0"直接落库，会把权益
+        # 跌 0 的尖刺写进 balance_snapshots，前端曲线瞬间砸到 0。
+        # 此处改为：无效值不写库、不更新 runtime.current_equity，
+        # 保留上一周期的权益与可用保证金，下一周期自然恢复。
+        quote = self._settings.account.quote_asset
+        total_raw = (balance.get("total") or {}).get(quote)
+        free_raw = (balance.get("free") or {}).get(quote)
+        try:
+            total = float(total_raw) if total_raw is not None else 0.0
+        except (TypeError, ValueError):
+            total = 0.0
+        try:
+            free = float(free_raw) if free_raw is not None else 0.0
+        except (TypeError, ValueError):
+            free = 0.0
+        if total <= 0 or free < 0:
+            logger.warning(
+                "balance parse invalid, skip snapshot: total={} free={} (keep prev equity={:.2f})",
+                total_raw, free_raw, self.runtime.current_equity,
+            )
+            return
         self.runtime.update_equity(total)
         await self._store.snapshot_balance(
             total_equity=total,
-            available_margin=float(free),
+            available_margin=free,
             runtime=self.runtime,
-            quote_asset=self._settings.account.quote_asset,
+            quote_asset=quote,
         )
 
     def _detect_external_closes(self, prev: dict[str, dict], curr: dict[str, dict]) -> list[dict]:
