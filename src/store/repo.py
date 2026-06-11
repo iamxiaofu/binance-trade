@@ -178,6 +178,121 @@ def _pnl_pct(pnl: float, margin: float) -> float:
     return (pnl / margin) * 100.0 if margin > 0 else 0.0
 
 
+def _weighted_exit_price_from_trades(
+    trades: list[dict[str, Any]],
+    *,
+    direction: str,
+    since_ms: int,
+    target_qty: float,
+) -> float:
+    """从 ccxt 形态的成交列表中，挑出 trade 开仓之后、平仓方向、数量累计
+    不低于 target_qty 的部分做加权均价。无法确定时返回 0.0。
+
+    ``trades`` 既可以是 ``fetch_my_trades`` 全量结果，也可以是已经按时间窗口
+    过滤后的子集；函数内部再按 ``timestamp >= since_ms`` 与反向 side 二次过滤。
+    """
+    if target_qty <= 0 or direction not in ("long", "short"):
+        return 0.0
+    close_side = "sell" if direction == "long" else "buy"
+    pool: list[tuple[int, float, float]] = []  # (timestamp, price, amount)
+    for t in trades or []:
+        try:
+            ts = int(t.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts < since_ms:
+            continue
+        side = (t.get("side") or "").lower()
+        if side != close_side:
+            continue
+        info = t.get("info") or {}
+        info_side = (info.get("side") or "").upper()
+        # ccxt 在 USDT-M 上对 reduce-only 平仓通常 side=BUY/SELL，但有些
+        # 限频时只放在 info.side 里；二者任一为 close_side 即视为平仓。
+        if info_side and info_side.lower() != close_side:
+            continue
+        try:
+            price = float(t.get("price") or 0.0)
+            amount = float(t.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or amount <= 0:
+            continue
+        pool.append((ts, price, amount))
+    if not pool:
+        return 0.0
+    pool.sort(key=lambda x: x[0])
+    remaining = target_qty
+    sum_notional = 0.0
+    sum_qty = 0.0
+    for _ts, price, amount in pool:
+        if remaining <= 0:
+            break
+        take = min(amount, remaining)
+        sum_notional += price * take
+        sum_qty += take
+        remaining -= take
+    if sum_qty <= 0:
+        return 0.0
+    # 如果成交累计量仍不足 target_qty，至少给一个保守的"已知成交量均价"。
+    return sum_notional / sum_qty
+
+
+def _sum_fee_from_trades(
+    trades: list[dict[str, Any]],
+    *,
+    direction: str,
+    since_ms: int,
+    target_qty: float,
+) -> float:
+    """从 ccxt myTrades 列表中累计与 ``_weighted_exit_price_from_trades`` 命中的
+    同一窗口的手续费（按 cost 直接相加，不分买卖）。"""
+    if target_qty <= 0 or direction not in ("long", "short"):
+        return 0.0
+    close_side = "sell" if direction == "long" else "buy"
+    pool: list[tuple[int, float, float]] = []
+    for t in trades or []:
+        try:
+            ts = int(t.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts < since_ms:
+            continue
+        side = (t.get("side") or "").lower()
+        if side != close_side:
+            continue
+        info = t.get("info") or {}
+        info_side = (info.get("side") or "").upper()
+        if info_side and info_side.lower() != close_side:
+            continue
+        try:
+            amount = float(t.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        pool.append((ts, amount, 0.0))
+    if not pool:
+        return 0.0
+    pool.sort(key=lambda x: x[0])
+    remaining = target_qty
+    total = 0.0
+    for t, (ts, amount, _) in zip(trades, pool):
+        if remaining <= 0:
+            break
+        take = min(amount, remaining)
+        fee_obj = t.get("fee") or {}
+        try:
+            cost = float(fee_obj.get("cost") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        # cost 已经按 amount 给出，按 take / amount 比例分摊
+        if amount > 0:
+            total += cost * (take / amount)
+        remaining -= take
+    return total
+
+
 def _raw_number(raw_json: str, key: str) -> float:
     try:
         raw = json.loads(raw_json or "{}")
@@ -1462,11 +1577,17 @@ class Store:
         reason: str = "EXCHANGE_FLAT",
         opened_before_ms: int | None = None,
         min_open_age_ms: int = 0,
+        exchange_trades_provider: (
+            "Callable[[str, int, int], Awaitable[list[dict]]] | None"
+        ) = None,
     ) -> int:
         """交易所确认该币种无持仓时，关闭仍悬挂的本地 open trade。
 
-        这是兜底账务修复：优先用该 trade 开仓后的最近退出成交价；如果没有可用退出成交，
-        用入场价关闭并把 confidence 标记为 inferred，避免页面继续显示虚假持仓。
+        这是兜底账务修复：优先用该 trade 开仓后的最近退出成交价（本地 close 订单
+        的 filled_price/avgPx）；如果本地没有可用退出订单，调用方可以注入
+        ``exchange_trades_provider(symbol, since_ms, until_ms)`` 直接拉交易所 myTrades
+        反查真实平仓均价；两者都拿不到时退回到用入场价关闭，并把 confidence 标记为
+        ``inferred``，避免页面继续显示虚假持仓。
         """
         import time as _t
 
@@ -1502,6 +1623,42 @@ class Store:
                     or (float(exit_row.price or 0.0) if exit_row else 0.0)
                     or float(trade.entry_price or 0.0)
                 )
+                exit_source = "local_close_order" if exit_row else "inferred_entry"
+                exit_fee = float(exit_row.fee or 0.0) if exit_row else 0.0
+                # 本地没有 close 订单时（典型：交易所侧强平/止损触发的 EXCHANGE_FLAT），
+                # 退回到入场价会让 pnl 算成 0。允许调用方注入 provider 直接反查
+                # 交易所 myTrades 拿真实平仓均价；provider 异常/空数据时安全降级。
+                if (
+                    exit_row is None
+                    and exchange_trades_provider is not None
+                    and float(trade.entry_price or 0.0) > 0
+                ):
+                    try:
+                        fetched = await exchange_trades_provider(
+                            symbol, int(trade.opened_at_ms), now_ms
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "{} reconcile exit price provider failed, fallback to entry: {}",
+                            symbol, e,
+                        )
+                        fetched = None
+                    if fetched:
+                        real_exit = _weighted_exit_price_from_trades(
+                            fetched,
+                            direction=trade.direction,
+                            since_ms=int(trade.opened_at_ms),
+                            target_qty=open_qty,
+                        )
+                        if real_exit > 0:
+                            exit_price = real_exit
+                            exit_source = "exchange_my_trades"
+                            exit_fee = _sum_fee_from_trades(
+                                fetched,
+                                direction=trade.direction,
+                                since_ms=int(trade.opened_at_ms),
+                                target_qty=open_qty,
+                            )
                 pnl = _realized_pnl(
                     direction=trade.direction,
                     entry_price=trade.entry_price,
@@ -1517,12 +1674,22 @@ class Store:
                 trade.exit_notional += abs(open_qty * exit_price)
                 trade.realized_pnl += pnl
                 trade.gross_realized_pnl = trade.realized_pnl
+                # 当 exit 价来自交易所 myTrades、且本地 close 订单缺失时，平仓手续费
+                # 同步从 myTrades 累加（避免 total_fee 漏算退场手续费）。
+                if exit_row is None and exit_source == "exchange_my_trades" and exit_fee > 0:
+                    trade.exit_fee = float(trade.exit_fee or 0.0) + exit_fee
+                    trade.total_fee = float(trade.entry_fee or 0.0) + trade.exit_fee
                 trade.net_realized_pnl = trade.gross_realized_pnl - trade.total_fee
                 margin = trade.entry_margin or _margin(trade.entry_notional, trade.leverage)
                 trade.pnl_pct_on_margin = _pnl_pct(trade.realized_pnl, margin)
                 trade.net_pnl_pct_on_margin = _pnl_pct(trade.net_realized_pnl, margin)
                 trade.exit_reason = reason[:24]
                 trade.confidence = "inferred"
+                logger.info(
+                    "{} reconcile flat trade={} pnl={:.4f} fee={:.4f} source={} prev_pnl={:.4f}",
+                    symbol, trade.id, pnl, exit_fee, exit_source,
+                    float(trade.realized_pnl or 0.0) - pnl,
+                )
                 changed += 1
             await session.commit()
             return changed

@@ -1109,7 +1109,11 @@ class TradingEngine:
         remaining = await self._cancel_symbol_condition_orders(
             symbol, reason="manual_close"
         )
-        await self._store.reconcile_symbol_flat(symbol, reason="MANUAL_CLOSE")
+        await self._store.reconcile_symbol_flat(
+            symbol,
+            reason="MANUAL_CLOSE",
+            exchange_trades_provider=self._fetch_exit_trades,
+        )
         canceled_note = "保护单已撤销" if not remaining else (
             "仍有条件单未撤销: "
             + ", ".join(self._condition_order_label(order) for order in remaining)
@@ -1184,6 +1188,28 @@ class TradingEngine:
         if raw is not None:
             return normalize_position(raw)
         return None
+
+    async def _fetch_exit_trades(
+        self, symbol: str, since_ms: int, until_ms: int
+    ) -> list[dict]:
+        """反查交易所 myTrades，用于 EXCHANGE_FLAT/MANUAL_CLOSE 路径补真实平仓均价。
+
+        拉取 ``[since_ms, until_ms]`` 窗口内该 symbol 的成交；ccxt 偶尔会带
+        略早的少量样本，调用方（如 ``reconcile_symbol_flat``）会再次按开仓
+        时间过滤。失败时返回空列表（store 兜底用 entry_price）。
+        """
+        try:
+            ccxt_sym = self._client._to_ccxt_symbol(symbol)
+        except Exception:
+            return []
+        try:
+            trades = await self._client.raw.fetch_my_trades(
+                ccxt_sym, since=int(since_ms), limit=1000
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("{} fetch exit trades failed: {}", symbol, e)
+            return []
+        return [t for t in (trades or []) if int(t.get("timestamp") or 0) <= int(until_ms)]
 
     async def _precheck_before_attach_sl_tp(
         self,
@@ -2540,6 +2566,7 @@ class TradingEngine:
                         reason="EXCHANGE_FLAT",
                         opened_before_ms=flat_checked_at_ms,
                         min_open_age_ms=_EXCHANGE_FLAT_MIN_OPEN_AGE_MS,
+                        exchange_trades_provider=self._fetch_exit_trades,
                     )
                     if closed:
                         logger.warning(

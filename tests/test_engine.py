@@ -236,6 +236,7 @@ class FakeStore:
         reason="EXCHANGE_FLAT",
         opened_before_ms=None,
         min_open_age_ms=0,
+        exchange_trades_provider=None,
     ):
         self.flat_reconciles.append((symbol, reason))
         if symbol in self.open_trades:

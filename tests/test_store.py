@@ -306,6 +306,101 @@ async def test_reconcile_symbol_flat_respects_time_guards(store):
     assert trade.exit_reason == "EXCHANGE_FLAT"
 
 
+async def test_reconcile_symbol_flat_uses_exchange_trades_provider_when_no_local_exit_order(store):
+    """EXCHANGE_FLAT 路径：本地无 close 订单时，注入 provider 应回填真实平仓均价。"""
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 0.0362, "price": 62810.65,
+        "notional": 2273.0, "leverage": 10, "dry_run": False, "status": "filled",
+        "id": "open-long", "raw": {},
+    })
+    # 把 opened_at_ms 调成 120s 之前，确保 min_open_age 不卡住
+    old_ms = int(time.time() * 1000) - 120_000
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        trade.opened_at_ms = old_ms
+        await session.commit()
+
+    # 模拟 ccxt myTrades：14:34 一次 SELL 全平 @ 62846.0
+    open_ms = old_ms
+    close_ms = open_ms + 60_000
+    fetched_trades = [
+        {
+            "timestamp": close_ms,
+            "side": "sell",
+            "price": 62846.0,
+            "amount": 0.0362,
+            "fee": {"cost": 0.91, "currency": "USDT"},
+            "info": {"side": "SELL"},
+        }
+    ]
+
+    async def provider(symbol: str, since_ms: int, until_ms: int) -> list[dict]:
+        assert symbol == "BTCUSDT"
+        assert since_ms == open_ms
+        assert until_ms >= close_ms
+        return fetched_trades
+
+    changed = await store.reconcile_symbol_flat(
+        "BTCUSDT",
+        reason="EXCHANGE_FLAT",
+        min_open_age_ms=60_000,
+        exchange_trades_provider=provider,
+    )
+
+    assert changed == 1
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+    assert trade.status == "closed"
+    assert trade.exit_reason == "EXCHANGE_FLAT"
+    assert trade.confidence == "inferred"
+    # 退出均价来自交易所 myTrades，不再兜底为 entry_price
+    assert trade.exit_price == pytest.approx(62846.0)
+    # pnl = (62846.0 - 62810.65) * 0.0362 ≈ +1.28
+    assert trade.realized_pnl == pytest.approx(1.28000, rel=1e-3)
+    # 平仓手续费从 myTrades 累加进 total_fee
+    assert trade.exit_fee == pytest.approx(0.91, rel=1e-6)
+    # net 仍可能为负（pnl 抵不过 fee），但 gross 应该是 +1.28
+    assert trade.gross_realized_pnl == pytest.approx(trade.realized_pnl, rel=1e-6)
+
+
+async def test_reconcile_symbol_flat_falls_back_when_provider_fails(store):
+    """EXCHANGE_FLAT 路径：provider 抛错时安全退回 entry_price 兜底，不阻断 reconcile。"""
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 0.0362, "price": 62810.65,
+        "notional": 2273.0, "leverage": 10, "dry_run": False, "status": "filled",
+        "id": "open-long-2", "raw": {},
+    })
+    old_ms = int(time.time() * 1000) - 120_000
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        trade.opened_at_ms = old_ms
+        await session.commit()
+
+    async def boom(symbol: str, since_ms: int, until_ms: int) -> list[dict]:
+        raise RuntimeError("exchange timeout")
+
+    changed = await store.reconcile_symbol_flat(
+        "BTCUSDT",
+        reason="EXCHANGE_FLAT",
+        min_open_age_ms=60_000,
+        exchange_trades_provider=boom,
+    )
+
+    assert changed == 1
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+    assert trade.status == "closed"
+    assert trade.exit_reason == "EXCHANGE_FLAT"
+    assert trade.confidence == "inferred"
+    # provider 失败 → 退回 entry_price → pnl = 0
+    assert trade.exit_price == pytest.approx(62810.65)
+    assert trade.realized_pnl == pytest.approx(0.0, abs=1e-9)
+
+
 async def test_has_open_trade_detects_local_managed_position(store):
     await store.log_order({
         "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
