@@ -3128,6 +3128,18 @@ class TradingEngine:
         prof = await self._store.get_llm_profile(name)
         if prof is None:
             raise ValueError(f"llm profile not found: {name!r}")
-        # db 里已经由 web 端 activate 过；这里重建整条 fallback 链 → 替换。
-        await self._apply_llm_chain(source="command")
+        # 记住旧 active，建链失败时回滚 DB，避免 DB 与引擎实际状态脱节。
+        old_name = self._llm_profile_name
+        try:
+            await self._apply_llm_chain(source="command")
+        except Exception:
+            if old_name:
+                try:
+                    await self._store.activate_llm_profile(old_name)
+                    logger.warning(
+                        "SWITCH_LLM_PROFILE failed, rolled back DB is_active to {}", old_name
+                    )
+                except Exception as roll_e:
+                    logger.warning("llm profile rollback failed: {}", roll_e)
+            raise
         return f"llm profile switched: {name} (version={self._llm_version})"
