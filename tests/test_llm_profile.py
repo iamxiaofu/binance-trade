@@ -1,24 +1,11 @@
-"""LLM profile 管理（持久化 + keyring + 工厂）测试。"""
+"""LLM profile 管理（明文持久化 + fallback 链 + 工厂）测试。"""
 from __future__ import annotations
-
-import asyncio
-import os
 
 import pytest
 
 from src.config.schema import LLMConfig
-from src.llm import keyring_store as kr
 from src.llm.client import LLMClient
 from src.store.repo import Store
-
-
-@pytest.fixture
-def fernet_env(monkeypatch):
-    """强制走 Fernet 后端（headless CI 无 keyring）。"""
-    monkeypatch.setenv("LLM_KEYRING_MASTER_KEY", "KXSIvd3t8TTEjuyz8A0daMTgpm4Ezcoix2BzelW-XxE=")
-    kr.reset_for_test()
-    yield
-    kr.reset_for_test()
 
 
 async def test_store_llm_profile_crud(tmp_path):
@@ -29,31 +16,36 @@ async def test_store_llm_profile_crud(tmp_path):
         # 初始空
         assert await s.list_llm_profiles() == []
         assert await s.get_active_llm_profile() is None
-        # upsert
+        # upsert（明文 api_key）
         await s.upsert_llm_profile(
             name="ikuncode", provider="anthropic", model="claude-opus-4-8",
             base_url="https://api.ikuncode.cc", timeout=60.0,
-            max_tokens=1024, max_retries=2, keyring_ref="profile://keyring/ikuncode",
+            max_tokens=1024, max_retries=2, api_key="sk-ant-IKUN",
         )
         prof = await s.get_llm_profile("ikuncode")
         assert prof and prof["key_present"] and not prof["is_active"]
-        # 重复 upsert：留空 keyring_ref → 保留旧
+        assert prof["api_key_mask"].endswith("IKUN")
+        assert "api_key" not in prof  # 对外视图绝不含明文
+        assert await s.get_llm_profile_secret("ikuncode") == "sk-ant-IKUN"
+        # 重复 upsert：留空 api_key → 保留旧 key，仅改其它字段
         await s.upsert_llm_profile(
             name="ikuncode", provider="anthropic", model="claude-opus-4-6",
-            base_url="", timeout=80.0, max_tokens=2048, max_retries=3, keyring_ref="",
+            base_url="", timeout=80.0, max_tokens=2048, max_retries=3, api_key="",
         )
         prof2 = await s.get_llm_profile("ikuncode")
         assert prof2["model"] == "claude-opus-4-6"
-        assert prof2["keyring_ref"] == "profile://keyring/ikuncode"
-        # 互斥激活
+        assert await s.get_llm_profile_secret("ikuncode") == "sk-ant-IKUN"
+        # 互斥激活；激活后 priority 置 0
         await s.upsert_llm_profile(
             name="official", provider="anthropic", model="claude-opus-4-6",
             base_url="", timeout=60.0, max_tokens=1024, max_retries=2,
-            keyring_ref="profile://keyring/official",
+            api_key="sk-ant-OFFICIAL",
         )
         await s.activate_llm_profile("official")
         assert (await s.get_llm_profile("ikuncode"))["is_active"] is False
-        assert (await s.get_llm_profile("official"))["is_active"] is True
+        active = await s.get_llm_profile("official")
+        assert active["is_active"] is True
+        assert active["priority"] == 0
         # 删 active 应抛错
         with pytest.raises(ValueError, match="cannot delete active"):
             await s.delete_llm_profile("official")
@@ -65,50 +57,47 @@ async def test_store_llm_profile_crud(tmp_path):
         await s.close()
 
 
-def test_fernet_roundtrip(monkeypatch):
-    """强制走 Fernet 后端（与机器是否装 keyring 无关）。"""
-    monkeypatch.setenv("LLM_KEYRING_MASTER_KEY", "KXSIvd3t8TTEjuyz8A0daMTgpm4Ezcoix2BzelW-XxE=")
-    monkeypatch.setattr(kr, "_probe", lambda: kr._FernetBackend(b"KXSIvd3t8TTEjuyz8A0daMTgpm4Ezcoix2BzelW-XxE="))
-    kr.reset_for_test()
-    ks, status = kr.get_keyring_store()
-    assert status["backend"] == "fernet"
-    assert status["available"] is True
-    ref = ks.set("official", "sk-ant-FAKE")
-    assert ks.get(ref) == "sk-ant-FAKE"
+async def test_enabled_chain_order(tmp_path):
+    """get_enabled_llm_profiles 应返回 active 主源 + 备源，按 priority 升序。"""
+    db = str(tmp_path / "chain.db")
+    s = Store(db)
+    await s.connect()
+    try:
+        await s.upsert_llm_profile(
+            name="main", provider="anthropic", model="m1", base_url="", timeout=60,
+            max_tokens=1024, max_retries=2, api_key="sk-main",
+        )
+        await s.upsert_llm_profile(
+            name="backup", provider="openai_compatible", model="gpt-x", base_url="https://gw",
+            timeout=60, max_tokens=1024, max_retries=1, api_key="sk-backup",
+            priority=10, fallback_enabled=True,
+        )
+        await s.upsert_llm_profile(
+            name="ignored", provider="anthropic", model="m2", base_url="", timeout=60,
+            max_tokens=1024, max_retries=2, api_key="sk-ig", priority=5,
+            fallback_enabled=False,
+        )
+        await s.activate_llm_profile("main")  # main priority -> 0
+        chain = await s.get_enabled_llm_profiles()
+        # ignored 既非 active 也未 fallback_enabled → 不在链里
+        assert [p["name"] for p in chain] == ["main", "backup"]
+    finally:
+        await s.close()
 
 
-def test_fernet_ciphertext_does_not_leak_plaintext(fernet_env):
-    ks, _ = kr.get_keyring_store()
-    plaintext = "sk-ant-THIS-IS-THE-SECRET"
-    ref = ks.set("official", plaintext)
-    assert plaintext not in ref
-    # Fernet 密文一定不等于明文
-    assert ref != plaintext
-
-
-def test_unavailable_when_no_backend(monkeypatch):
-    """强制走 _Unavailable（与机器环境无关）。"""
-    monkeypatch.setattr(kr, "_probe", lambda: kr._Unavailable())
-    kr.reset_for_test()
-    ks, status = kr.get_keyring_store()
-    assert status["backend"] == "unavailable"
-    assert status["available"] is False
-    with pytest.raises(kr.KeyringUnavailable):
-        ks.set("x", "y")
-
-
-def test_llm_client_from_profile_uses_profile_values(fernet_env):
-    """from_profile 工厂应该用 profile 里的 model/timeout/base_url，而不是 yaml 默认。"""
+def test_llm_client_from_profile_uses_profile_values():
+    """from_profile 工厂应该用 profile 里的 provider/model/timeout，而不是 yaml 默认。"""
     cfg = LLMConfig(
         model="claude-opus-4-8", timeout=60, max_tokens=1024,
         max_retries=2, kline_lookback=100,
     )
     prof = {
-        "name": "official", "model": "claude-opus-4-6",
+        "name": "official", "provider": "anthropic", "model": "claude-opus-4-6",
         "max_tokens": 2048, "max_retries": 4, "timeout": 75.0,
         "base_url": "https://example.invalid",
     }
     cli = LLMClient.from_profile(prof, cfg, "sk-test")
+    assert cli._cfg.provider == "anthropic"
     assert cli._cfg.model == "claude-opus-4-6"
     assert cli._cfg.timeout == 75.0
     assert cli._cfg.max_tokens == 2048

@@ -628,67 +628,51 @@ async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)
 
 
 # ---------- LLM profile 管理 ----------
-# 全部写 llm_profiles 表 + keyring；激活通过现有命令队列触发 engine 热替换。
+# 全部写 llm_profiles 表；激活通过现有命令队列触发 engine 热替换。
 # 设计要点：
-# - list / get / activate / test 永远不返回 key 明文（响应里没有这个字段）。
-# - 创建/更新时只接受 api_key 一次性的明文（POST/PUT body），入库前 keyring.set，
-#   写库只放 keyring_ref/ciphertext。
-# - keyring 后端不可用时，写操作返回 503 + 明确 hint，前端用 banner 提示。
+# - list / get / activate / test 永远不返回 key 明文（只回 key_present + 末4位 mask）。
+# - 创建/更新时只接受 api_key 明文（POST/PUT body），明文直接入库（单租户自托管）。
+# - fallback 链：active 主源 + fallback_enabled 备源，按 priority 升序串联。
 
 from pydantic import BaseModel, Field  # noqa: E402
-from src.llm.keyring_store import (  # noqa: E402
-    get_keyring_store,
-    KeyringUnavailable,
-)
+from src.llm.providers import build_provider  # noqa: E402
 
 
 class _LLMProfileUpsert(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    provider: str = Field(default="anthropic", pattern="^anthropic$")
+    provider: str = Field(default="anthropic", pattern="^(anthropic|openai_compatible)$")
     model: str = Field(min_length=1, max_length=128)
     base_url: str | None = None
     timeout: float = Field(default=60.0, gt=0)
     max_tokens: int = Field(default=1024, gt=0, le=512000)
     max_retries: int = Field(default=2, ge=0, le=5)
+    priority: int = Field(default=100, ge=0, le=10000)
+    fallback_enabled: bool = False
     # 留空=不更新（PUT 时）；POST 时必填
-    api_key: str = Field(default="", max_length=512)
-
-
-def _keyring_status() -> dict:
-    _ks, status = get_keyring_store()
-    return status
-
-
-def _check_keyring_available() -> None:
-    """写操作前置：keyring 后端不可用直接 503。"""
-    s = _keyring_status()
-    if not s.get("available"):
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "keyring_unavailable",
-                "backend": s.get("backend"),
-                "hint": s.get("hint"),
-            },
-        )
+    api_key: str = Field(default="", max_length=8192)
 
 
 @app.get("/api/llm/status")
 async def api_llm_status(_: str = Depends(_check_auth)):
-    """前端顶部 banner + 切换轮询用。"""
-    s = _keyring_status()
+    """前端切换状态轮询用（active / engine / fallback 链）。"""
     store = await _get_store()
     active = await store.get_active_llm_profile()
+    chain = await store.get_enabled_llm_profiles()
     rt = await store.runtime_settings()
-    # engine 进程热替换后会写 llm.active_version / llm.active_name / llm.active_source
+    # engine 热替换后会写 llm.active_version / llm.active_name / llm.active_source / llm.chain
     return {
-        "keyring": s,
         "active": active,
-        "switching_supported": s.get("available", False),
+        "switching_supported": True,
+        "chain": [
+            {"name": p["name"], "provider": p["provider"], "priority": p["priority"],
+             "is_active": p["is_active"], "fallback_enabled": p["fallback_enabled"]}
+            for p in chain
+        ],
         "engine": {
             "active_name": rt.get("llm.active_name", ""),
             "active_version": int(rt.get("llm.active_version", "0") or "0"),
             "active_source": rt.get("llm.active_source", ""),
+            "chain": rt.get("llm.chain", ""),
         },
     }
 
@@ -703,7 +687,6 @@ async def api_llm_profiles(_: str = Depends(_check_auth)):
 async def api_llm_profiles_create(
     payload: _LLMProfileUpsert, _: str = Depends(_check_auth)
 ):
-    _check_keyring_available()
     if not payload.api_key.strip():
         raise HTTPException(
             status_code=400, detail="api_key is required when creating a profile"
@@ -712,29 +695,18 @@ async def api_llm_profiles_create(
     existing = await store.get_llm_profile(payload.name)
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"profile exists: {payload.name}")
-    ks, _ = get_keyring_store()
-    try:
-        ref = ks.set(payload.name, payload.api_key)
-    except KeyringUnavailable as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    try:
-        prof = await store.upsert_llm_profile(
-            name=payload.name,
-            provider=payload.provider,
-            model=payload.model,
-            base_url=(payload.base_url or None),
-            timeout=payload.timeout,
-            max_tokens=payload.max_tokens,
-            max_retries=payload.max_retries,
-            keyring_ref=ref,
-        )
-    except Exception:
-        # 落库失败时回滚 keyring 项，避免孤儿。
-        try:
-            ks.delete(ref)
-        except Exception:  # noqa: BLE001
-            pass
-        raise
+    prof = await store.upsert_llm_profile(
+        name=payload.name,
+        provider=payload.provider,
+        model=payload.model,
+        base_url=(payload.base_url or None),
+        timeout=payload.timeout,
+        max_tokens=payload.max_tokens,
+        max_retries=payload.max_retries,
+        api_key=payload.api_key,
+        priority=payload.priority,
+        fallback_enabled=payload.fallback_enabled,
+    )
     return prof
 
 
@@ -742,54 +714,23 @@ async def api_llm_profiles_create(
 async def api_llm_profiles_update(
     name: str, payload: _LLMProfileUpsert, _: str = Depends(_check_auth)
 ):
-    _check_keyring_available()
     store = await _get_store()
     existing = await store.get_llm_profile(name)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"profile not found: {name}")
-    # 如果新 api_key 留空 → 保留旧 keyring_ref；非空 → 写新 keyring。
-    new_ref = ""
-    if payload.api_key.strip():
-        ks, _ = get_keyring_store()
-        old_ref = existing.get("keyring_ref") or ""
-        try:
-            new_ref = ks.set(name, payload.api_key)
-        except KeyringUnavailable as e:
-            raise HTTPException(status_code=503, detail=str(e)) from e
-        try:
-            prof = await store.upsert_llm_profile(
-                name=name,
-                provider=payload.provider,
-                model=payload.model,
-                base_url=(payload.base_url or None),
-                timeout=payload.timeout,
-                max_tokens=payload.max_tokens,
-                max_retries=payload.max_retries,
-                keyring_ref=new_ref,
-            )
-        except Exception:
-            try:
-                ks.delete(new_ref)
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-        # 旧 key 删掉（仅 keyring 模式有意义；fernet 模式下 ref 是密文，新覆盖即可）
-        if old_ref and old_ref != new_ref:
-            try:
-                ks.delete(old_ref)
-            except Exception:  # noqa: BLE001
-                logger.warning("failed to delete old keyring ref: {}", old_ref)
-    else:
-        prof = await store.upsert_llm_profile(
-            name=name,
-            provider=payload.provider,
-            model=payload.model,
-            base_url=(payload.base_url or None),
-            timeout=payload.timeout,
-            max_tokens=payload.max_tokens,
-            max_retries=payload.max_retries,
-            keyring_ref="",
-        )
+    # api_key 留空 = 保留旧 key；非空 = 覆盖（repo 内部按是否非空决定）。
+    prof = await store.upsert_llm_profile(
+        name=name,
+        provider=payload.provider,
+        model=payload.model,
+        base_url=(payload.base_url or None),
+        timeout=payload.timeout,
+        max_tokens=payload.max_tokens,
+        max_retries=payload.max_retries,
+        api_key=payload.api_key,
+        priority=payload.priority,
+        fallback_enabled=payload.fallback_enabled,
+    )
     return prof
 
 
@@ -804,19 +745,12 @@ async def api_llm_profiles_delete(name: str, _: str = Depends(_check_auth)):
             status_code=409, detail="cannot delete active profile; switch first"
         )
     await store.delete_llm_profile(name)
-    ks, _ = get_keyring_store()
-    old_ref = existing.get("keyring_ref") or ""
-    if old_ref:
-        try:
-            ks.delete(old_ref)
-        except Exception:  # noqa: BLE001
-            logger.warning("failed to delete keyring ref: {}", old_ref)
     return {"deleted": True, "name": name}
 
 
 @app.post("/api/llm/profiles/{name}/test")
 async def api_llm_profiles_test(name: str, _: str = Depends(_check_auth)):
-    """Dry-run 校验：用该 profile 的 key 真的发一次最小 ping。
+    """Dry-run 校验：用该 profile 的 key 真的发一次最小 ping（按 provider）。
 
     失败抛 502（key 错/网络不通/模型不存在），成功返回 {"ok": True, "latency_ms": ...}。
     不会切换 active profile。
@@ -825,30 +759,19 @@ async def api_llm_profiles_test(name: str, _: str = Depends(_check_auth)):
     prof = await store.get_llm_profile(name)
     if prof is None:
         raise HTTPException(status_code=404, detail=f"profile not found: {name}")
-    ks, _ = get_keyring_store()
-    try:
-        api_key = ks.get(prof["keyring_ref"])
-    except (KeyError, KeyringUnavailable) as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    # 真正的 ping：test 端点只关心 (model, base_url, timeout, api_key, max_tokens)，
-    # 不依赖 LLMConfig 的工程参数 (kline_lookback / kline_interval / ...)，所以
-    # 这里直接构造 AsyncAnthropic，避免 LLMConfig 必填字段缺失的问题。
-    from anthropic import AsyncAnthropic  # type: ignore
+    api_key = await store.get_llm_profile_secret(name)
+    if not api_key:
+        raise HTTPException(status_code=400, detail=f"profile {name} has no api_key")
     timeout = min(float(prof["timeout"]), 15.0)  # 测试给短超时
-    kwargs = {"api_key": api_key, "timeout": timeout}
-    base_url = prof.get("base_url") or None
-    if base_url:
-        kwargs["base_url"] = base_url
-    client = AsyncAnthropic(**kwargs)
+    provider = build_provider(
+        prof["provider"], model=prof["model"], base_url=(prof.get("base_url") or None),
+        api_key=api_key, timeout=timeout,
+    )
     t0 = time.monotonic()
     try:
-        # 用 profile 自己的 max_tokens 做上限，但 cap 到 256 防 8k 浪费
+        # cap 到 256 token 防 8k 浪费
         max_tokens = min(int(prof.get("max_tokens", 1024) or 1024), 256)
-        await client.messages.create(
-            model=prof["model"],
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+        await provider.ping(max_tokens=max_tokens)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=502,
@@ -856,7 +779,7 @@ async def api_llm_profiles_test(name: str, _: str = Depends(_check_auth)):
         ) from e
     finally:
         try:
-            await client.close()
+            await provider.close()
         except Exception:  # noqa: BLE001
             pass
     return {"ok": True, "latency_ms": int((time.monotonic() - t0) * 1000)}
