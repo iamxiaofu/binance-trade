@@ -84,6 +84,8 @@ class PositionSnapshot(BaseModel):
     size: float | None = None
     unrealized_pnl_pct: float | None = None
     current_leverage: int | None = None
+    sl_price: float | None = None   # 当前交易所挂单的止损触发价（无则 None）
+    tp_price: float | None = None   # 当前交易所挂单的止盈触发价（无则 None）
 
 
 class MarketContext(BaseModel):
@@ -124,6 +126,7 @@ class Action(str, Enum):
     OPEN_SHORT = "OPEN_SHORT"
     CLOSE = "CLOSE"
     HOLD = "HOLD"
+    ADJUST_SLTP = "ADJUST_SLTP"   # 已有持仓时调整止盈止损，不平仓
 
 
 class TradeDecision(BaseModel):
@@ -147,15 +150,17 @@ class TradeDecision(BaseModel):
     stop_loss_pct: float = Field(
         ge=0.0, le=1.0,
         description=(
-            "相对参考开仓价的价格止损距离小数，不是保证金比例或权益比例；"
+            "相对基准价的价格止损距离小数，不是保证金比例或权益比例；"
             "百分比=小数×100；0.012 必须解释为 1.20% 价格距离。"
+            "OPEN 时基准价=entry_ref；ADJUST_SLTP 时基准价=当前标记价 mark。"
         ),
     )
     take_profit_pct: float = Field(
         ge=0.0, le=1.0,
         description=(
-            "相对参考开仓价的价格止盈距离小数，不是保证金比例或权益比例；"
+            "相对基准价的价格止盈距离小数，不是保证金比例或权益比例；"
             "百分比=小数×100；0.02 必须解释为 2.00% 价格距离。"
+            "OPEN 时基准价=entry_ref；ADJUST_SLTP 时基准价=当前标记价 mark。"
         ),
     )
     reason: str = Field(
@@ -177,6 +182,10 @@ class TradeDecision(BaseModel):
     @property
     def is_open(self) -> bool:
         return self.action in (Action.OPEN_LONG, Action.OPEN_SHORT)
+
+    @property
+    def is_adjust(self) -> bool:
+        return self.action == Action.ADJUST_SLTP
 
     @classmethod
     def safe_hold(cls, symbol: str, reason: str) -> "TradeDecision":

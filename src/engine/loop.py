@@ -1890,6 +1890,16 @@ class TradingEngine:
             )
             return
         position = build_position_snapshot(self.runtime.positions.get(symbol))
+        if position.has_position:
+            try:
+                active_orders = await self._active_protection_orders(symbol)
+                for order in active_orders:
+                    if order["kind"] == "SL" and order.get("trigger_price"):
+                        position.sl_price = float(order["trigger_price"])
+                    elif order["kind"] == "TP" and order.get("trigger_price"):
+                        position.tp_price = float(order["trigger_price"])
+            except Exception as _e:
+                logger.debug("fetch protection orders for snapshot failed {}: {}", symbol, _e)
         higher_tf = await self._fetch_higher_tf_safe(symbol)
         micro_klines = await self._fetch_micro_klines_safe(symbol)
         leader_snapshot = await self._get_cycle_leader_snapshot(symbol)
@@ -1997,6 +2007,9 @@ class TradingEngine:
             await self._handle_close(symbol)
             return
         if decision.action == Action.HOLD:
+            return
+        if decision.action == Action.ADJUST_SLTP:
+            await self._handle_adjust_sltp(decision, ctx)
             return
 
         # 3. 风控逐项校验
@@ -2236,6 +2249,133 @@ class TradingEngine:
             )
 
     # ---------- 辅助 ----------
+
+    async def _handle_adjust_sltp(self, decision: "TradeDecision", ctx: "MarketContext") -> None:
+        """LLM 决策 ADJUST_SLTP：撤旧条件单、按标记价和新 pct 重挂。不平仓。"""
+        symbol = decision.symbol
+        position = await self._fetch_exchange_position(symbol)
+        if position is None:
+            logger.info("[{}] ADJUST_SLTP: 交易所无持仓，忽略", symbol)
+            return
+
+        side = position["side"]
+        qty = float(position["contracts"] or 0.0)
+        entry = float(position["entry_price"] or 0.0)
+        mark = await self._current_mark_price(symbol, position)
+        if side not in ("long", "short") or qty <= 0 or entry <= 0 or mark <= 0:
+            logger.warning("[{}] ADJUST_SLTP: 持仓数据不完整，跳过", symbol)
+            return
+
+        is_long = side == "long"
+        filters = self._client.filters(symbol)
+        equity = await self._current_equity()
+
+        # 用标记价作为基准计算新触发价
+        specs: list[tuple[str, str, float]] = []
+        rejected: list[str] = []
+        for kind, pct, otype in (
+            ("SL", decision.stop_loss_pct, "STOP_MARKET"),
+            ("TP", decision.take_profit_pct, "TAKE_PROFIT_MARKET"),
+        ):
+            if pct <= 0:
+                continue
+            raw_trigger = (
+                mark * (1 - pct) if (kind == "SL") == is_long else mark * (1 + pct)
+            )
+            trigger = float(round_price(raw_trigger, filters))
+            reason = self._validate_adjust_trigger(
+                symbol=symbol, side=side, kind=kind,
+                trigger=trigger, entry=entry, mark=mark,
+                qty=qty, equity=equity,
+            )
+            if reason:
+                rejected.append(f"{kind}@{trigger:.4f}: {reason}")
+                continue
+            specs.append((kind, otype, trigger))
+
+        if not specs:
+            logger.warning("[{}] ADJUST_SLTP: 全部触发价校验失败 {}", symbol, rejected)
+            return
+
+        # 先校验完再撤旧单，降低裸奔风险
+        remaining = await self._cancel_symbol_condition_orders(symbol, reason="adjust_sltp")
+        if remaining:
+            details = ", ".join(self._condition_order_label(o) for o in remaining)
+            logger.warning("[{}] ADJUST_SLTP: 部分旧条件单未撤成功: {}，仍尝试补挂", symbol, details)
+
+        results = await self._executor.place_protection_orders(
+            symbol=symbol, pos_side=side, qty=qty, specs=specs,
+        )
+        for order in results:
+            await self._store.log_order(order)
+
+        placed = [f"{o['kind']}@{float(o.get('price') or o.get('trigger_price') or 0):.4f}"
+                  for o in results if o.get("status") == "placed"]
+        failed = [f"{o.get('kind')}:{(o.get('raw') or {}).get('error') or o.get('status')}"
+                  for o in results if o.get("status") != "placed"]
+
+        self.runtime.mark_order_event(symbol)
+        logger.warning(
+            "ADJUST_SLTP {} side={} mark={} placed={} failed={} rejected={}",
+            symbol, side, mark, placed, failed, rejected,
+        )
+
+        # SL 挂单失败 → 持仓无保护，禁用该标的并尝试紧急平仓
+        sl_failed = decision.stop_loss_pct > 0 and not any(
+            o.get("kind") == "SL" and o.get("status") == "placed" for o in results
+        )
+        if sl_failed:
+            await self._disable_symbol_due_protection_failure(
+                symbol, f"ADJUST_SLTP SL place failed: {failed}"
+            )
+            await self._emergency_close_unprotected_position(
+                symbol, reason="ADJUST_SLTP SL not placed"
+            )
+
+    def _validate_adjust_trigger(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        kind: str,
+        trigger: float,
+        entry: float,
+        mark: float,
+        qty: float,
+        equity: float,
+    ) -> str:
+        """校验 ADJUST_SLTP 触发价。基准是 mark（允许止损移至盈利侧）。"""
+        if trigger <= 0 or mark <= 0 or qty <= 0:
+            return "价格或数量无效"
+        if side == "long":
+            if kind == "SL" and trigger >= mark:
+                return f"多单止损必须低于当前标记价 {mark:.4f}"
+            if kind == "TP" and trigger <= mark:
+                return f"多单止盈必须高于当前标记价 {mark:.4f}"
+        elif side == "short":
+            if kind == "SL" and trigger <= mark:
+                return f"空单止损必须高于当前标记价 {mark:.4f}"
+            if kind == "TP" and trigger >= mark:
+                return f"空单止盈必须低于当前标记价 {mark:.4f}"
+        else:
+            return f"未知持仓方向 {side}"
+
+        # SL：理论亏损上限校验（以 entry 为基准计算实际亏损）
+        if kind == "SL" and equity > 0:
+            loss = (entry - trigger) * qty if side == "long" else (trigger - entry) * qty
+            if loss < 0:
+                # 止损在盈利侧（loss<0 表示锁利），直接通过
+                pass
+            else:
+                max_loss = equity * (self._settings.risk.max_loss_per_trade_pct / 100.0)
+                if max_loss > 0 and loss > max_loss:
+                    return (
+                        f"理论止损亏损 {loss:.2f} USDT 超过上限 {max_loss:.2f} USDT "
+                        f"({self._settings.risk.max_loss_per_trade_pct}% of {equity:.2f})"
+                    )
+        return ""
+
+
     def _mark_recent_explicit_close(self, symbol: str) -> None:
         self._recent_explicit_closes[normalize_symbol(symbol)] = (
             time.monotonic() + _POST_CLOSE_RECONCILE_GRACE_SECONDS

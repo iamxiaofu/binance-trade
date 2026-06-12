@@ -94,7 +94,7 @@ def test_prompt_includes_risk_reason_discipline():
     assert "0.02 必须写为 2.00%" in prompt
     assert "OPEN_LONG: SL=entry_ref×(1-stop_loss_pct)" in prompt
     assert "OPEN_SHORT: SL=entry_ref×(1+stop_loss_pct)" in prompt
-    assert "实际成交后系统会用交易所实际 entry_price 重算保护单" in prompt
+    assert "实际成交后系统会用交易所实际价格重算保护单" in prompt
     assert "sl_loss≈notional×stop_loss_pct" in prompt
     assert "equity_loss_pct≈sl_loss÷账户权益×100" in prompt
     assert "R≈tp_profit÷sl_loss" in prompt
