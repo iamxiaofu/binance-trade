@@ -75,6 +75,7 @@ const decisionTypeOptions = [
   { label: '建议开空', value: 'OPEN_SHORT' },
   { label: '建议平仓', value: 'CLOSE' },
   { label: '继续观望', value: 'HOLD' },
+  { label: '调整止盈止损', value: 'ADJUST_SLTP' },
 ]
 
 const symbolOptions = computed(() => cfg.value?.symbols || [])

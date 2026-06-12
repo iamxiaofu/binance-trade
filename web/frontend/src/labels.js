@@ -11,6 +11,7 @@ export function decisionLabel(action, skipped = false) {
     OPEN_SHORT: '建议开空',
     CLOSE: '建议平仓',
     HOLD: '继续观望',
+    ADJUST_SLTP: '调整止盈止损',
   }[action] || action || '—'
 }
 
@@ -21,6 +22,7 @@ export function decisionTagType(action, skipped = false) {
     OPEN_SHORT: 'danger',
     CLOSE: 'primary',
     HOLD: 'warning',
+    ADJUST_SLTP: 'primary',
   }[action] || 'info'
 }
 

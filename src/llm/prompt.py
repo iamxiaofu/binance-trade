@@ -30,6 +30,7 @@ SYSTEM_PROMPT = """\
      ⚠ ADJUST_SLTP 时 stop_loss_pct / take_profit_pct 以**当前标记价 mark** 为基准：
        多单: SL = mark×(1−stop_loss_pct)，TP = mark×(1+take_profit_pct)
        空单: SL = mark×(1+stop_loss_pct)，TP = mark×(1−take_profit_pct)
+     leverage / size_pct 填占位值（如 leverage=1, size_pct=0），系统不读取，不会修改仓位杠杆。
      无持仓时 ADJUST_SLTP 将被忽略，请改用 HOLD。
 3. 多周期共振(高周期与当前周期方向一致)时机会更可靠，可给更高 confidence。
 4. 关注量价配合：放量突破比缩量更可信；背离需警惕。
