@@ -1,11 +1,12 @@
-"""Claude API 决策客户端：强制结构化输出 + 超时/重试 → 失败降级 HOLD。
+"""Claude/OpenAI 兼容 决策客户端：强制结构化输出 + 超时/重试 → 失败降级 HOLD。
 
 关键纪律：
-- 用 Anthropic tool-use 强制 LLM 以 ``submit_decision`` 工具返回，schema 来自
-  ``TradeDecision``，配合 ``tool_choice`` 强制调用，杜绝自由文本。
+- provider 层（``src.llm.providers``）用 tool-use / function-calling 强制 LLM 以
+  ``submit_decision`` 工具返回，schema 来自 ``TradeDecision``，杜绝自由文本。
 - 任何异常（超时、网络、解析失败、字段越界）都不抛给上层，统一返回
   ``TradeDecision.safe_hold(...)`` —— 绝不带病下单。
 - LLM 永远拿不到任何密钥；client 只接收已构建好的 prompt。
+- 单个 client 只对接「一个源」；主备故障转移由 ``LLMFailoverClient`` 在外层串接。
 """
 from __future__ import annotations
 
@@ -16,15 +17,13 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from anthropic import AsyncAnthropic
 from loguru import logger
-from pydantic import ValidationError
 
 from src.config.schema import LLMConfig
 from src.llm.prompt import SYSTEM_PROMPT, build_user_prompt
+from src.llm.providers import build_provider
+from src.llm.providers._schema import _TOOL_NAME  # noqa: F401  (向后兼容导出)
 from src.llm.schema import MarketContext, TradeDecision
-
-_TOOL_NAME = "submit_decision"
 
 
 @dataclass
@@ -42,6 +41,10 @@ class LLMTrace:
     status: str = ""
     # 失败原因(成功时为空)。
     error: str = ""
+    # 实际给出决策的对接源名（fallback 链里可能不是主源）。
+    source_name: str = ""
+    # 是否走了备源兜底（主源失败后由备源给出）。
+    fallback_used: bool = False
 
 
 def _jsonable(value: Any) -> Any:
@@ -66,18 +69,6 @@ def _dump_json(value: Any) -> str:
     return json.dumps(_jsonable(value), ensure_ascii=False, default=str)
 
 
-def _build_tool() -> dict:
-    """用 TradeDecision 的 JSON Schema 构造 Anthropic tool 定义。"""
-    schema = TradeDecision.model_json_schema()
-    # Anthropic input_schema 需要 type=object；移除 pydantic 特有的 $defs 引用问题
-    schema.pop("title", None)
-    return {
-        "name": _TOOL_NAME,
-        "description": "提交本周期对该标的的结构化交易决策。必须调用本工具。",
-        "input_schema": schema,
-    }
-
-
 class _LLMRuntime:
     """LLMClient 运行时视图：仅暴露 ``decide_with_trace`` 真正用到的字段。
 
@@ -85,8 +76,9 @@ class _LLMRuntime:
     避免在 LLMClient 内部做两套路径。
     """
 
-    def __init__(self, *, model, max_tokens, max_retries, timeout, base_url,
+    def __init__(self, *, provider, model, max_tokens, max_retries, timeout, base_url,
                  kline_interval, prompt_kline_count, micro_kline_lookback):
+        self.provider = provider
         self.model = model
         self.max_tokens = max_tokens
         self.max_retries = max_retries
@@ -99,6 +91,7 @@ class _LLMRuntime:
     @classmethod
     def from_config(cls, cfg: LLMConfig) -> "_LLMRuntime":
         return cls(
+            provider=cfg.provider,
             model=cfg.model,
             max_tokens=cfg.max_tokens,
             max_retries=cfg.max_retries,
@@ -113,6 +106,7 @@ class _LLMRuntime:
     def from_profile(cls, profile: dict, engine_cfg: LLMConfig) -> "_LLMRuntime":
         """profile 来自 llm_profiles 表，``engine_cfg`` 提供不变的工程参数。"""
         return cls(
+            provider=profile.get("provider") or "anthropic",
             model=profile["model"],
             max_tokens=int(profile["max_tokens"]),
             max_retries=int(profile["max_retries"]),
@@ -127,12 +121,13 @@ class _LLMRuntime:
 class LLMClient:
     def __init__(self, cfg: LLMConfig, api_key: str):
         self._cfg = _LLMRuntime.from_config(cfg)
-        # base_url 为空 → 官方 api.anthropic.com；否则指向 Anthropic 兼容中转端点。
-        kwargs = {"api_key": api_key, "timeout": cfg.timeout}
-        if cfg.base_url:
-            kwargs["base_url"] = cfg.base_url
-        self._client = AsyncAnthropic(**kwargs)
-        self._tool = _build_tool()
+        self._provider = build_provider(
+            self._cfg.provider,
+            model=self._cfg.model,
+            base_url=self._cfg.base_url,
+            api_key=api_key,
+            timeout=self._cfg.timeout,
+        )
 
     @classmethod
     def from_profile(
@@ -140,16 +135,18 @@ class LLMClient:
     ) -> "LLMClient":
         """从 profile dict + 工程 cfg 构造一个 LLMClient。
 
-        profile 字段：model/max_tokens/max_retries/timeout/base_url。
+        profile 字段：provider/model/max_tokens/max_retries/timeout/base_url。
         工程 cfg（kline_interval 等）由 engine 透传，保证 prompt 结构不变。
         """
         obj = cls.__new__(cls)
         obj._cfg = _LLMRuntime.from_profile(profile, engine_cfg)
-        kwargs = {"api_key": api_key, "timeout": obj._cfg.timeout}
-        if obj._cfg.base_url:
-            kwargs["base_url"] = obj._cfg.base_url
-        obj._client = AsyncAnthropic(**kwargs)
-        obj._tool = _build_tool()
+        obj._provider = build_provider(
+            obj._cfg.provider,
+            model=obj._cfg.model,
+            base_url=obj._cfg.base_url,
+            api_key=api_key,
+            timeout=obj._cfg.timeout,
+        )
         return obj
 
     async def decide(self, ctx: MarketContext) -> TradeDecision:
@@ -165,14 +162,9 @@ class LLMClient:
             prompt_kline_count=self._cfg.prompt_kline_count,
             micro_kline_count=self._cfg.micro_kline_lookback,
         )
-        request_payload = {
-            "model": self._cfg.model,
-            "max_tokens": self._cfg.max_tokens,
-            "system": SYSTEM_PROMPT,
-            "tools": [self._tool],
-            "tool_choice": {"type": "tool", "name": _TOOL_NAME},
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
+        request_payload = self._provider.request_payload(
+            system=SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=self._cfg.max_tokens
+        )
         trace = LLMTrace(
             user_prompt=user_prompt,
             request_json=_dump_json(request_payload),
@@ -184,7 +176,10 @@ class LLMClient:
         for attempt in range(self._cfg.max_retries + 1):
             try:
                 resp = await asyncio.wait_for(
-                    self._client.messages.create(**request_payload),
+                    self._provider.create(
+                        system=SYSTEM_PROMPT, user_prompt=user_prompt,
+                        max_tokens=self._cfg.max_tokens,
+                    ),
                     timeout=self._cfg.timeout,
                 )
                 attempts.append({"attempt": attempt + 1, "response": _jsonable(resp)})
@@ -228,22 +223,16 @@ class LLMClient:
         return decision, trace
 
     def _parse(self, resp, symbol: str) -> TradeDecision | None:
-        """从响应里取出 tool_use 输入并校验为 TradeDecision。失败返回 None。"""
-        for block in resp.content:
-            if getattr(block, "type", None) == "tool_use" and block.name == _TOOL_NAME:
-                try:
-                    decision = TradeDecision.model_validate(block.input)
-                    # 防止 LLM 把 symbol 写错
-                    if decision.symbol != symbol.upper():
-                        logger.warning(
-                            "LLM symbol mismatch {} vs {}, override", decision.symbol, symbol
-                        )
-                        decision = decision.model_copy(update={"symbol": symbol.upper()})
-                    return decision
-                except ValidationError as e:
-                    logger.warning("LLM decision validation failed {}: {}", symbol, e)
-                    return None
-        return None
+        """委托 provider 解析，并防止 LLM 把 symbol 写错。失败返回 None。"""
+        decision = self._provider.parse(resp, symbol)
+        if decision is None:
+            return None
+        if decision.symbol != symbol.upper():
+            logger.warning(
+                "LLM symbol mismatch {} vs {}, override", decision.symbol, symbol
+            )
+            decision = decision.model_copy(update={"symbol": symbol.upper()})
+        return decision
 
     async def close(self) -> None:
-        await self._client.close()
+        await self._provider.close()

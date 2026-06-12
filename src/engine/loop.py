@@ -3023,33 +3023,31 @@ class TradingEngine:
 
     # ---------- LLM profile 热替换 ----------
     async def _bootstrap_llm_profile(self) -> None:
-        """启动时把 DB 中 active profile 应用到 engine；首次启动时把 yaml 默认写一条。"""
+        """启动时把 DB 中 active profile（+备源）建成 fallback 链；首次启动写 yaml 默认。"""
         active = await self._store.get_active_llm_profile()
         if active is not None:
             try:
-                await self._apply_llm_profile(active, source="db")
+                await self._apply_llm_chain(source="db")
                 return
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "failed to apply stored active profile {}: {}; falling back to yaml",
-                    active.get("name"), e,
+                    "failed to build llm chain from stored profiles: {}; falling back to yaml", e,
                 )
         # 首次启动或 active profile 失效：把 yaml 默认写一条 default profile。
         s = self._settings.llm
         await self._ensure_default_profile_from_yaml(s, self._creds.anthropic_api_key)
 
     async def _ensure_default_profile_from_yaml(self, llm_cfg, api_key: str) -> None:
-        """把 yaml + 环境变量 keyring 写一条 default profile，标记 active。"""
-        from src.llm.keyring_store import get_keyring_store
-        ks, st = get_keyring_store()
-        if not st.get("available"):
-            logger.warning(
-                "keyring unavailable, skip writing default profile: {}", st
-            )
-            return
+        """把 yaml + 环境变量 api_key 写一条 default profile（明文入库），标记 active。
+
+        存量迁移落点：旧库 default profile 的 api_key 为空（原 keyring 模式，明文在 OS
+        钥匙串里取不回）时，用 .env 的 ANTHROPIC_API_KEY 回填明文。
+        """
         existing = await self._store.get_llm_profile("default")
-        if existing is None:
-            ref = ks.set("default", api_key)
+        existing_secret = ""
+        if existing is not None:
+            existing_secret = await self._store.get_llm_profile_secret("default")
+        if existing is None or not existing_secret:
             await self._store.upsert_llm_profile(
                 name="default",
                 provider=llm_cfg.provider,
@@ -3058,24 +3056,32 @@ class TradingEngine:
                 timeout=llm_cfg.timeout,
                 max_tokens=llm_cfg.max_tokens,
                 max_retries=llm_cfg.max_retries,
-                keyring_ref=ref,
+                api_key=api_key,
+                priority=0,
             )
         await self._store.activate_llm_profile("default")
-        active = await self._store.get_llm_profile("default")
-        assert active is not None
-        await self._apply_llm_profile(active, source="yaml-default")
+        await self._apply_llm_chain(source="yaml-default")
 
-    async def _apply_llm_profile(self, prof: dict, source: str) -> None:
-        """从 profile dict 构造新的 LLMClient，原子替换。"""
+    async def _build_llm_chain(self):
+        """按 priority 升序把 active 主源 + fallback_enabled 备源建成 LLMFailoverClient。"""
         from src.llm.client import LLMClient
-        from src.llm.keyring_store import get_keyring_store
-        ks, _ = get_keyring_store()
-        try:
-            api_key = ks.get(prof["keyring_ref"])
-        except (KeyError, KeyringUnavailable) as e:
-            raise RuntimeError(f"keyring 解密失败: {e}") from e
-        new_client = LLMClient.from_profile(prof, self._settings.llm, api_key)
-        await self._replace_llm_client(new_client, prof["name"], source=source)
+        from src.llm.failover import LLMFailoverClient
+        profiles = await self._store.get_enabled_llm_profiles()
+        chain: list[tuple[str, LLMClient]] = []
+        for prof in profiles:
+            api_key = await self._store.get_llm_profile_secret(prof["name"])
+            if not api_key:
+                logger.warning("llm profile {} has no api_key, skip in chain", prof["name"])
+                continue
+            chain.append((prof["name"], LLMClient.from_profile(prof, self._settings.llm, api_key)))
+        if not chain:
+            raise RuntimeError("no usable llm profile (missing api_key)")
+        return LLMFailoverClient(chain)
+
+    async def _apply_llm_chain(self, source: str) -> None:
+        """重建整条 fallback 链并原子替换。"""
+        new_chain = await self._build_llm_chain()
+        await self._replace_llm_client(new_chain, new_chain.primary_name, source=source)
 
     async def _replace_llm_client(
         self, new_client, name: str, source: str
@@ -3091,11 +3097,13 @@ class TradingEngine:
         except Exception as e:  # noqa: BLE001
             logger.warning("old LLMClient close failed: {}", e)
         # 把 version/name 写到 runtime_settings，web 进程能感知"是否真的热替换了"。
+        chain_names = getattr(new_client, "source_names", [name])
         try:
             await self._store.set_runtime_settings({
                 "llm.active_name": name,
                 "llm.active_version": str(self._llm_version),
                 "llm.active_source": source,
+                "llm.chain": ",".join(chain_names),
             })
         except Exception as e:  # noqa: BLE001
             logger.warning("failed to persist LLM active runtime settings: {}", e)
@@ -3104,13 +3112,13 @@ class TradingEngine:
             await self._store.log_audit(
                 symbol="__LLM_SWITCH__",
                 action="LLM_SWITCH",
-                reason=f"profile: {name} (source={source})",
+                reason=f"profile: {name} chain={chain_names} (source={source})",
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("failed to log LLM switch audit: {}", e)
         logger.warning(
-            "LLM profile switched: name={} source={} version={}",
-            name, source, self._llm_version,
+            "LLM profile switched: name={} chain={} source={} version={}",
+            name, chain_names, source, self._llm_version,
         )
 
     async def _switch_llm_profile(self, arg: str) -> str:
@@ -3120,12 +3128,6 @@ class TradingEngine:
         prof = await self._store.get_llm_profile(name)
         if prof is None:
             raise ValueError(f"llm profile not found: {name!r}")
-        from src.llm.keyring_store import get_keyring_store
-        ks, st = get_keyring_store()
-        if not st.get("available"):
-            raise ValueError(
-                f"keyring backend unavailable: {st.get('hint') or st.get('backend')}"
-            )
-        # db 里已经由 web 端 activate 过；这里就是读 → 构造 → 替换
-        await self._apply_llm_profile(prof, source="command")
+        # db 里已经由 web 端 activate 过；这里重建整条 fallback 链 → 替换。
+        await self._apply_llm_chain(source="command")
         return f"llm profile switched: {name} (version={self._llm_version})"

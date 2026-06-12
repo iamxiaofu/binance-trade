@@ -2,6 +2,7 @@
 # 注意：代码已弃用 pandas-ta（改用纯 pandas/numpy 实现指标），故不在此列出。
 ccxt==4.5.56
 anthropic==0.105.2
+openai==2.41.1
 pydantic==2.13.4
 PyYAML==6.0.3
 pandas==3.0.3

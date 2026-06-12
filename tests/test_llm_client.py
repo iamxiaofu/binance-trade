@@ -1,13 +1,12 @@
-"""LLM 客户端解析与降级测试（不发真实网络请求）。"""
+"""LLM 客户端解析与降级测试（不发真实网络请求，注入 FakeProvider）。"""
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
 from src.config.schema import LLMConfig
-from src.llm.client import LLMClient, _TOOL_NAME
+from src.llm.client import LLMClient
 from src.llm.schema import Action, IndicatorSnapshot, MarketContext, PositionSnapshot
 
 
@@ -31,101 +30,109 @@ def _ctx(symbol="BTCUSDT") -> MarketContext:
     )
 
 
-def _tool_use_block(payload: dict):
-    return SimpleNamespace(type="tool_use", name=_TOOL_NAME, input=payload)
+class _FakeProvider:
+    """注入式 provider：可指定返回 payload、抛错或超时。"""
+
+    name = "fake"
+    model = "fake-model"
+
+    def __init__(self, *, payload=None, exc=None, delay=0.0):
+        self._payload = payload
+        self._exc = exc
+        self._delay = delay
+
+    def request_payload(self, *, system, user_prompt, max_tokens):
+        return {"messages": [{"role": "user", "content": user_prompt}], "model": self.model}
+
+    async def create(self, *, system, user_prompt, max_tokens):
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        if self._exc:
+            raise self._exc
+        return {"payload": self._payload}
+
+    def parse(self, resp, expected_symbol):
+        from pydantic import ValidationError
+        from src.llm.schema import TradeDecision
+        if self._payload is None:
+            return None
+        try:
+            return TradeDecision.model_validate(self._payload)
+        except ValidationError:
+            return None
+
+    async def ping(self, *, max_tokens=16):
+        return None
+
+    async def close(self):
+        return None
 
 
-def _resp(*blocks):
-    return SimpleNamespace(content=list(blocks))
+def _client_with(provider) -> LLMClient:
+    client = LLMClient(_cfg(), api_key="x")
+    client._provider = provider
+    return client
+
+
+_GOOD = {
+    "symbol": "BTCUSDT", "action": "HOLD", "confidence": 0.5,
+    "size_pct": 0, "leverage": 1, "stop_loss_pct": 0,
+    "take_profit_pct": 0, "reason": "ok",
+}
 
 
 def test_parse_valid_decision():
-    client = LLMClient(_cfg(), api_key="x")
-    payload = {
-        "symbol": "BTCUSDT", "action": "OPEN_LONG", "confidence": 0.8,
-        "size_pct": 0.1, "leverage": 2, "stop_loss_pct": 0.02,
-        "take_profit_pct": 0.04, "reason": "uptrend",
-    }
-    d = client._parse(_resp(_tool_use_block(payload)), "BTCUSDT")
+    payload = {**_GOOD, "action": "OPEN_LONG", "confidence": 0.8,
+               "size_pct": 0.1, "leverage": 2, "stop_loss_pct": 0.02,
+               "take_profit_pct": 0.04, "reason": "uptrend"}
+    client = _client_with(_FakeProvider(payload=payload))
+    d = client._parse({"x": 1}, "BTCUSDT")
     assert d is not None and d.action is Action.OPEN_LONG
 
 
 def test_parse_invalid_returns_none():
-    client = LLMClient(_cfg(), api_key="x")
     bad = {"symbol": "BTCUSDT", "action": "OPEN_LONG", "confidence": 5}  # 越界+缺字段
-    assert client._parse(_resp(_tool_use_block(bad)), "BTCUSDT") is None
+    client = _client_with(_FakeProvider(payload=bad))
+    assert client._parse({"x": 1}, "BTCUSDT") is None
 
 
 def test_parse_symbol_mismatch_overridden():
-    client = LLMClient(_cfg(), api_key="x")
-    payload = {
-        "symbol": "ETHUSDT", "action": "HOLD", "confidence": 0.5,
-        "size_pct": 0, "leverage": 1, "stop_loss_pct": 0,
-        "take_profit_pct": 0, "reason": "x",
-    }
-    d = client._parse(_resp(_tool_use_block(payload)), "BTCUSDT")
+    payload = {**_GOOD, "symbol": "ETHUSDT"}
+    client = _client_with(_FakeProvider(payload=payload))
+    d = client._parse({"x": 1}, "BTCUSDT")
     assert d.symbol == "BTCUSDT"  # 被纠正
 
 
-def test_decide_degrades_to_hold_on_error(monkeypatch):
-    """messages.create 抛错 → decide 返回 safe_hold(HOLD)。"""
-    client = LLMClient(_cfg(max_retries=1), api_key="x")
-
-    async def boom(*a, **k):
-        raise RuntimeError("network down")
-
-    monkeypatch.setattr(client._client.messages, "create", boom)
+def test_decide_degrades_to_hold_on_error():
+    """provider.create 抛错 → decide 返回 safe_hold(HOLD)。"""
+    client = _client_with(_FakeProvider(exc=RuntimeError("network down")))
     d = asyncio.run(client.decide(_ctx()))
     assert d.action is Action.HOLD
     assert "[degraded]" in d.reason
 
 
-def test_decide_degrades_on_timeout(monkeypatch):
-    client = LLMClient(_cfg(max_retries=0), api_key="x")
-
-    async def slow(*a, **k):
-        await asyncio.sleep(10)
-
-    monkeypatch.setattr(client._client.messages, "create", slow)
-    # 把超时压到极短
+def test_decide_degrades_on_timeout():
+    client = _client_with(_FakeProvider(delay=10))
     client._cfg = _cfg(max_retries=0).model_copy(update={"timeout": 0.05})
     d = asyncio.run(client.decide(_ctx()))
     assert d.action is Action.HOLD
 
 
-def test_decide_with_trace_records_request_and_response(monkeypatch):
-    client = LLMClient(_cfg(max_retries=0), api_key="x")
-    payload = {
-        "symbol": "BTCUSDT", "action": "HOLD", "confidence": 0.4,
-        "size_pct": 0, "leverage": 1, "stop_loss_pct": 0,
-        "take_profit_pct": 0, "reason": "mixed",
-    }
-
-    async def ok(*a, **k):
-        return _resp(_tool_use_block(payload))
-
-    monkeypatch.setattr(client._client.messages, "create", ok)
+def test_decide_with_trace_records_request_and_response():
+    payload = {**_GOOD, "confidence": 0.4, "reason": "mixed"}
+    client = _client_with(_FakeProvider(payload=payload))
+    client._cfg = _cfg(max_retries=0)
     decision, trace = asyncio.run(client.decide_with_trace(_ctx()))
-
     assert decision.action is Action.HOLD
     assert "标的: BTCUSDT" in trace.user_prompt
     assert '"messages"' in trace.request_json
     assert '"final_decision"' in trace.response_json
 
 
-def test_decide_with_trace_records_latency_and_status(monkeypatch):
-    client = LLMClient(_cfg(max_retries=0), api_key="x")
-
-    async def fast(*a, **k):
-        await asyncio.sleep(0.05)
-        payload = {
-            "symbol": "BTCUSDT", "action": "HOLD", "confidence": 0.5,
-            "size_pct": 0, "leverage": 1, "stop_loss_pct": 0,
-            "take_profit_pct": 0, "reason": "ok",
-        }
-        return _resp(_tool_use_block(payload))
-
-    monkeypatch.setattr(client._client.messages, "create", fast)
+def test_decide_with_trace_records_latency_and_status():
+    payload = {**_GOOD}
+    client = _client_with(_FakeProvider(payload=payload, delay=0.05))
+    client._cfg = _cfg(max_retries=0)
     decision, trace = asyncio.run(client.decide_with_trace(_ctx()))
     assert decision.action is Action.HOLD
     assert trace.status == "ok"
@@ -134,13 +141,9 @@ def test_decide_with_trace_records_latency_and_status(monkeypatch):
     assert trace.error == ""
 
 
-def test_decide_with_trace_marks_degraded_after_retries(monkeypatch):
-    client = LLMClient(_cfg(max_retries=2), api_key="x")
-
-    async def boom(*a, **k):
-        raise RuntimeError("net down")
-
-    monkeypatch.setattr(client._client.messages, "create", boom)
+def test_decide_with_trace_marks_degraded_after_retries():
+    client = _client_with(_FakeProvider(exc=RuntimeError("net down")))
+    client._cfg = _cfg(max_retries=2)
     decision, trace = asyncio.run(client.decide_with_trace(_ctx()))
     assert decision.action is Action.HOLD
     assert trace.status == "degraded"

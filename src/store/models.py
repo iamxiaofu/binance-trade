@@ -268,10 +268,11 @@ class RuntimeSettingRow(Base):
 
 
 class LLMProfileRow(Base):
-    """运行期可热替换的 LLM profile 表。
+    """运行期可热替换的 LLM 对接源 profile 表。
 
-    key 通过 keyring_ref 引用，明文不落库；同一时刻 is_active 只能有 1 个，
-    由 Store 写事务保证。
+    - ``api_key`` 明文存库（单租户自托管，DB 文件权限即边界；迁移=直接拷 sqlite）。
+    - 同一时刻 ``is_active`` 只能有 1 个（主源/链头），由 Store 写事务保证。
+    - ``priority`` 升序决定 fallback 链尝试顺序；``fallback_enabled`` 标记备源是否入链。
     """
     __tablename__ = "llm_profiles"
 
@@ -283,8 +284,12 @@ class LLMProfileRow(Base):
     max_tokens: Mapped[int] = mapped_column(Integer, default=1024)
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    # keyring 引用，格式 "profile://<service>/<name>"，明文不写库
+    # API key 明文（不再走 keyring）。旧库遗留的 keyring_ref 列保留但不再读写。
+    api_key: Mapped[str] = mapped_column(Text, default="")
     keyring_ref: Mapped[str] = mapped_column(String(200), default="")
+    # fallback 链：priority 升序优先；fallback_enabled 决定备源是否入链。
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    fallback_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
     updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
 

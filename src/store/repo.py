@@ -94,6 +94,11 @@ _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("llm_status", "VARCHAR(16) NOT NULL DEFAULT ''"),
     ("llm_error", "VARCHAR(200) NOT NULL DEFAULT ''"),
 )
+_LLM_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("api_key", "TEXT NOT NULL DEFAULT ''"),
+    ("priority", "INTEGER NOT NULL DEFAULT 100"),
+    ("fallback_enabled", "INTEGER NOT NULL DEFAULT 0"),
+)
 _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_decisions_ts_id ON decisions(ts_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_decisions_symbol_ts_id ON decisions(symbol, ts_ms DESC, id DESC)",
@@ -356,6 +361,13 @@ class Store:
         for name, ddl in _DECISION_EXTENSION_COLUMNS:
             if decision_existing and name not in decision_existing:
                 await conn.execute(text(f"ALTER TABLE decisions ADD COLUMN {name} {ddl}"))
+        llm_profile_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(llm_profiles)"))).fetchall()
+        }
+        for name, ddl in _LLM_PROFILE_COLUMNS:
+            if llm_profile_existing and name not in llm_profile_existing:
+                await conn.execute(text(f"ALTER TABLE llm_profiles ADD COLUMN {name} {ddl}"))
         for ddl in _SQLITE_INDEX_DDL:
             await conn.execute(text(ddl))
 
@@ -1825,31 +1837,37 @@ class Store:
 
     # ---------- LLM profile 持久化 ----------
     # 设计要点：
-    # - key 通过 keyring_ref 引用，明文不落库；调用方负责先写 keyring 再 upsert。
+    # - api_key 明文存库（单租户自托管）；对外视图脱敏（key_present + 末4位 mask）。
     # - 同一时刻 is_active 只能为 True，由 upsert_llm_profile + activate_llm_profile 事务保证。
     # - list/get/activate 永远不返回 key 明文（key 也不在 ORM 字段里）。
     async def list_llm_profiles(self) -> list[dict[str, Any]]:
-        """返回全部 LLM profile（不含 key 明文，key_present 仅表示是否存了 keyring）。"""
+        """返回全部 LLM profile（不含 key 明文，仅 key_present + 末4位 mask）。"""
         async with self._sessionmaker() as session:
             rows = (await session.execute(
                 select(LLMProfileRow).order_by(LLMProfileRow.name)
             )).scalars().all()
-            return [
-                {
-                    "name": r.name,
-                    "provider": r.provider,
-                    "model": r.model,
-                    "base_url": r.base_url or "",
-                    "timeout": r.timeout,
-                    "max_tokens": r.max_tokens,
-                    "max_retries": r.max_retries,
-                    "is_active": bool(r.is_active),
-                    "key_present": bool(r.keyring_ref),
-                    "created_at": r.created_at,
-                    "updated_at": r.updated_at,
-                }
-                for r in rows
-            ]
+            return [self._profile_public(r) for r in rows]
+
+    @staticmethod
+    def _profile_public(r: LLMProfileRow) -> dict[str, Any]:
+        """对外可见的 profile 视图：脱敏 key（绝不返明文）。"""
+        api_key = r.api_key or ""
+        return {
+            "name": r.name,
+            "provider": r.provider,
+            "model": r.model,
+            "base_url": r.base_url or "",
+            "timeout": r.timeout,
+            "max_tokens": r.max_tokens,
+            "max_retries": r.max_retries,
+            "is_active": bool(r.is_active),
+            "priority": r.priority,
+            "fallback_enabled": bool(r.fallback_enabled),
+            "key_present": bool(api_key),
+            "api_key_mask": ("****" + api_key[-4:]) if len(api_key) >= 4 else ("****" if api_key else ""),
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }
 
     async def get_llm_profile(self, name: str) -> dict[str, Any] | None:
         """获取单个 LLM profile（不含 key 明文）。"""
@@ -1857,21 +1875,32 @@ class Store:
             r = await session.get(LLMProfileRow, name)
             if r is None:
                 return None
-            return {
-                "name": r.name,
-                "provider": r.provider,
-                "model": r.model,
-                "base_url": r.base_url or "",
-                "timeout": r.timeout,
-                "max_tokens": r.max_tokens,
-                "max_tokens": r.max_tokens,
-                "max_retries": r.max_retries,
-                "is_active": bool(r.is_active),
-                "keyring_ref": r.keyring_ref,
-                "key_present": bool(r.keyring_ref),
-                "created_at": r.created_at,
-                "updated_at": r.updated_at,
-            }
+            return self._profile_public(r)
+
+    async def get_llm_profile_secret(self, name: str) -> str:
+        """读取明文 api_key —— 仅 engine 建链 / web test 端点内部使用，绝不进 HTTP 响应。"""
+        async with self._sessionmaker() as session:
+            r = await session.get(LLMProfileRow, name)
+            if r is None:
+                raise KeyError(f"llm profile not found: {name!r}")
+            return r.api_key or ""
+
+    async def get_enabled_llm_profiles(self) -> list[dict[str, Any]]:
+        """返回 fallback 链：active 主源 + 所有 fallback_enabled 备源。
+
+        排序：priority 升序 → is_active 优先 → name。主源 activate 时 priority 置 0，恒为链头。
+        """
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(
+                select(LLMProfileRow).where(
+                    (LLMProfileRow.is_active == True) |  # noqa: E712
+                    (LLMProfileRow.fallback_enabled == True)  # noqa: E712
+                )
+            )).scalars().all()
+            ordered = sorted(
+                rows, key=lambda r: (r.priority, 0 if r.is_active else 1, r.name)
+            )
+            return [self._profile_public(r) for r in ordered]
 
     async def upsert_llm_profile(
         self,
@@ -1883,14 +1912,13 @@ class Store:
         timeout: float,
         max_tokens: int,
         max_retries: int,
-        keyring_ref: str,
+        api_key: str = "",
+        priority: int = 100,
+        fallback_enabled: bool = False,
     ) -> dict[str, Any]:
         """插入或更新一条 profile。is_active 不会被这里修改。
 
-        调用方职责：
-        1) 先把 api_key 写进 keyring，得到 keyring_ref；
-        2) 再调本方法落 DB；
-        3) 写失败时记得把 keyring 项删掉。
+        ``api_key`` 留空表示不更新（PUT 不改 key 语义）；非空才覆盖。
         """
         import time as _t
         now = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
@@ -1905,7 +1933,9 @@ class Store:
                     timeout=timeout,
                     max_tokens=max_tokens,
                     max_retries=max_retries,
-                    keyring_ref=keyring_ref,
+                    api_key=api_key,
+                    priority=priority,
+                    fallback_enabled=fallback_enabled,
                     is_active=False,
                     created_at=now,
                     updated_at=now,
@@ -1918,9 +1948,11 @@ class Store:
                 row.timeout = timeout
                 row.max_tokens = max_tokens
                 row.max_retries = max_retries
+                row.priority = priority
+                row.fallback_enabled = fallback_enabled
                 # 留空表示不更新；非空才覆盖
-                if keyring_ref:
-                    row.keyring_ref = keyring_ref
+                if api_key:
+                    row.api_key = api_key
                 row.updated_at = now
             await session.commit()
             return await self.get_llm_profile(name)
@@ -1940,7 +1972,7 @@ class Store:
             return True
 
     async def activate_llm_profile(self, name: str) -> dict[str, Any]:
-        """把 is_active 标志从旧的切到 name；事务内互斥。
+        """把 is_active 标志从旧的切到 name；事务内互斥。新主源 priority 置 0 恒为链头。
 
         返回新的 active profile（不含 key 明文）。
         找不到 name 时抛 ValueError，事务回滚。
@@ -1960,6 +1992,7 @@ class Store:
                     r.is_active = False
                     r.updated_at = now
             target.is_active = True
+            target.priority = 0
             target.updated_at = now
             await session.commit()
         prof = await self.get_llm_profile(name)
@@ -1974,20 +2007,7 @@ class Store:
             )).scalars().first()
             if row is None:
                 return None
-            return {
-                "name": row.name,
-                "provider": row.provider,
-                "model": row.model,
-                "base_url": row.base_url or "",
-                "timeout": row.timeout,
-                "max_tokens": row.max_tokens,
-                "max_retries": row.max_retries,
-                "is_active": True,
-                "keyring_ref": row.keyring_ref,
-                "key_present": bool(row.keyring_ref),
-                "created_at": row.created_at,
-                "updated_at": row.updated_at,
-            }
+            return self._profile_public(row)
 
 
     # ---------- 未完成挂单 ----------

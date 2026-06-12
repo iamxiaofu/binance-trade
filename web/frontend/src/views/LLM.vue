@@ -7,10 +7,10 @@ const loading = ref(false)
 // 状态/数据都给出"乐观默认"，避免 onMounted/refresh 时 ref=null 导致黄条闪动。
 // 后端首次响应回来后会整体覆盖；轮询用 Object.assign 局部更新，不会瞬时清空。
 const status = ref({
-  keyring: { backend: 'unknown', available: false, hint: '' },
   active: null,
-  switching_supported: false,
-  engine: { active_name: '', active_version: 0, active_source: '' },
+  switching_supported: true,
+  chain: [],
+  engine: { active_name: '', active_version: 0, active_source: '', chain: '' },
 })
 const profiles = ref([])
 const showDialog = ref(false)
@@ -30,19 +30,17 @@ function emptyForm() {
     timeout: 60,
     max_tokens: 1024,
     max_retries: 2,
+    priority: 100,
+    fallback_enabled: false,
     api_key: '',
   }
 }
 
-const keyringAvailable = computed(() => {
-  // status 默认值里 switching_supported=false，所以 firstLoaded=false 时 banner 不显示
-  // 真正响应回来后，后端返回的 switching_supported 才是权威值
-  return Boolean(status.value?.switching_supported)
-})
 const activeName = computed(() => status.value?.active?.name || '—')
 const engineActiveName = computed(() => status.value?.engine?.active_name || '—')
 const engineVersion = computed(() => status.value?.engine?.active_version ?? 0)
 const engineSource = computed(() => status.value?.engine?.active_source || '—')
+const engineChain = computed(() => status.value?.engine?.chain || '—')
 const engineSynced = computed(
   () => engineActiveName.value !== '—' && engineActiveName.value === activeName.value,
 )
@@ -77,6 +75,8 @@ function openEdit(p) {
     timeout: p.timeout,
     max_tokens: p.max_tokens,
     max_retries: p.max_retries,
+    priority: p.priority ?? 100,
+    fallback_enabled: !!p.fallback_enabled,
     api_key: '',  // 留空 = 不改
   }
   showDialog.value = true
@@ -185,30 +185,12 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
 
 <template>
   <div class="llm-page">
-    <el-alert
-      v-if="firstLoaded && !keyringAvailable"
-      type="warning"
-      :closable="false"
-      show-icon
-      class="banner"
-      :title="`keyring 后端不可用：${status.keyring?.backend || 'unknown'}`"
-    >
-      <template #default>
-        <div>当前 web 端切换功能被禁用。可用方案：</div>
-        <ol>
-          <li>安装 <code>python-keyring</code> + 系统 <code>libsecret-1</code>；或</li>
-          <li>设置环境变量 <code>LLM_KEYRING_MASTER_KEY</code>（urlsafe-b64 32B 或任意字符串）。</li>
-        </ol>
-        <div>重启 <code>binance-trade-web.service</code> 生效。</div>
-      </template>
-    </el-alert>
-
     <el-row :gutter="16" class="status-row">
       <el-col :span="8">
         <el-card shadow="never">
           <div class="stat-label">DB active</div>
           <div class="stat-value">{{ activeName }}</div>
-          <div class="stat-hint">llm_profiles.is_active=true</div>
+          <div class="stat-hint">llm_profiles.is_active=true（主源/链头）</div>
         </el-card>
       </el-col>
       <el-col :span="8">
@@ -224,12 +206,9 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
       </el-col>
       <el-col :span="8">
         <el-card shadow="never">
-          <div class="stat-label">keyring</div>
-          <div class="stat-value">{{ status?.keyring?.backend || '—' }}</div>
-          <div class="stat-hint">
-            <span v-if="keyringAvailable" style="color:#67c23a">可用</span>
-            <span v-else style="color:#e6a23c">不可用</span>
-          </div>
+          <div class="stat-label">Fallback 链</div>
+          <div class="stat-value" style="font-size:14px">{{ engineChain }}</div>
+          <div class="stat-hint">主源失败按 priority 升序兜底</div>
         </el-card>
       </el-col>
     </el-row>
@@ -238,7 +217,7 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
       <template #header>
         <div class="table-header">
           <span>LLM profiles</span>
-          <el-button type="primary" :disabled="!keyringAvailable" @click="openCreate">
+          <el-button type="primary" @click="openCreate">
             新增 profile
           </el-button>
         </div>
@@ -246,22 +225,28 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
 
       <el-table :data="profiles" v-loading="loading" stripe>
         <el-table-column prop="name" label="名称" min-width="120" />
-        <el-table-column prop="provider" label="provider" width="100" />
-        <el-table-column prop="model" label="model" min-width="180" />
-        <el-table-column label="base_url" min-width="200">
+        <el-table-column prop="provider" label="provider" width="140" />
+        <el-table-column prop="model" label="model" min-width="160" />
+        <el-table-column label="base_url" min-width="180">
           <template #default="{ row }">
             <span :title="row.base_url">{{ row.base_url || '(官方)' }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="timeout" label="timeout" width="80" />
-        <el-table-column prop="max_tokens" label="max_tokens" min-width="100" />
+        <el-table-column prop="priority" label="priority" width="80" />
+        <el-table-column label="备源" width="70">
+          <template #default="{ row }">
+            <el-tag v-if="row.fallback_enabled" type="warning" size="small">是</el-tag>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="key" width="80">
           <template #default="{ row }">
             <el-tag v-if="row.key_present" type="success" size="small">已存</el-tag>
             <el-tag v-else type="info" size="small">未设</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="120">
+        <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <el-tag v-if="row.is_active" type="success">active</el-tag>
             <el-tag v-else type="info" effect="plain">inactive</el-tag>
@@ -270,7 +255,7 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
         <el-table-column label="操作" min-width="280">
           <template #default="{ row }">
             <el-button
-              size="small" :disabled="row.is_active || !keyringAvailable"
+              size="small" :disabled="row.is_active"
               @click="activate(row)"
             >激活</el-button>
             <el-button
@@ -304,18 +289,36 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
           <el-input v-model="form.name" :disabled="!!editing" placeholder="例如 default / official / ikuncode" />
         </el-form-item>
         <el-form-item label="provider">
-          <el-select v-model="form.provider" disabled>
-            <el-option label="anthropic" value="anthropic" />
+          <el-select v-model="form.provider">
+            <el-option label="anthropic (Messages + tool_use)" value="anthropic" />
+            <el-option label="openai_compatible (chat/completions)" value="openai_compatible" />
           </el-select>
         </el-form-item>
         <el-form-item label="model">
-          <el-input v-model="form.model" placeholder="claude-opus-4-6" />
+          <el-input v-model="form.model" placeholder="claude-opus-4-6 / gpt-4o ..." />
         </el-form-item>
         <el-form-item label="base_url">
-          <el-input v-model="form.base_url" placeholder="留空 = 官方 api.anthropic.com" />
+          <el-input
+            v-model="form.base_url"
+            :placeholder="form.provider === 'openai_compatible'
+              ? '兼容网关地址，留空 = 官方 OpenAI'
+              : '留空 = 官方 api.anthropic.com'"
+          />
         </el-form-item>
         <el-form-item label="timeout (s)">
           <el-input-number v-model="form.timeout" :min="5" :max="300" />
+        </el-form-item>
+        <el-form-item label="priority">
+          <el-input-number v-model="form.priority" :min="0" :max="10000" />
+          <div style="font-size:12px; color:var(--el-text-color-placeholder); margin-left:8px">
+            升序优先；激活时主源自动置 0
+          </div>
+        </el-form-item>
+        <el-form-item label="备源">
+          <el-switch v-model="form.fallback_enabled" />
+          <div style="font-size:12px; color:var(--el-text-color-placeholder); margin-left:8px">
+            开启后并入 fallback 链，主源失败时按 priority 兜底
+          </div>
         </el-form-item>
         <el-form-item label="max_tokens">
           <el-input-number v-model="form.max_tokens" :min="64" :max="512000" :step="64" />

@@ -130,7 +130,7 @@ class RiskConfig(_Base):
 
 
 class LLMConfig(_Base):
-    provider: Literal["anthropic"] = "anthropic"
+    provider: Literal["anthropic", "openai_compatible"] = "anthropic"
     model: str
     # 可选：Anthropic 兼容的中转/代理端点(如自建网关或第三方中转)。
     # 留空 = 用 Anthropic 官方 api.anthropic.com。填了就指向该 base_url。
@@ -202,25 +202,28 @@ class ExecutionConfig(_Base):
 
 
 class LLMProfile(_Base):
-    """运行期可热替换的 LLM profile。
+    """运行期可热替换的 LLM 对接源 profile。
 
     与 ``LLMConfig`` 的差异：
     - 不含 kline_lookback / kline_interval / prompt_kline_count / micro_* /
       higher_timeframes / indicators 等"工程参数"，这些仍由 config.yaml 控制。
-    - key 通过 keyring 引用（``keyring_ref``），明文不落 DB。
-    - ``is_active`` 同一时刻只能为 True，由事务保证。
+    - ``api_key`` 明文存库（不再走 keyring）。
+    - ``is_active`` 同一时刻只能为 True（主源/链头），由事务保证。
+    - ``priority`` 升序决定 fallback 链顺序；``fallback_enabled`` 标记备源是否入链。
     """
 
     name: str = Field(min_length=1, max_length=64)
-    provider: Literal["anthropic"] = "anthropic"
+    provider: Literal["anthropic", "openai_compatible"] = "anthropic"
     model: str = Field(min_length=1, max_length=128)
     base_url: str | None = None
     timeout: float = Field(default=60.0, gt=0)
     max_tokens: int = Field(default=1024, gt=0, le=512000)
     max_retries: int = Field(default=2, ge=0, le=5)
     is_active: bool = False
-    # keyring 引用，格式 "profile://<service>/<name>"，明文不写库
-    keyring_ref: str = Field(default="", max_length=200)
+    # API key 明文，不再走 keyring
+    api_key: str = Field(default="", max_length=8192)
+    priority: int = Field(default=100, ge=0, le=10000)
+    fallback_enabled: bool = False
     created_at: str = ""
     updated_at: str = ""
 
