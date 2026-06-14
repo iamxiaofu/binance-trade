@@ -337,7 +337,13 @@ class TradingEngine:
             return "strategy paused (persisted)"
         if name == "RESUME":
             self.runtime.resume_entries()
-            await self._store.set_runtime_setting("strategy.paused", "false")
+            await self._store.set_runtime_settings({
+                "strategy.paused": "false",
+                "strategy.pause.reason_code": "",
+                "strategy.pause.reason": "",
+                "strategy.pause.source": "",
+                "strategy.pause.at_ms": "",
+            })
             return "strategy resumed (persisted)"
         if name == "RESUME_ALL_SYMBOLS":
             return await self._resume_all_symbols()
@@ -550,7 +556,13 @@ class TradingEngine:
             for row in rows
             if row.get("status") == "active" and not row.get("needs_review")
         ]
-        values = {"strategy.paused": "false"}
+        values = {
+            "strategy.paused": "false",
+            "strategy.pause.reason_code": "",
+            "strategy.pause.reason": "",
+            "strategy.pause.source": "",
+            "strategy.pause.at_ms": "",
+        }
         values.update({
             self._symbol_enabled_key(symbol): "true"
             for symbol in eligible
@@ -629,6 +641,21 @@ class TradingEngine:
             "symbol disabled {} reason_code={} source={} action={} reason={}",
             symbol, reason_code, source, action, reason,
         )
+
+    async def _persist_strategy_pause_reason(
+        self,
+        *,
+        reason_code: str,
+        reason: str,
+        source: str,
+    ) -> None:
+        await self._store.set_runtime_settings({
+            "strategy.paused": "true",
+            "strategy.pause.reason_code": reason_code,
+            "strategy.pause.reason": reason,
+            "strategy.pause.source": source,
+            "strategy.pause.at_ms": str(int(time.time() * 1000)),
+        })
 
     async def _cancel_and_flatten(self, source: str) -> str:
         """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
@@ -1974,10 +2001,35 @@ class TradingEngine:
         if breached and not rt.halt_new_entries:
             logger.warning("CIRCUIT BREAKER: {}", breached)
             rt.trip_breaker(breached)
+            reason_code = "DAILY_LOSS" if breached.startswith("daily loss") else "MAX_DRAWDOWN"
+            await self._persist_strategy_pause_reason(
+                reason_code=reason_code,
+                reason=rt.halt_new_entries_reason,
+                source="engine:circuit_breaker",
+            )
             try:
-                await self._executor.flatten_all(symbols=self._tracked_symbols())
+                results = await self._executor.flatten_all(symbols=self._tracked_symbols())
+                for result in results:
+                    await self._store.log_order(result)
+                flattened = sum(1 for result in results if result.get("filled"))
             except Exception as e:
                 logger.error("circuit-breaker flatten failed: {}", e)
+                flattened = 0
+                await self._store.record_system_command(
+                    "CIRCUIT_BREAKER",
+                    arg=reason_code,
+                    source="engine",
+                    status="failed",
+                    result=f"{rt.halt_new_entries_reason}; flatten failed: {e}",
+                )
+            else:
+                await self._store.record_system_command(
+                    "CIRCUIT_BREAKER",
+                    arg=reason_code,
+                    source="engine",
+                    status="done",
+                    result=f"{rt.halt_new_entries_reason}; flattened {flattened} positions",
+                )
             await self._notifier.send(Event.CIRCUIT_BREAK, breached)
             return True
         return rt.halt_new_entries

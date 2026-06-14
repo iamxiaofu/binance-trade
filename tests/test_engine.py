@@ -55,6 +55,7 @@ class FakeStore:
         self.claims = []
         self.takeover_trades = []
         self.open_qty = {}
+        self.system_commands = []  # (command, arg, source, status, result)
         self.symbols = {
             "BTCUSDT": {
                 "symbol": "BTCUSDT",
@@ -119,6 +120,12 @@ class FakeStore:
 
     async def mark_command(self, cmd_id, status, result=""):
         self.marked.append((cmd_id, status, result))
+
+    async def record_system_command(
+        self, command, *, arg="", source="engine", status="done", result=""
+    ):
+        self.system_commands.append((command, arg, source, status, result))
+        return len(self.system_commands)
 
     async def mark_orders_status_by_exchange_ids(self, exchange_order_ids, status):
         self.marked_status_calls.append((list(exchange_order_ids or []), status))
@@ -460,7 +467,14 @@ class FakeExecutor:
 
     async def flatten_all(self, symbols=None):
         self.flattened += 1
-        return []
+        symbols = list(symbols or [])
+        return [
+            {"symbol": sym, "kind": "CLOSE", "status": "filled",
+             "filled": True, "closed": True, "dry_run": False,
+             "qty": 1.0, "price": 100.0, "entry_price": 100.0,
+             "pos_side": "long", "side": "sell", "id": f"flatten-{i}"}
+            for i, sym in enumerate(symbols)
+        ]
 
     async def cancel_all_orders(self, symbols=None):
         self.canceled += 1
@@ -559,12 +573,28 @@ async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch)
     assert eng._executor.flattened == 1
     assert any(e == Event.CIRCUIT_BREAK for e, _ in eng._notifier.events)
 
+    # 新增：pause 元数据 + 系统命令历史都写入了
+    assert eng._store.runtime_settings["strategy.paused"] == "true"
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == "DAILY_LOSS"
+    assert "daily loss" in eng._store.runtime_settings["strategy.pause.reason"]
+    assert eng._store.runtime_settings["strategy.pause.source"] == "engine:circuit_breaker"
+    system_cmds = [c for c in eng._store.system_commands if c[0] == "CIRCUIT_BREAKER"]
+    assert system_cmds, "circuit breaker should write a system command record"
+    assert system_cmds[0][1] == "DAILY_LOSS"
+    assert system_cmds[0][3] == "done"
+    assert "flattened 1 positions" in system_cmds[0][4]
+
 
 async def test_circuit_breaker_trips_on_drawdown(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng.runtime.drawdown_pct = settings.risk.max_drawdown_pct + 1
     assert await eng._check_circuit_breaker() is True
     assert eng._executor.flattened == 1
+
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == "MAX_DRAWDOWN"
+    assert "drawdown" in eng._store.runtime_settings["strategy.pause.reason"]
+    assert any(c[0] == "CIRCUIT_BREAKER" and c[1] == "MAX_DRAWDOWN"
+               for c in eng._store.system_commands)
 
 
 async def test_no_breaker_under_limits(settings, creds, monkeypatch):
@@ -1261,6 +1291,24 @@ async def test_runtime_symbol_enabled_applied_on_startup(settings, creds, monkey
     assert eng._symbol_enabled["BTCUSDT"] is False
 
 
+async def test_resume_command_clears_pause_meta(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.runtime_settings.update({
+        "strategy.paused": "true",
+        "strategy.pause.reason_code": "MAX_DRAWDOWN",
+        "strategy.pause.reason": "drawdown 25% >= 20%",
+        "strategy.pause.source": "engine:circuit_breaker",
+        "strategy.pause.at_ms": "1700000000000",
+    })
+    eng._store.pending = [{"id": 1, "command": "RESUME", "arg": ""}]
+    await eng._process_commands()
+    assert eng._store.runtime_settings["strategy.paused"] == "false"
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == ""
+    assert eng._store.runtime_settings["strategy.pause.reason"] == ""
+    assert eng._store.runtime_settings["strategy.pause.source"] == ""
+    assert eng.runtime.halt_new_entries is False
+
+
 async def test_runtime_strategy_paused_applied_on_startup(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._store.runtime_settings["strategy.paused"] = "true"
@@ -1455,7 +1503,7 @@ async def test_command_cancel_and_flatten_keeps_engine_running(settings, creds, 
     assert eng._store.runtime_settings["strategy.paused"] == "true"
     assert eng.runtime.kill_switch is False
     assert eng._stopped.is_set() is False
-    assert "flattened 0 positions" in eng._store.marked[0][2]
+    assert "flattened 1 positions" in eng._store.marked[0][2]
 
 
 async def test_command_stop_engine_does_not_flatten(settings, creds, monkeypatch):

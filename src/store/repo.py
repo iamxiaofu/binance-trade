@@ -2139,6 +2139,34 @@ class Store:
             row.executed_at = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
             await session.commit()
 
+    async def record_system_command(
+        self,
+        command: str,
+        *,
+        arg: str = "",
+        source: str = "engine",
+        status: str = "done",
+        result: str = "",
+    ) -> int:
+        """记录非 Web 入队的系统事件，让控制台命令历史可追溯。"""
+        import time as _t
+        now_ms = int(_t.time() * 1000)
+        now = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
+        row = ControlCommandRow(
+            ts_ms=now_ms,
+            created_at=now,
+            command=command,
+            arg=arg,
+            source=source,
+            status=status,
+            result=result[:300],
+            executed_at=now,
+        )
+        async with self._sessionmaker() as session:
+            session.add(row)
+            await session.commit()
+            return row.id
+
     async def recent_commands(self, limit: int = 50) -> list[dict]:
         """最近的命令记录（web 展示用）。"""
         async with self._sessionmaker() as session:

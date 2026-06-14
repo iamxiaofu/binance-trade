@@ -81,10 +81,21 @@ function commandLabel(name) {
     CANCEL_AND_FLATTEN: '撤单+平仓',
     STOP_ENGINE: '停止交易引擎',
     KILL_SWITCH: 'Kill Switch',
+    CIRCUIT_BREAKER: '自动熔断',
   }[name] || name
 }
 
 const strategyPaused = computed(() => Boolean(cfg.value?.strategy_paused))
+const strategyPause = computed(() => cfg.value?.strategy_pause || {})
+const strategyPauseReason = computed(() => strategyPause.value.reason || '')
+const strategyPauseReasonCode = computed(() => strategyPause.value.reason_code || '')
+const strategyPauseTooltip = computed(() =>
+  [
+    strategyPauseReasonCode.value,
+    strategyPauseReason.value,
+    strategyPause.value.source,
+  ].filter(Boolean).join(' | ')
+)
 const configuredSymbols = computed(() => cfg.value?.symbols || [])
 const allSymbolsEnabled = computed(() =>
   symbolRows.value
@@ -103,6 +114,9 @@ const symbolRows = computed(() => {
       symbol,
       enabled: cfg.value?.symbol_enabled?.[symbol] !== false && item.enabled !== false,
       strategyPaused: strategyPaused.value,
+      strategyPauseReason: strategyPauseReason.value,
+      strategyPauseReasonCode: strategyPauseReasonCode.value,
+      strategyPauseTooltip: strategyPauseTooltip.value,
       hasPosition: (live.positions || []).some((p) =>
         p.symbol === symbol && Number(p.contracts || 0) > 0
       ),
@@ -431,14 +445,25 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="LLM 调用" width="120">
+        <el-table-column label="LLM 调用" width="200">
           <template #default="{ row }">
-            <el-tag
-              :type="row.strategyPaused ? 'warning' : row.enabled ? 'success' : 'info'"
-              size="small"
-            >
-              {{ row.strategyPaused ? '策略暂停' : row.enabled ? '允许' : '禁止' }}
-            </el-tag>
+            <el-space>
+              <el-tag
+                :type="row.strategyPaused ? 'warning' : row.enabled ? 'success' : 'info'"
+                size="small"
+              >
+                {{ row.strategyPaused ? '策略暂停' : row.enabled ? '允许' : '禁止' }}
+              </el-tag>
+              <el-tooltip
+                v-if="row.strategyPaused && (row.strategyPauseReasonCode || row.strategyPauseReason)"
+                :content="row.strategyPauseTooltip"
+                placement="top"
+              >
+                <el-tag type="danger" size="small">
+                  {{ row.strategyPauseReasonCode || 'PAUSED' }}
+                </el-tag>
+              </el-tooltip>
+            </el-space>
           </template>
         </el-table-column>
         <el-table-column label="同步状态" width="150">

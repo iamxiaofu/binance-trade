@@ -146,6 +146,21 @@ async def _effective_strategy_paused() -> tuple[bool, str]:
     return False, "default"
 
 
+async def _strategy_pause_meta() -> dict[str, str]:
+    try:
+        store = await _get_store()
+        settings = await store.runtime_settings()
+        return {
+            "reason_code": settings.get("strategy.pause.reason_code", ""),
+            "reason": settings.get("strategy.pause.reason", ""),
+            "source": settings.get("strategy.pause.source", ""),
+            "at_ms": settings.get("strategy.pause.at_ms", ""),
+        }
+    except Exception as e:
+        logger.warning("runtime strategy pause meta unavailable: {}", e)
+        return {"reason_code": "", "reason": "", "source": "", "at_ms": ""}
+
+
 async def _effective_symbol_enabled() -> dict[str, bool]:
     try:
         store = await _get_store()
@@ -582,6 +597,7 @@ async def api_config(_: str = Depends(_check_auth)):
     """暴露非敏感运行配置，供前端展示风控阈值等。"""
     s = _settings
     strategy_paused, strategy_status_source = await _effective_strategy_paused()
+    strategy_pause = await _strategy_pause_meta()
     symbol_enabled = await _effective_symbol_enabled()
     symbols_state = await _symbol_rows()
     symbols = [row["symbol"] for row in symbols_state]
@@ -591,6 +607,7 @@ async def api_config(_: str = Depends(_check_auth)):
         "symbols": symbols,
         "strategy_paused": strategy_paused,
         "strategy_status_source": strategy_status_source,
+        "strategy_pause": strategy_pause,
         "symbol_enabled": symbol_enabled,
         "symbols_state": symbols_state,
         "cycle_interval": s.cycle.interval,
