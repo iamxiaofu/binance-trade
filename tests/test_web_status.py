@@ -1,6 +1,7 @@
 """web/status.py 测试：只读查询返回正确结构。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import sqlite3
 
 import pytest
@@ -266,6 +267,43 @@ def test_resolve_time_bounds_quick_range():
     assert end == 10_800_000
 
 
+def test_utc8_day_start_ms():
+    now_ms = int(datetime(2025, 12, 14, 9, tzinfo=timezone.utc).timestamp() * 1000)
+    expected = int(datetime(2025, 12, 13, 16, tzinfo=timezone.utc).timestamp() * 1000)
+    assert status.utc8_day_start_ms(now_ms) == expected
+
+
+async def test_day_equity_change_uses_utc8_day_boundary(db, monkeypatch):
+    s = Store(db)
+    await s.connect()
+    rt = RuntimeState()
+    await s.snapshot_balance(total_equity=205.0, available_margin=180.0, runtime=rt)
+    await s.snapshot_balance(total_equity=197.5, available_margin=180.0, runtime=rt)
+    await s.close()
+
+    now_ms = int(datetime(2025, 12, 14, 9, tzinfo=timezone.utc).timestamp() * 1000)
+    day_start = status.utc8_day_start_ms(now_ms)
+    conn = sqlite3.connect(db)
+    try:
+        ids = [row[0] for row in conn.execute("SELECT id FROM balance_snapshots ORDER BY id")]
+        timestamps = [day_start - 1_000, day_start + 1_000, day_start + 2_000]
+        for ts, row_id in zip(timestamps, ids, strict=True):
+            conn.execute("UPDATE balance_snapshots SET ts_ms = ? WHERE id = ?", (ts, row_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    change = status.day_equity_change(db, latest_ts_ms=day_start + 2_000)
+    assert change["day_equity_start_ts_ms"] == day_start
+    assert change["day_equity_start_snapshot_ts_ms"] == day_start + 1_000
+    assert change["day_equity_start"] == pytest.approx(205.0)
+    assert change["day_equity_latest"] == pytest.approx(197.5)
+    assert change["day_equity_change"] == pytest.approx(-7.5)
+    monkeypatch.setattr(status, "_now_ms", lambda: day_start + 2_000)
+    assert status.latest_balance(db)["day_equity_change"] == pytest.approx(-7.5)
+    assert status.pnl_stats(db)["day_equity_change"] == pytest.approx(-7.5)
+
+
 def test_resolve_time_bounds_custom_range():
     start, end, key = status.resolve_time_bounds(
         start_ts_ms=1000,
@@ -275,6 +313,29 @@ def test_resolve_time_bounds_custom_range():
     assert key == "custom"
     assert start == 1000
     assert end == 2000
+
+
+async def test_recent_commands_exposes_utc_timestamp_ms(db):
+    s = Store(db)
+    await s.connect()
+    command_id = await s.enqueue_command("PAUSE", source="test")
+    await s.close()
+
+    executed_at = datetime(2025, 12, 14, 1, tzinfo=timezone.utc)
+    executed_at_ms = int(executed_at.timestamp() * 1000)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE control_commands SET ts_ms = ?, executed_at = ? WHERE id = ?",
+            (executed_at_ms, "2025-12-14 01:00:00", command_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    command = status.recent_commands(db, 1)[0]
+    assert command["created_at_ms"] == executed_at_ms
+    assert command["executed_at_ms"] == executed_at_ms
 
 
 def test_pnl_stats_filters_time_range(db):

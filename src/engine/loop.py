@@ -1740,14 +1740,16 @@ class TradingEngine:
         # Active exchange protection may remain open while price is crossing its trigger.
         # Do not classify it as stale by current mark, or we can cancel the order that
         # should be allowed to trigger.
+        # SL may be above entry (profit-lock / trailing stop via ADJUST_SLTP) — only
+        # require it to be on the correct side of mark, not entry.
         if pos_side == "long":
-            if kind == "SL" and not (trigger < entry):
-                return f"long SL trigger {trigger:g} not below entry"
+            if kind == "SL" and not (trigger < mark):
+                return f"long SL trigger {trigger:g} not below mark {mark:g}"
             if kind == "TP" and not (trigger > entry):
                 return f"long TP trigger {trigger:g} not above entry"
         elif pos_side == "short":
-            if kind == "SL" and not (trigger > entry):
-                return f"short SL trigger {trigger:g} not above entry"
+            if kind == "SL" and not (trigger > mark):
+                return f"short SL trigger {trigger:g} not above mark {mark:g}"
             if kind == "TP" and not (trigger < entry):
                 return f"short TP trigger {trigger:g} not below entry"
         else:
@@ -1826,13 +1828,14 @@ class TradingEngine:
         if trigger <= 0 or entry <= 0 or mark <= 0 or qty <= 0:
             return "价格或数量无效"
         if side == "long":
-            if kind == "SL" and not (trigger < mark and trigger < entry):
-                return f"多单止损必须低于当前标记价 {mark:.2f} 且低于开仓价 {entry:.2f}"
+            # SL may be above entry (profit-lock via ADJUST_SLTP); only require it below mark.
+            if kind == "SL" and not (trigger < mark):
+                return f"多单止损必须低于当前标记价 {mark:.2f}"
             if kind == "TP" and not (trigger > mark and trigger > entry):
                 return f"多单止盈必须高于当前标记价 {mark:.2f} 且高于开仓价 {entry:.2f}"
         elif side == "short":
-            if kind == "SL" and not (trigger > mark and trigger > entry):
-                return f"空单止损必须高于当前标记价 {mark:.2f} 且高于开仓价 {entry:.2f}"
+            if kind == "SL" and not (trigger > mark):
+                return f"空单止损必须高于当前标记价 {mark:.2f}"
             if kind == "TP" and not (trigger < mark and trigger < entry):
                 return f"空单止盈必须低于当前标记价 {mark:.2f} 且低于开仓价 {entry:.2f}"
         else:
@@ -1843,9 +1846,12 @@ class TradingEngine:
             max_loss = equity * (self._settings.risk.max_loss_per_trade_pct / 100.0)
             if equity <= 0 or max_loss <= 0:
                 return "无法获取账户权益，不能校验止损风险"
+            # loss < 0 means profit-lock (SL above entry for long / below entry for short).
+            # That is a valid state from ADJUST_SLTP — skip the max_loss cap check since
+            # hitting this SL would lock in profit, not incur a loss.
             if loss < 0:
-                return "止损触发价方向错误"
-            if loss > max_loss:
+                pass  # profit-lock SL — valid, no cap check needed
+            elif loss > max_loss:
                 return (
                     f"理论止损亏损 {loss:.2f} USDT 超过上限 {max_loss:.2f} USDT "
                     f"({self._settings.risk.max_loss_per_trade_pct}% of {equity:.2f})"

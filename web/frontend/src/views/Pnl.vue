@@ -78,9 +78,9 @@ function resize() { if (chart) chart.resize() }
     <el-row :gutter="16">
       <el-col :span="6">
         <el-card class="metric-card" shadow="never">
-          <div class="label">当日已实现盈亏 (USDT)</div>
-          <div class="value" :class="pnlClass(stats?.day_realized_pnl)">
-            {{ stats ? fmt(stats.day_realized_pnl) : '—' }}
+          <div class="label">当日权益变化 (USDT)</div>
+          <div class="value" :class="pnlClass(stats?.day_equity_change)">
+            {{ stats ? fmt(stats.day_equity_change) : '—' }}
           </div>
         </el-card>
       </el-col>
@@ -128,7 +128,7 @@ function resize() { if (chart) chart.resize() }
       </template>
       <div ref="barEl" style="height:320px"></div>
       <div style="color:#909399; font-size:12px; margin-top:8px">
-        说明：当日已实现盈亏来自运行态余额快照；当日未实现盈亏优先来自交易所实时持仓，失败时回退到最近持仓快照。
+        说明：当日权益变化按 UTC+8 日界统计 total_equity 差值；当日未实现盈亏优先来自交易所实时持仓，失败时回退到最近持仓快照。
       </div>
     </el-card>
   </div>

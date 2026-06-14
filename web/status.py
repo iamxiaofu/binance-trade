@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import sqlite3
 import time
@@ -286,9 +287,18 @@ RANGE_MS: dict[str, int] = {
     "30d": 30 * 24 * 60 * 60 * 1000,
 }
 
+UTC8_OFFSET_MS = 8 * 60 * 60 * 1000
+DAY_MS = 24 * 60 * 60 * 1000
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def utc8_day_start_ms(now_ms: int | None = None) -> int:
+    """Return the UTC timestamp for the current UTC+8 calendar day start."""
+    now = int(now_ms if now_ms is not None else _now_ms())
+    return ((now + UTC8_OFFSET_MS) // DAY_MS) * DAY_MS - UTC8_OFFSET_MS
 
 
 def resolve_time_bounds(
@@ -513,7 +523,67 @@ def open_trade_metadata(db_path: str) -> dict[str, dict]:
 
 def latest_balance(db_path: str) -> dict | None:
     rows = _rows(db_path, "SELECT * FROM balance_snapshots ORDER BY id DESC LIMIT 1")
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    latest = rows[0]
+    latest.update(day_equity_change(db_path))
+    return latest
+
+
+def day_equity_change(
+    db_path: str,
+    *,
+    latest_ts_ms: int | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Account-equity delta since UTC+8 midnight.
+
+    This is intentionally based on balance_snapshots.total_equity rather than
+    realized PnL fields, so it includes fees, funding, and live unrealized PnL
+    reflected in the exchange account equity.
+    """
+    latest_rows = _rows(
+        db_path,
+        "SELECT ts_ms, created_at, total_equity FROM balance_snapshots "
+        "ORDER BY id DESC LIMIT 1",
+    )
+    if not latest_rows:
+        return {
+            "day_equity_change": 0.0,
+            "day_equity_start": None,
+            "day_equity_latest": None,
+            "day_equity_start_ts_ms": utc8_day_start_ms(now_ms),
+            "day_equity_start_snapshot_ts_ms": None,
+            "day_equity_start_snapshot_at": "",
+        }
+
+    latest = latest_rows[0]
+    effective_now = int(now_ms if now_ms is not None else (latest_ts_ms or _now_ms()))
+    start_ts = utc8_day_start_ms(effective_now)
+    first_rows = _rows(
+        db_path,
+        "SELECT ts_ms, created_at, total_equity FROM balance_snapshots "
+        "WHERE ts_ms >= ? AND ts_ms <= ? ORDER BY ts_ms ASC, id ASC LIMIT 1",
+        (start_ts, effective_now),
+    )
+    latest_equity = float(latest.get("total_equity") or 0.0)
+    if not first_rows:
+        start_equity = latest_equity
+        start_snapshot_ts = None
+        start_snapshot_at = ""
+    else:
+        first = first_rows[0]
+        start_equity = float(first.get("total_equity") or 0.0)
+        start_snapshot_ts = int(first.get("ts_ms") or 0) or None
+        start_snapshot_at = str(first.get("created_at") or "")
+    return {
+        "day_equity_change": latest_equity - start_equity,
+        "day_equity_start": start_equity,
+        "day_equity_latest": latest_equity,
+        "day_equity_start_ts_ms": start_ts,
+        "day_equity_start_snapshot_ts_ms": start_snapshot_ts,
+        "day_equity_start_snapshot_at": start_snapshot_at,
+    }
 
 
 def balance_history(
@@ -551,7 +621,18 @@ def balance_history(
 
 
 def recent_commands(db_path: str, limit: int = 50) -> list[dict]:
-    return _rows(db_path, "SELECT * FROM control_commands ORDER BY id DESC LIMIT ?", (limit,))
+    rows = _rows(db_path, "SELECT * FROM control_commands ORDER BY id DESC LIMIT ?", (limit,))
+    for row in rows:
+        row["created_at_ms"] = int(row.get("ts_ms") or 0) or None
+        executed_at = str(row.get("executed_at") or "").strip()
+        try:
+            executed_dt = datetime.strptime(executed_at, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+            row["executed_at_ms"] = int(executed_dt.timestamp() * 1000)
+        except ValueError:
+            row["executed_at_ms"] = None
+    return rows
 
 
 def _json_text(value: Any) -> str:
@@ -749,6 +830,7 @@ def pnl_stats(db_path: str, filters: PnlFilters | None = None) -> dict:
 
     return {
         "day_realized_pnl": day_pnl,
+        **day_equity_change(db_path),
         "close_count": len(closes),
         "range_close_count": len(closes),
         "trade_count": len(trade_rows),

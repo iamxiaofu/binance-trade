@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import { useLiveStore } from '../stores/live'
-import { orderStatusLabel } from '../labels'
+import { orderStatusLabel, utc8DateTime, utc8Time } from '../labels'
 
 const live = useLiveStore()
 const repairing = ref({})
@@ -29,11 +29,11 @@ const openOrdersError = computed(() => live.summary?.open_orders_error || '')
 const openOrdersSyncedAtMs = computed(() => live.summary?.open_orders_synced_at_ms || live.summary?.positions_synced_at_ms)
 const openOrdersSyncedText = computed(() => {
   const ts = openOrdersSyncedAtMs.value
-  return ts ? new Date(Number(ts)).toLocaleTimeString() : '—'
+  return utc8Time(ts)
 })
 const syncedAtText = computed(() => {
   const ts = live.summary?.positions_synced_at_ms
-  return ts ? new Date(Number(ts)).toLocaleTimeString() : '—'
+  return utc8Time(ts)
 })
 const isExchangeLive = computed(() => positionsSource.value === 'exchange')
 const hasMissingProtection = computed(() => positions.value.some((p) =>
@@ -75,8 +75,7 @@ function fmtPct(n) {
 }
 
 function fmtTime(ts) {
-  const v = Number(ts || 0)
-  return v > 0 ? new Date(v).toLocaleString() : '—'
+  return utc8DateTime(ts)
 }
 
 function margin(row) {

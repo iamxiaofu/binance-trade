@@ -3,6 +3,7 @@ import { computed, ref, onMounted, watch } from 'vue'
 import { api } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLiveStore } from '../stores/live'
+import { localTime } from '../labels'
 
 const live = useLiveStore()
 const cfg = ref(null)
@@ -489,7 +490,9 @@ watch(
         </div>
       </template>
       <el-table :data="commands" stripe max-height="340">
-        <el-table-column prop="created_at" label="入队时间" width="170" />
+        <el-table-column label="入队时间" width="180">
+          <template #default="{ row }">{{ localTime(row.created_at_ms) }}</template>
+        </el-table-column>
         <el-table-column label="命令" width="150">
           <template #default="{ row }">{{ commandLabel(row.command) }}</template>
         </el-table-column>
@@ -501,7 +504,9 @@ watch(
           </template>
         </el-table-column>
         <el-table-column prop="result" label="结果" min-width="200" show-overflow-tooltip />
-        <el-table-column prop="executed_at" label="执行时间" width="170" />
+        <el-table-column label="执行时间" width="180">
+          <template #default="{ row }">{{ localTime(row.executed_at_ms) }}</template>
+        </el-table-column>
       </el-table>
     </el-card>
   </div>

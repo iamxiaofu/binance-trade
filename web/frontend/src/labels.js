@@ -1,7 +1,67 @@
-export function localTime(ts, fallback = '—') {
-  if (!ts) return fallback || '—'
+const UTC8_TIME_ZONE = 'Asia/Shanghai'
+
+const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: UTC8_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+})
+
+const timeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: UTC8_TIME_ZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+})
+
+const axisTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: UTC8_TIME_ZONE,
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+})
+
+function normalizeFormattedTime(value) {
+  return String(value || '').replace(/\//g, '-')
+}
+
+function dateFromTs(ts) {
+  if (!ts) return null
   const d = new Date(Number(ts))
-  return Number.isNaN(d.getTime()) ? (fallback || '—') : d.toLocaleString()
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+export function utc8DateTime(ts, fallback = '—') {
+  const d = dateFromTs(ts)
+  return d ? normalizeFormattedTime(dateTimeFormatter.format(d)) : (fallback || '—')
+}
+
+export function utc8Time(ts, fallback = '—') {
+  const d = dateFromTs(ts)
+  return d ? timeFormatter.format(d) : (fallback || '—')
+}
+
+export function utc8AxisTime(ts, fallback = '') {
+  const d = dateFromTs(ts)
+  return d ? normalizeFormattedTime(axisTimeFormatter.format(d)) : (fallback || '')
+}
+
+export function localTime(ts, fallback = '—') {
+  return utc8DateTime(ts, fallback)
+}
+
+export function utc8InputToMs(value) {
+  if (!value) return undefined
+  const normalized = String(value).trim().replace(' ', 'T')
+  const ts = Date.parse(`${normalized}+08:00`)
+  return Number.isNaN(ts) ? undefined : ts
 }
 
 export function decisionLabel(action, skipped = false) {

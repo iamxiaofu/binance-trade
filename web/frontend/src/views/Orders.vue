@@ -4,6 +4,7 @@ import { api } from '../api'
 import { ElMessage } from 'element-plus'
 import {
   localTime,
+  utc8InputToMs,
   decisionLabel,
   executionModeLabel,
   exitReasonLabel,
@@ -103,8 +104,8 @@ function queryParams() {
     direction: filters.value.directions,
     status: filters.value.statuses,
     exit_reason: filters.value.exitReasons,
-    start_ts_ms: start instanceof Date ? start.getTime() : undefined,
-    end_ts_ms: end instanceof Date ? end.getTime() : undefined,
+    start_ts_ms: utc8InputToMs(start),
+    end_ts_ms: utc8InputToMs(end),
     limit: page.value.limit,
     offset: page.value.offset,
   }
@@ -285,6 +286,7 @@ onUnmounted(() => {
           <el-date-picker
             v-model="filters.range"
             type="datetimerange"
+            value-format="YYYY-MM-DD HH:mm:ss"
             range-separator="至"
             start-placeholder="开始时间"
             end-placeholder="结束时间"

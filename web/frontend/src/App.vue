@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useLiveStore } from './stores/live'
+import { utc8Time } from './labels'
 
 const live = useLiveStore()
 const route = useRoute()
@@ -20,7 +21,7 @@ const menu = [
 ]
 
 const lastUpdateText = computed(() =>
-  live.lastUpdate ? live.lastUpdate.toLocaleTimeString() : '—'
+  live.lastUpdate ? utc8Time(live.lastUpdate.getTime()) : '—'
 )
 const activePath = computed(() => route.path)
 const isDark = computed(() => theme.value === 'dark')

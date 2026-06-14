@@ -2,7 +2,7 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api'
 import { ElMessage } from 'element-plus'
-import { decisionLabel, decisionTagType, llmLatencyTag, localTime } from '../labels'
+import { decisionLabel, decisionTagType, llmLatencyTag, localTime, utc8InputToMs } from '../labels'
 import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 
 const rows = ref([])
@@ -99,7 +99,7 @@ function quickRangeBounds(value) {
 function activeTimeRange() {
   if (filters.value.quickRange) return filters.value.quickRange
   const [start, end] = filters.value.range || []
-  if (start instanceof Date && end instanceof Date) return ''
+  if (start && end) return ''
   return ''
 }
 
@@ -120,8 +120,8 @@ function queryParams() {
     }
   } else {
     const [start, end] = filters.value.range || []
-    if (start instanceof Date) params.start_ts_ms = start.getTime()
-    if (end instanceof Date) params.end_ts_ms = end.getTime()
+    params.start_ts_ms = utc8InputToMs(start)
+    params.end_ts_ms = utc8InputToMs(end)
   }
   return params
 }
@@ -133,8 +133,7 @@ function onQuickRangeChange(value) {
 }
 
 function onManualRangeChange(value) {
-  if (Array.isArray(value) && value.length === 2
-      && value[0] instanceof Date && value[1] instanceof Date) {
+  if (Array.isArray(value) && value.length === 2 && value[0] && value[1]) {
     filters.value.quickRange = ''
   }
   search()
@@ -376,6 +375,7 @@ onUnmounted(() => {
         <el-date-picker
           v-model="filters.range"
           type="datetimerange"
+          value-format="YYYY-MM-DD HH:mm:ss"
           range-separator="至"
           start-placeholder="开始时间"
           end-placeholder="结束时间"

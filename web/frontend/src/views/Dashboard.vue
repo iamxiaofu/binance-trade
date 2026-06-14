@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import * as echarts from 'echarts'
 import { useLiveStore } from '../stores/live'
 import { api } from '../api'
-import { decisionLabel, localTime } from '../labels'
+import { decisionLabel, localTime, utc8AxisTime } from '../labels'
 import { DEFAULT_TIME_RANGE, QUICK_TIME_RANGES } from '../timeRanges'
 
 const live = useLiveStore()
@@ -14,7 +14,7 @@ let chart = null
 
 const bal = computed(() => live.balance || {})
 const positions = computed(() => live.positions || [])
-const dayPnl = computed(() => Number(bal.value.day_realized_pnl || 0))
+const dayEquityChange = computed(() => Number(bal.value.day_equity_change || 0))
 const lastDecision = computed(() => (live.summary.recent_decisions || [])[0] || null)
 
 function fmt(n, d = 2) {
@@ -38,7 +38,7 @@ async function loadEquity() {
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
     xAxis: {
       type: 'category',
-      data: data.map(d => d.created_at),
+      data: data.map(d => utc8AxisTime(d.ts_ms, d.created_at)),
       axisLabel: { show: false, color: mutedColor },
       axisLine: { lineStyle: { color: gridColor } },
     },
@@ -98,9 +98,9 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
       </el-col>
       <el-col :span="6">
         <el-card class="metric-card" shadow="never">
-          <div class="label">当日已实现盈亏</div>
-          <div class="value" :class="dayPnl > 0 ? 'pnl-pos' : dayPnl < 0 ? 'pnl-neg' : ''">
-            {{ dayPnl > 0 ? '+' : '' }}{{ fmt(dayPnl) }}
+          <div class="label">当日权益变化</div>
+          <div class="value" :class="dayEquityChange > 0 ? 'pnl-pos' : dayEquityChange < 0 ? 'pnl-neg' : ''">
+            {{ dayEquityChange > 0 ? '+' : '' }}{{ fmt(dayEquityChange) }}
           </div>
         </el-card>
       </el-col>
