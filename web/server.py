@@ -59,6 +59,13 @@ _positions_cache: dict[str, Any] = {
     "condition_error": "",
 }
 _POSITIONS_TTL_MS = int(os.environ.get("WEB_POSITIONS_TTL_MS", "2000"))
+_balance_lock = asyncio.Lock()
+_balance_cache: dict[str, Any] = {
+    "ts_ms": 0,
+    "total_equity": None,
+    "available_margin": None,
+}
+_BALANCE_TTL_MS = int(os.environ.get("WEB_BALANCE_TTL_MS", "2000"))
 # 行情数据源注册表：mainnet/testnet 双源（REST + WS），供看板行情用
 _feeds = MarketFeedRegistry()
 # 默认行情源跟随交易模式；需要单独看主网时可用 WEB_MARKET_SOURCE=mainnet 覆盖。
@@ -220,6 +227,48 @@ async def _live_positions_snapshot() -> dict[str, Any]:
         return dict(_positions_cache)
 
 
+async def _live_balance_snapshot() -> dict[str, Any]:
+    """Fetch current exchange USDT equity with a short dashboard cache."""
+    now = int(time.time() * 1000)
+    async with _balance_lock:
+        cached_ts = int(_balance_cache.get("ts_ms") or 0)
+        if cached_ts and now - cached_ts <= _BALANCE_TTL_MS:
+            return dict(_balance_cache)
+
+        client = await _get_market()
+        balance = await client.fetch_balance()
+        quote = _settings.account.quote_asset
+        total_raw = (balance.get("total") or {}).get(quote)
+        free_raw = (balance.get("free") or {}).get(quote)
+        total = float(total_raw) if total_raw is not None else 0.0
+        free = float(free_raw) if free_raw is not None else 0.0
+        if total <= 0 or free < 0:
+            raise ValueError(f"invalid {quote} balance: total={total_raw} free={free_raw}")
+        _balance_cache.update({
+            "ts_ms": int(time.time() * 1000),
+            "total_equity": total,
+            "available_margin": free,
+        })
+        return dict(_balance_cache)
+
+
+def _apply_live_balance(summary: dict[str, Any], live_balance: dict[str, Any]) -> None:
+    balance = dict(summary.get("balance") or {})
+    total = float(live_balance["total_equity"])
+    balance.update({
+        "ts_ms": int(live_balance["ts_ms"]),
+        "total_equity": total,
+        "available_margin": float(live_balance["available_margin"]),
+        **st.day_equity_change(
+            _DB,
+            current_equity=total,
+            now_ms=int(live_balance["ts_ms"]),
+        ),
+        "equity_source": "exchange",
+    })
+    summary["balance"] = balance
+
+
 async def _live_condition_orders(
     client: ExchangeClient,
     symbols: list[str],
@@ -261,6 +310,8 @@ async def _live_open_orders(
             merged[key] = order
     orders = sorted(merged.values(), key=lambda x: (x["symbol"], x["side"], -(x["ts_ms"] or 0)))
     return orders, "; ".join(errors)
+
+
 def _attach_protection_orders(positions: list[dict], orders: list[dict[str, Any]]) -> None:
     by_symbol: dict[str, list[dict[str, Any]]] = {}
     for order in orders:
@@ -300,6 +351,13 @@ def _select_protection_order(orders: list[dict[str, Any]], kind: str) -> dict[st
 
 async def _status_summary() -> dict[str, Any]:
     summary = st.status_summary(_DB)
+    try:
+        _apply_live_balance(summary, await _live_balance_snapshot())
+    except Exception as e:
+        logger.warning("live balance unavailable, fallback to db snapshot: {}", e)
+        if summary.get("balance"):
+            summary["balance"]["equity_source"] = "db_snapshot"
+            summary["balance"]["equity_error"] = str(e)
     try:
         live = await _live_positions_snapshot()
         summary["positions"] = live["positions"]
@@ -457,6 +515,18 @@ async def api_pnl(
         "start_ts_ms": start,
         "end_ts_ms": end,
     }
+    try:
+        live_balance = await _live_balance_snapshot()
+        stats.update(st.day_equity_change(
+            _DB,
+            current_equity=float(live_balance["total_equity"]),
+            now_ms=int(live_balance["ts_ms"]),
+        ))
+        stats["equity_source"] = "exchange"
+    except Exception as e:
+        logger.warning("live pnl equity unavailable, fallback to db snapshot: {}", e)
+        stats["equity_source"] = "db_snapshot"
+        stats["equity_error"] = str(e)
     try:
         live = await _live_positions_snapshot()
         stats["day_unrealized_pnl"] = sum(

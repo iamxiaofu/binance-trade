@@ -533,6 +533,7 @@ def latest_balance(db_path: str) -> dict | None:
 def day_equity_change(
     db_path: str,
     *,
+    current_equity: float | None = None,
     latest_ts_ms: int | None = None,
     now_ms: int | None = None,
 ) -> dict[str, Any]:
@@ -560,22 +561,28 @@ def day_equity_change(
     latest = latest_rows[0]
     effective_now = int(now_ms if now_ms is not None else (latest_ts_ms or _now_ms()))
     start_ts = utc8_day_start_ms(effective_now)
-    first_rows = _rows(
+    baseline_rows = _rows(
         db_path,
         "SELECT ts_ms, created_at, total_equity FROM balance_snapshots "
-        "WHERE ts_ms >= ? AND ts_ms <= ? ORDER BY ts_ms ASC, id ASC LIMIT 1",
-        (start_ts, effective_now),
+        "WHERE ts_ms <= ? ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        (start_ts,),
     )
-    latest_equity = float(latest.get("total_equity") or 0.0)
-    if not first_rows:
-        start_equity = latest_equity
-        start_snapshot_ts = None
-        start_snapshot_at = ""
-    else:
-        first = first_rows[0]
-        start_equity = float(first.get("total_equity") or 0.0)
-        start_snapshot_ts = int(first.get("ts_ms") or 0) or None
-        start_snapshot_at = str(first.get("created_at") or "")
+    if not baseline_rows:
+        baseline_rows = _rows(
+            db_path,
+            "SELECT ts_ms, created_at, total_equity FROM balance_snapshots "
+            "WHERE ts_ms >= ? AND ts_ms <= ? ORDER BY ts_ms ASC, id ASC LIMIT 1",
+            (start_ts, effective_now),
+        )
+    latest_equity = (
+        float(current_equity)
+        if current_equity is not None
+        else float(latest.get("total_equity") or 0.0)
+    )
+    baseline = baseline_rows[0] if baseline_rows else latest
+    start_equity = float(baseline.get("total_equity") or 0.0)
+    start_snapshot_ts = int(baseline.get("ts_ms") or 0) or None
+    start_snapshot_at = str(baseline.get("created_at") or "")
     return {
         "day_equity_change": latest_equity - start_equity,
         "day_equity_start": start_equity,

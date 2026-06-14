@@ -295,13 +295,25 @@ async def test_day_equity_change_uses_utc8_day_boundary(db, monkeypatch):
 
     change = status.day_equity_change(db, latest_ts_ms=day_start + 2_000)
     assert change["day_equity_start_ts_ms"] == day_start
-    assert change["day_equity_start_snapshot_ts_ms"] == day_start + 1_000
-    assert change["day_equity_start"] == pytest.approx(205.0)
+    assert change["day_equity_start_snapshot_ts_ms"] == day_start - 1_000
+    assert change["day_equity_start"] == pytest.approx(200.0)
     assert change["day_equity_latest"] == pytest.approx(197.5)
-    assert change["day_equity_change"] == pytest.approx(-7.5)
+    assert change["day_equity_change"] == pytest.approx(-2.5)
     monkeypatch.setattr(status, "_now_ms", lambda: day_start + 2_000)
-    assert status.latest_balance(db)["day_equity_change"] == pytest.approx(-7.5)
-    assert status.pnl_stats(db)["day_equity_change"] == pytest.approx(-7.5)
+    assert status.latest_balance(db)["day_equity_change"] == pytest.approx(-2.5)
+    assert status.pnl_stats(db)["day_equity_change"] == pytest.approx(-2.5)
+
+
+async def test_day_equity_change_accepts_live_equity(db):
+    latest_ts = status.latest_balance(db)["ts_ms"]
+    change = status.day_equity_change(
+        db,
+        current_equity=193.25,
+        now_ms=latest_ts,
+    )
+    assert change["day_equity_start"] == pytest.approx(200.0)
+    assert change["day_equity_latest"] == pytest.approx(193.25)
+    assert change["day_equity_change"] == pytest.approx(-6.75)
 
 
 def test_resolve_time_bounds_custom_range():
