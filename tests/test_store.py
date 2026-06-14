@@ -628,11 +628,30 @@ async def test_upsert_dynamic_symbol_from_exchange_defaults_disabled(store):
 
 async def test_set_symbol_enabled_updates_registry_and_runtime(store):
     await store.sync_config_symbols(["BTCUSDT"])
-    await store.set_symbol_enabled("BTCUSDT", False)
+    await store.set_symbol_enabled(
+        "BTCUSDT",
+        False,
+        reason_code="PROTECTION_FAILURE",
+        reason="SL missing",
+        source="engine",
+        action="disable_new_entries",
+    )
 
     row = await store.get_symbol("BTCUSDT")
     assert row["enabled"] is False
+    assert row["disabled_reason_code"] == "PROTECTION_FAILURE"
+    assert row["disabled_reason"] == "SL missing"
+    assert row["disabled_source"] == "engine"
+    assert row["disabled_action"] == "disable_new_entries"
+    assert row["disabled_at"]
     assert await store.get_runtime_setting("symbol.enabled.BTCUSDT") == "false"
+
+    await store.set_symbol_enabled("BTCUSDT", True)
+    row = await store.get_symbol("BTCUSDT")
+    assert row["enabled"] is True
+    assert row["disabled_reason_code"] == ""
+    assert row["disabled_reason"] == ""
+    assert row["last_enabled_at"]
 
 
 async def test_update_symbol_filters_keeps_enabled_state(store):

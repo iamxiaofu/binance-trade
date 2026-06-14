@@ -113,6 +113,11 @@ const symbolRows = computed(() => {
       minNotional: Number(item.min_notional || 0),
       tickSize: Number(item.tick_size || 0),
       stepSize: Number(item.step_size || 0),
+      disabledReasonCode: item.disabled_reason_code || '',
+      disabledReason: item.disabled_reason || '',
+      disabledAt: item.disabled_at || '',
+      disabledSource: item.disabled_source || '',
+      disabledAction: item.disabled_action || '',
     }
   })
 })
@@ -401,11 +406,22 @@ watch(
       </div>
       <el-table :data="symbolRows" stripe>
         <el-table-column prop="symbol" label="币种" width="120" />
-        <el-table-column label="状态" width="110">
+        <el-table-column label="状态" width="190">
           <template #default="{ row }">
-            <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
-              {{ row.enabled ? '已启用' : '已停用' }}
-            </el-tag>
+            <el-space>
+              <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
+                {{ row.enabled ? '已启用' : '已停用' }}
+              </el-tag>
+              <el-tooltip
+                v-if="!row.enabled && (row.disabledReason || row.disabledReasonCode)"
+                :content="[row.disabledReasonCode, row.disabledReason, row.disabledAt].filter(Boolean).join(' | ')"
+                placement="top"
+              >
+                <el-tag type="danger" size="small">
+                  {{ row.disabledReasonCode || 'DISABLED' }}
+                </el-tag>
+              </el-tooltip>
+            </el-space>
           </template>
         </el-table-column>
         <el-table-column label="持仓" width="100">

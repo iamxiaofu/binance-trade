@@ -67,6 +67,12 @@ class FakeStore:
                 "min_notional": 0.0,
                 "tick_size": 0.0,
                 "step_size": 0.0,
+                "disabled_reason_code": "",
+                "disabled_reason": "",
+                "disabled_at": "",
+                "disabled_source": "",
+                "disabled_action": "",
+                "last_enabled_at": "",
             }
         }
 
@@ -267,6 +273,12 @@ class FakeStore:
                     "min_notional": 0.0,
                     "tick_size": 0.0,
                     "step_size": 0.0,
+                    "disabled_reason_code": "",
+                    "disabled_reason": "",
+                    "disabled_at": "",
+                    "disabled_source": "",
+                    "disabled_action": "",
+                    "last_enabled_at": "",
                 },
             )
 
@@ -279,8 +291,30 @@ class FakeStore:
     async def get_symbol(self, symbol):
         return self.symbols.get(symbol)
 
-    async def set_symbol_enabled(self, symbol, enabled):
+    async def set_symbol_enabled(
+        self,
+        symbol,
+        enabled,
+        *,
+        reason_code="",
+        reason="",
+        source="",
+        action="",
+    ):
         self.symbols[symbol]["enabled"] = enabled
+        if enabled:
+            self.symbols[symbol]["disabled_reason_code"] = ""
+            self.symbols[symbol]["disabled_reason"] = ""
+            self.symbols[symbol]["disabled_at"] = ""
+            self.symbols[symbol]["disabled_source"] = ""
+            self.symbols[symbol]["disabled_action"] = ""
+            self.symbols[symbol]["last_enabled_at"] = "now"
+        else:
+            self.symbols[symbol]["disabled_reason_code"] = reason_code
+            self.symbols[symbol]["disabled_reason"] = reason
+            self.symbols[symbol]["disabled_at"] = "now"
+            self.symbols[symbol]["disabled_source"] = source
+            self.symbols[symbol]["disabled_action"] = action
         self.runtime_settings[f"symbol.enabled.{symbol}"] = str(enabled).lower()
 
     async def update_symbol_filters(self, symbol, filters):
@@ -313,6 +347,12 @@ class FakeStore:
             "min_notional": float(filters.min_notional),
             "tick_size": float(filters.tick_size),
             "step_size": float(filters.step_size),
+            "disabled_reason_code": "",
+            "disabled_reason": "",
+            "disabled_at": "",
+            "disabled_source": "",
+            "disabled_action": "",
+            "last_enabled_at": "",
         }
         self.runtime_settings[f"symbol.enabled.{symbol}"] = str(enabled).lower()
         return self.symbols[symbol]
@@ -416,6 +456,7 @@ class FakeExecutor:
         self.flattened = 0
         self.canceled = 0
         self.opened = []
+        self.closed = []
 
     async def flatten_all(self, symbols=None):
         self.flattened += 1
@@ -451,6 +492,7 @@ class FakeExecutor:
         ]
 
     async def close_position(self, position, *, mode=None, skip_slippage_guard=False):
+        self.closed.append((position, mode, skip_slippage_guard))
         return {"symbol": "BTCUSDT", "kind": "CLOSE", "status": "filled",
                 "filled": True, "closed": True, "dry_run": False,
                 "qty": abs(float(position.get("contracts") or 0)),
@@ -1543,6 +1585,40 @@ async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, m
     assert eng._store.orders == []
     assert eng._store.marked[0][1] == "failed"
     assert "空单止损必须高于当前标记价" in eng._store.marked[0][2]
+
+
+async def test_reconcile_emergency_closes_when_repair_sl_crossed_mark(settings, creds, monkeypatch):
+    settings.risk.max_loss_per_trade_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.open_trades.add("BTCUSDT")
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "short",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+        "markPrice": 103.0,
+    }]
+    eng._client.condition_orders = [
+        {"id": "tp-1", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
+         "side": "buy", "amount": 1.0, "stopPrice": 95.0, "status": "open",
+         "reduceOnly": True},
+    ]
+    eng._store.templates = {
+        "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
+        "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
+    }
+
+    await eng._enforce_exchange_invariants("periodic")
+
+    assert eng._symbol_enabled["BTCUSDT"] is False
+    assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "false"
+    row = eng._store.symbols["BTCUSDT"]
+    assert row["disabled_reason_code"] == "SL_TRIGGER_CROSSED_MARK"
+    assert row["disabled_action"] == "emergency_close"
+    assert "SL trigger crossed current mark" in row["disabled_reason"]
+    assert eng._executor.closed
+    assert any(o.get("kind") == "CLOSE" for o in eng._store.orders)
 
 
 async def test_command_repair_sl_tp_keeps_active_tp_after_mark_crosses_trigger(settings, creds, monkeypatch):

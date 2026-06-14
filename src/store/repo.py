@@ -80,6 +80,12 @@ _SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("step_size", "FLOAT NOT NULL DEFAULT 0.0"),
     ("raw_filters_json", "TEXT NOT NULL DEFAULT ''"),
     ("exchange_state_json", "TEXT NOT NULL DEFAULT ''"),
+    ("disabled_reason_code", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("disabled_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("disabled_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("disabled_source", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("disabled_action", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("last_enabled_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
     ("added_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
     ("updated_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
     ("last_filter_sync_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
@@ -395,6 +401,12 @@ class Store:
             "step_size": row.step_size,
             "raw_filters_json": row.raw_filters_json,
             "exchange_state_json": row.exchange_state_json,
+            "disabled_reason_code": row.disabled_reason_code,
+            "disabled_reason": row.disabled_reason,
+            "disabled_at": row.disabled_at,
+            "disabled_source": row.disabled_source,
+            "disabled_action": row.disabled_action,
+            "last_enabled_at": row.last_enabled_at,
             "added_at": row.added_at,
             "updated_at": row.updated_at,
             "last_filter_sync_at": row.last_filter_sync_at,
@@ -547,7 +559,16 @@ class Store:
             row.last_filter_sync_at = now
             await session.commit()
 
-    async def set_symbol_enabled(self, symbol: str, enabled: bool) -> None:
+    async def set_symbol_enabled(
+        self,
+        symbol: str,
+        enabled: bool,
+        *,
+        reason_code: str = "",
+        reason: str = "",
+        source: str = "",
+        action: str = "",
+    ) -> None:
         symbol = normalize_symbol(symbol)
         now = _now_iso_utc()
         async with self._sessionmaker() as session:
@@ -556,6 +577,19 @@ class Store:
                 raise ValueError(f"symbol not registered: {symbol}")
             row.enabled = enabled
             row.updated_at = now
+            if enabled:
+                row.disabled_reason_code = ""
+                row.disabled_reason = ""
+                row.disabled_at = ""
+                row.disabled_source = ""
+                row.disabled_action = ""
+                row.last_enabled_at = now
+            else:
+                row.disabled_reason_code = (reason_code or "DISABLED")[:64]
+                row.disabled_reason = (reason or "")[:2000]
+                row.disabled_at = now
+                row.disabled_source = (source or "")[:32]
+                row.disabled_action = (action or "")[:32]
             runtime = await session.get(RuntimeSettingRow, f"symbol.enabled.{symbol}")
             if runtime is None:
                 session.add(

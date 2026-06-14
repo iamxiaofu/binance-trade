@@ -44,6 +44,19 @@ _POST_CLOSE_RECONCILE_GRACE_SECONDS = 30.0
 _UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0)
 
 
+class ProtectionRepairError(ValueError):
+    def __init__(
+        self,
+        symbol: str,
+        message: str,
+        *,
+        reason_code: str = "PROTECTION_REPAIR_FAILED",
+    ):
+        super().__init__(message)
+        self.symbol = symbol
+        self.reason_code = reason_code
+
+
 class TradingEngine:
     def __init__(self, settings: Settings, creds: Credentials):
         self._settings = settings
@@ -397,7 +410,14 @@ class TradingEngine:
         if enabled and record.get("needs_review"):
             raise ValueError(f"{symbol} needs manual review before enable")
         self._symbol_enabled[symbol] = enabled
-        await self._store.set_symbol_enabled(symbol, enabled)
+        await self._store.set_symbol_enabled(
+            symbol,
+            enabled,
+            reason_code="" if enabled else "MANUAL_DISABLED",
+            reason="" if enabled else "manual disabled via SET_SYMBOL_ENABLED",
+            source="web:admin",
+            action="manual_toggle",
+        )
         await self._reload_symbols_from_store()
         return f"{symbol} strategy enabled set to {enabled} (persisted)"
 
@@ -585,6 +605,30 @@ class TradingEngine:
     @staticmethod
     def _symbol_enabled_key(symbol: str) -> str:
         return f"symbol.enabled.{normalize_symbol(symbol)}"
+
+    async def _set_symbol_disabled(
+        self,
+        symbol: str,
+        *,
+        reason_code: str,
+        reason: str,
+        source: str,
+        action: str,
+    ) -> None:
+        symbol = normalize_symbol(symbol)
+        self._symbol_enabled[symbol] = False
+        await self._store.set_symbol_enabled(
+            symbol,
+            False,
+            reason_code=reason_code,
+            reason=reason,
+            source=source,
+            action=action,
+        )
+        logger.error(
+            "symbol disabled {} reason_code={} source={} action={} reason={}",
+            symbol, reason_code, source, action, reason,
+        )
 
     async def _cancel_and_flatten(self, source: str) -> str:
         """撤销挂单并平掉当前持仓，但不停止交易引擎。"""
@@ -797,6 +841,20 @@ class TradingEngine:
                 equity=equity,
             )
             if reason:
+                if kind == "SL":
+                    crossed_mark = (
+                        (side == "long" and trigger >= mark)
+                        or (side == "short" and trigger <= mark)
+                    )
+                    if crossed_mark:
+                        raise ProtectionRepairError(
+                            symbol,
+                            (
+                                f"{symbol}: SL trigger crossed current mark; "
+                                f"side={side} sl={trigger:.2f} mark={mark:.2f}; {reason}"
+                            ),
+                            reason_code="SL_TRIGGER_CROSSED_MARK",
+                        )
                 rejected.append(f"{kind}@{trigger:.2f}: {reason}")
                 continue
             otype = "STOP_MARKET" if kind == "SL" else "TAKE_PROFIT_MARKET"
@@ -804,7 +862,10 @@ class TradingEngine:
             accepted.append(f"{kind}@{trigger:.2f}({source})")
 
         if not specs:
-            raise ValueError(f"{symbol}: 未补挂保护单；" + "；".join(rejected))
+            raise ProtectionRepairError(
+                symbol,
+                f"{symbol}: 未补挂保护单；" + "；".join(rejected),
+            )
 
         results = await self._executor.place_protection_orders(
             symbol=symbol,
@@ -1438,8 +1499,13 @@ class TradingEngine:
         )
 
     async def _disable_symbol_due_protection_failure(self, symbol: str, reason: str) -> None:
-        self._symbol_enabled[symbol] = False
-        await self._store.set_runtime_setting(self._symbol_enabled_key(symbol), "false")
+        await self._set_symbol_disabled(
+            symbol,
+            reason_code="PROTECTION_FAILURE",
+            reason=reason,
+            source="engine",
+            action="disable_new_entries",
+        )
         logger.error("disabled {} due protection failure: {}", symbol, reason)
         await self._notifier.send(Event.ERROR, f"{symbol} disabled: {reason}")
 
@@ -1476,6 +1542,31 @@ class TradingEngine:
             Event.CLOSE,
             f"{symbol} emergency closed unprotected position pnl={pnl:.2f}",
         )
+
+    async def _disable_symbol_and_emergency_close(
+        self,
+        symbol: str,
+        *,
+        reason_code: str,
+        reason: str,
+        source: str,
+    ) -> None:
+        await self._set_symbol_disabled(
+            symbol,
+            reason_code=reason_code,
+            reason=reason,
+            source=source,
+            action="emergency_close",
+        )
+        logger.error(
+            "{} emergency close starting after symbol disable: reason_code={} reason={}",
+            symbol, reason_code, reason,
+        )
+        await self._notifier.send(
+            Event.ERROR,
+            f"{symbol} disabled; emergency close starting: {reason[:180]}",
+        )
+        await self._emergency_close_unprotected_position(symbol, reason=reason)
 
     async def _stale_condition_open_block_reason(self, decision: TradeDecision) -> str:
         symbol = decision.symbol
@@ -1516,8 +1607,13 @@ class TradingEngine:
         return f"{symbol}: 当前持仓已有保护条件单，暂不支持叠加开仓以避免保护数量失配"
 
     async def _disable_symbol_due_stale_conditions(self, symbol: str, details: str) -> None:
-        self._symbol_enabled[symbol] = False
-        await self._store.set_runtime_setting(self._symbol_enabled_key(symbol), "false")
+        await self._set_symbol_disabled(
+            symbol,
+            reason_code="STALE_CONDITION_ORDERS",
+            reason=f"stale condition orders remain: {details}",
+            source="engine",
+            action="disable_new_entries",
+        )
         logger.error("disabled {} due stale condition orders: {}", symbol, details)
         await self._notifier.send(
             Event.ERROR,
@@ -2793,6 +2889,26 @@ class TradingEngine:
                         "{} SL missing during {}; protection repair failed: {}",
                         symbol, reason, e,
                     )
+                    if (
+                        isinstance(e, ProtectionRepairError)
+                        and e.reason_code == "SL_TRIGGER_CROSSED_MARK"
+                    ):
+                        close_reason = (
+                            f"SL protection missing during exchange reconcile ({reason}); "
+                            f"{e}"
+                        )
+                        logger.error(
+                            "{} SL repair trigger crossed mark during {}; "
+                            "emergency close required: {}",
+                            symbol, reason, e,
+                        )
+                        await self._disable_symbol_and_emergency_close(
+                            symbol,
+                            reason_code=e.reason_code,
+                            reason=close_reason,
+                            source=f"engine:{reason}",
+                        )
+                        continue
                 await self._disable_symbol_due_protection_failure(
                     symbol,
                     f"SL protection missing during exchange reconcile ({reason})",
@@ -2874,11 +2990,16 @@ class TradingEngine:
             return False
         if live_position is not None:
             self.runtime.positions[symbol] = live_position
-        self._symbol_enabled[symbol] = False
-        await self._store.set_symbol_enabled(symbol, False)
         message = (
             f"{symbol} live position detected during {reason}, but no local open trade "
             "exists; symbol disabled and auto close skipped"
+        )
+        await self._set_symbol_disabled(
+            symbol,
+            reason_code="UNMANAGED_LIVE_POSITION",
+            reason=message,
+            source=f"engine:{reason}",
+            action="disable_new_entries",
         )
         logger.error(message)
         await self._notifier.send(Event.ERROR, message)

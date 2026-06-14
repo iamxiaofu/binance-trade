@@ -179,6 +179,12 @@ async def _symbol_rows() -> list[dict[str, Any]]:
                 "min_notional": 0.0,
                 "tick_size": 0.0,
                 "step_size": 0.0,
+                "disabled_reason_code": "",
+                "disabled_reason": "",
+                "disabled_at": "",
+                "disabled_source": "",
+                "disabled_action": "",
+                "last_enabled_at": "",
             }
             for symbol in _settings.symbols
         ]
