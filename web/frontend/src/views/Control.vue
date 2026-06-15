@@ -12,6 +12,21 @@ const loading = ref(false)
 const symbolLoading = ref({})
 const newSymbol = ref('')
 const addSymbolLoading = ref(false)
+const riskState = ref(null)
+const riskForm = ref({})
+const riskPreview = ref(null)
+const riskLoading = ref(false)
+const riskFields = [
+  { key: 'max_leverage', label: '最大杠杆', min: 1, max: 125, step: 1 },
+  { key: 'max_order_margin_pct', label: '单笔保证金占权益上限 (%)', min: 0.01, max: 100, step: 1, scale: 100 },
+  { key: 'max_symbol_margin_pct', label: '单币种保证金占权益上限 (%)', min: 0.01, max: 100, step: 1, scale: 100 },
+  { key: 'max_total_margin_pct', label: '总保证金占权益上限 (%)', min: 0.01, max: 100, step: 1, scale: 100 },
+  { key: 'max_loss_per_order_margin_pct', label: '单笔止损占订单保证金上限 (%)', min: 0.01, max: 100, step: 1 },
+  { key: 'liq_distance_min_pct', label: '最小爆仓距离 (%)', min: 0, max: 100, step: 1 },
+  { key: 'daily_max_loss_pct', label: '日亏熔断 (%)', min: 0.01, max: 100, step: 1 },
+  { key: 'max_drawdown_pct', label: '回撤熔断 (%)', min: 0.01, max: 100, step: 1 },
+  { key: 'min_confidence', label: '最小置信度', min: 0, max: 1, step: 0.05 },
+]
 const configCommandIds = new Set()
 const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED', 'ADD_SYMBOL', 'REVIEW_SYMBOL'])
 const SYMBOL_SYNC_ATTEMPTS = 8
@@ -24,7 +39,61 @@ async function loadCfg() {
   cfg.value = await api.config().catch(() => null)
 }
 async function refreshAll() {
-  await Promise.all([loadCfg(), loadCommands()])
+  await Promise.all([loadCfg(), loadCommands(), loadRisk()])
+}
+
+async function loadRisk() {
+  riskState.value = await api.riskSettings().catch(() => null)
+  if (!riskState.value) return
+  riskForm.value = Object.fromEntries(riskFields.map((field) => [
+    field.key,
+    Number(riskState.value.effective[field.key]) * (field.scale || 1),
+  ]))
+  riskPreview.value = null
+}
+
+function riskPayload() {
+  return Object.fromEntries(riskFields.map((field) => [
+    field.key,
+    Number(riskForm.value[field.key]) / (field.scale || 1),
+  ]))
+}
+
+async function previewRisk() {
+  riskLoading.value = true
+  try {
+    riskPreview.value = await api.riskPreview({
+      expected_version: riskState.value.version,
+      values: riskPayload(),
+    })
+  } catch (e) {
+    ElMessage.error(`参数校验失败: ${e.message}`)
+  } finally {
+    riskLoading.value = false
+  }
+}
+
+async function applyRisk() {
+  await previewRisk()
+  if (!riskPreview.value || Object.keys(riskPreview.value.changes || {}).length === 0) {
+    ElMessage.info('没有参数变化')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将立即应用 ${Object.keys(riskPreview.value.changes).length} 项风险参数修改。降低熔断阈值可能立即触发强制平仓。`,
+      '确认应用风险参数',
+      { type: 'warning', confirmButtonText: '应用', cancelButtonText: '取消' },
+    )
+    const result = await api.riskApply({
+      expected_version: riskState.value.version,
+      values: riskPayload(),
+    })
+    ElMessage.success(`风险参数更新命令已入队 (#${result.id})`)
+    await loadCommands()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error(`应用失败: ${e.message || e}`)
+  }
 }
 
 async function send(name, arg = '', confirmText = null) {
@@ -96,6 +165,13 @@ const strategyPauseTooltip = computed(() =>
     strategyPause.value.source,
   ].filter(Boolean).join(' | ')
 )
+const streamState = computed(() => cfg.value?.user_stream || live.summary?.stream || {})
+const streamTagType = computed(() => ({
+  LIVE: 'success',
+  RESYNCING: 'warning',
+  DEGRADED: 'warning',
+  DISCONNECTED: 'danger',
+})[streamState.value.status] || 'info')
 const configuredSymbols = computed(() => cfg.value?.symbols || [])
 const allSymbolsEnabled = computed(() =>
   symbolRows.value
@@ -350,6 +426,20 @@ watch(
             <el-descriptions-item label="数据库">
               <span class="mono">{{ cfg.db_path }}</span>
             </el-descriptions-item>
+            <el-descriptions-item label="Binance 私有流">
+              <el-tag :type="streamTagType" effect="dark">
+                {{ streamState.status || 'STARTING' }}
+              </el-tag>
+              <span v-if="streamState.reason" style="margin-left:8px">
+                {{ streamState.reason }}
+              </span>
+            </el-descriptions-item>
+            <el-descriptions-item label="最近 REST 对账">
+              {{ streamState.last_resync_at_ms ? localTime(streamState.last_resync_at_ms) : '—' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="事件状态延迟">
+              {{ streamState.event_lag_ms == null ? '—' : `${streamState.event_lag_ms} ms` }}
+            </el-descriptions-item>
           </el-descriptions>
         </el-card>
       </el-col>
@@ -521,6 +611,39 @@ watch(
           </template>
         </el-table-column>
       </el-table>
+    </el-card>
+
+    <el-card shadow="never" style="margin-top:16px">
+      <template #header>
+        <div style="display:flex; justify-content:space-between; align-items:center">
+          <span>动态风险参数</span>
+          <el-tag v-if="riskState" type="info">版本 {{ riskState.version }}</el-tag>
+        </div>
+      </template>
+      <el-alert type="warning" :closable="false" style="margin-bottom:12px"
+        title="参数由交易引擎通过命令队列原子应用；mainnet 需要输入 MAINNET 二次确认。" />
+      <el-form v-if="riskState" label-width="245px">
+        <el-row :gutter="16">
+          <el-col v-for="field in riskFields" :key="field.key" :span="12">
+            <el-form-item :label="field.label">
+              <el-input-number v-model="riskForm[field.key]" :min="field.min" :max="field.max"
+                :step="field.step" style="width:100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+      <el-table v-if="riskPreview && Object.keys(riskPreview.changes || {}).length" :data="Object.entries(riskPreview.changes).map(([key, value]) => ({ key, ...value }))" size="small" style="margin-bottom:12px">
+        <el-table-column prop="key" label="参数" />
+        <el-table-column prop="before" label="修改前" />
+        <el-table-column prop="after" label="修改后" />
+      </el-table>
+      <el-alert v-if="riskPreview?.impact?.would_trigger_daily_loss || riskPreview?.impact?.would_trigger_drawdown"
+        type="error" :closable="false" show-icon style="margin-bottom:12px"
+        title="应用后将立即触发熔断并强制平仓" />
+      <el-space>
+        <el-button :loading="riskLoading" @click="previewRisk">预览影响</el-button>
+        <el-button type="primary" :loading="riskLoading" @click="applyRisk">确认并立即应用</el-button>
+      </el-space>
     </el-card>
 
     <el-card shadow="never" style="margin-top:16px">

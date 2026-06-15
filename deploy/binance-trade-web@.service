@@ -1,0 +1,29 @@
+[Unit]
+Description=binance-trade web API (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/binance-trade
+Environment=PYTHONPATH=/opt/binance-trade
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/binance-trade/web-%i.env
+Environment=BINANCE_CONFIG=/etc/binance-trade/config.%i.yaml
+Environment=BINANCE_ENV=/etc/binance-trade/web-%i.env
+Environment=WEB_HOST=127.0.0.1
+ExecStartPre=/opt/binance-trade/scripts/check_env_ready.sh /etc/binance-trade/web-%i.env
+ExecStart=/opt/binance-trade/.venv/bin/python -m web.server
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/binance-trade/%i /var/log/binance-trade/%i
+
+[Install]
+WantedBy=multi-user.target

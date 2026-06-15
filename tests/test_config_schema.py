@@ -16,6 +16,7 @@ from src.config.schema import (
     Settings,
     StorageConfig,
     ThrottleConfig,
+    Credentials,
 )
 
 
@@ -36,7 +37,7 @@ def _settings(*, mode: str, storage: StorageConfig) -> Settings:
             max_order_margin_pct=0.2,
             max_symbol_margin_pct=0.4,
             max_total_margin_pct=0.8,
-            max_loss_per_trade_pct=2,
+            max_loss_per_order_margin_pct=30,
             max_drawdown_pct=20,
             daily_max_loss_pct=10,
             liq_distance_min_pct=5,
@@ -130,3 +131,8 @@ def test_execution_rejects_non_market_emergency_mode():
             max_order_retries=3,
             recv_window=5000,
         )
+
+
+def test_credentials_do_not_require_fixed_llm_key():
+    creds = Credentials(binance_api_key="key", binance_api_secret="secret")
+    assert creds.anthropic_api_key == ""

@@ -36,7 +36,7 @@ def settings() -> Settings:
             max_order_margin_pct=0.2,          # 200*0.2=40
             max_symbol_margin_pct=0.4,         # 200*0.4=80
             max_total_margin_pct=0.8,          # 200*0.8=160
-            max_loss_per_trade_pct=2,          # 200*2%=4
+            max_loss_per_order_margin_pct=30,         # stop loss <= 30% of order margin
             max_drawdown_pct=20,
             daily_max_loss_pct=10,             # 200*10%=20
             liq_distance_min_pct=5,

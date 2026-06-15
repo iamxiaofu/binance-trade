@@ -107,7 +107,7 @@ def test_profit_lock_long():
 
 class _MockSettings:
     class risk:
-        max_loss_per_trade_pct = 2.0  # 2% of equity
+        max_loss_per_order_margin_pct = 2.0  # 2% of equity
 
 
 class _MockEngine:
@@ -133,7 +133,7 @@ class _MockEngine:
         if kind == "SL" and equity > 0:
             loss = (entry - trigger) * qty if side == "long" else (trigger - entry) * qty
             if loss >= 0:
-                max_loss = equity * (self._settings.risk.max_loss_per_trade_pct / 100.0)
+                max_loss = equity * (self._settings.risk.max_loss_per_order_margin_pct / 100.0)
                 if max_loss > 0 and loss > max_loss:
                     return f"止损亏损 {loss:.2f} 超过上限 {max_loss:.2f}"
         return ""
@@ -160,7 +160,7 @@ def test_validate_profit_lock_passes():
 
 
 def test_validate_sl_exceeds_max_loss_rejected():
-    """止损距离过大超过 max_loss_per_trade_pct，应被拒绝。"""
+    """止损距离过大超过 max_loss_per_order_margin_pct，应被拒绝。"""
     # equity=1000, max_loss=2% = 20 USDT; qty=1 BTC, entry=mark=65000
     # trigger=64900 → loss=(65000-64900)*1=100 > 20
     err = _eng.validate(side="long", kind="SL", trigger=64900, entry=65000,

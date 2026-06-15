@@ -4,7 +4,7 @@
 // 页面隐藏时跳过轮询请求，避免后台标签页持续请求。
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { api } from '../api'
+import { api, wsPath } from '../api'
 
 export const useLiveStore = defineStore('live', () => {
   const connected = ref(false)
@@ -52,7 +52,7 @@ export const useLiveStore = defineStore('live', () => {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     try {
-      ws = new WebSocket(`${proto}://${location.host}/ws`)
+      ws = new WebSocket(`${proto}://${location.host}${wsPath()}`)
     } catch (_) { return }
     ws.onmessage = (ev) => {
       try { _apply(JSON.parse(ev.data), 'ws') } catch (_) { /* ignore */ }

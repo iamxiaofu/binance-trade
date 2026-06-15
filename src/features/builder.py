@@ -89,7 +89,9 @@ def build_context(
     # 资金基准：优先权益，缺失退回可用保证金。把保证金/止损亏损上限告知 LLM。
     equity_base = equity if equity > 0 else available_margin
     max_order_margin_abs = equity_base * settings.risk.max_order_margin_pct
-    max_loss_per_trade_abs = equity_base * (settings.risk.max_loss_per_trade_pct / 100.0)
+    max_loss_per_trade_abs = max_order_margin_abs * (
+        settings.risk.max_loss_per_order_margin_pct / 100.0
+    )
 
     return MarketContext(
         symbol=symbol,

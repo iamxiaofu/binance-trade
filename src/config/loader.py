@@ -45,7 +45,8 @@ def _load_credentials(notify: NotifyConfig) -> Credentials:
     creds = Credentials(
         binance_api_key=_require_env("BINANCE_API_KEY"),
         binance_api_secret=_require_env("BINANCE_API_SECRET"),
-        anthropic_api_key=_require_env("ANTHROPIC_API_KEY"),
+        # LLM secrets are exclusively managed by environment-specific DB profiles.
+        anthropic_api_key="",
     )
     # 仅在开启 Telegram 时才强制要求其密钥
     if notify.telegram_enabled:
@@ -60,7 +61,9 @@ def load_config(
 ) -> tuple[Settings, Credentials]:
     """加载并校验配置。任何问题都抛出 ConfigError（含清晰原因）。"""
     if env_path is not None and Path(env_path).exists():
-        load_dotenv(env_path, override=False)
+        # 显式传入的环境文件必须拥有当前进程的配置所有权，避免同一 shell
+        # 中残留的 testnet/mainnet 凭据污染另一个实例。
+        load_dotenv(env_path, override=True)
 
     raw = _load_yaml(Path(config_path))
 

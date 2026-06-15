@@ -1,6 +1,27 @@
 // 统一的后端 API 封装。Basic Auth 由浏览器在首次 401 后自动附带，
 // 因此这里不手动管理凭据；仅做 fetch + JSON 解析 + 错误处理。
 const JSON_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json' }
+const ENV_KEY = 'binance-trade-environment'
+let environment = localStorage.getItem(ENV_KEY) === 'mainnet' ? 'mainnet' : 'testnet'
+
+export function getEnvironment() {
+  return environment
+}
+
+export function setEnvironment(value) {
+  environment = value === 'mainnet' ? 'mainnet' : 'testnet'
+  localStorage.setItem(ENV_KEY, environment)
+  window.dispatchEvent(new CustomEvent('binance-trade-environment-change', { detail: environment }))
+}
+
+export function wsPath(path = '') {
+  return `/ws/${environment}${path}`
+}
+
+function environmentPath(path) {
+  if (path.startsWith('/api/')) return `/api/${environment}/${path.slice(5)}`
+  return path
+}
 
 function qs(params) {
   const q = new URLSearchParams()
@@ -35,8 +56,12 @@ function formatDetail(detail) {
 async function req(path, opts = {}) {
   // 没 body 的 POST/PUT 不需要 Content-Type，让 fetch 不带该 header
   const hasBody = opts.body !== undefined && opts.body !== null
-  const headers = hasBody ? JSON_HEADERS : { Accept: 'application/json' }
-  const resp = await fetch(path, { headers, ...opts })
+  const headers = {
+    ...(hasBody ? JSON_HEADERS : { Accept: 'application/json' }),
+    'X-Trade-Environment': environment,
+    ...(opts.headers || {}),
+  }
+  const resp = await fetch(environmentPath(path), { ...opts, headers })
   if (!resp.ok) {
     let detail = resp.statusText
     try {
@@ -46,6 +71,17 @@ async function req(path, opts = {}) {
     throw new Error(`${resp.status}: ${formatDetail(detail)}`)
   }
   return resp.json()
+}
+
+async function mainnetConfirmation(action, payload = '') {
+  if (environment !== 'mainnet') return ''
+  const confirmation = window.prompt(`MAINNET 高风险操作：${action}\n请输入 MAINNET 确认`)
+  if (confirmation !== 'MAINNET') throw new Error('mainnet confirmation canceled')
+  const result = await req('/api/confirmations', {
+    method: 'POST',
+    body: JSON.stringify({ action, payload, confirmation }),
+  })
+  return result.token
 }
 
 export const api = {
@@ -73,8 +109,25 @@ export const api = {
     req(`/api/klines/${symbol}?${qs({ timeframe, limit, source })}`),
   ticker: (symbol, source = undefined) =>
     req(`/api/ticker/${symbol}?${qs({ source })}`),
-  command: (name, arg = '') =>
-    req(`/api/command/${name}?arg=${encodeURIComponent(arg)}`, { method: 'POST' }),
+  command: async (name, arg = '') => {
+    const highRisk = new Set([
+      'KILL_SWITCH', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED',
+      'CLOSE_POSITION', 'CANCEL_AND_FLATTEN', 'STOP_ENGINE',
+    ])
+    const token = highRisk.has(name) ? await mainnetConfirmation(name, arg) : ''
+    return req(`/api/command/${name}?${qs({ arg, confirmation_token: token })}`, { method: 'POST' })
+  },
+  riskSettings: () => req('/api/risk-settings'),
+  riskPreview: (payload) =>
+    req('/api/risk-settings/preview', { method: 'POST', body: JSON.stringify(payload) }),
+  riskApply: async (payload) => {
+    const commandPayload = JSON.stringify({ expected_version: payload.expected_version, ...payload.values })
+    const confirmation_token = await mainnetConfirmation('UPDATE_RISK_SETTINGS', commandPayload)
+    return req('/api/risk-settings/apply', {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, confirmation_token }),
+    })
+  },
 
   // LLM profile 管理
   llmStatus: () => req('/api/llm/status'),

@@ -14,22 +14,28 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import secrets
 import time
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from src.config.loader import load_config
-from src.exchange.client import ExchangeClient
-from src.exchange.orders import normalize_condition_order, normalize_open_order
-from src.exchange.positions import normalize_position, normalize_symbol
+from src.exchange.positions import normalize_symbol
 from src.features.indicators import compute_snapshot
+from src.risk.settings import (
+    RUNTIME_RISK_KEY,
+    RUNTIME_RISK_VERSION_KEY,
+    decode_risk,
+    risk_public,
+    validate_risk_payload,
+)
 from src.store.repo import Store
 from web import status as st
 from web.market_feed import MarketFeedRegistry
@@ -46,26 +52,6 @@ _WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
 app = FastAPI(title="binance-trade dashboard", docs_url=None, redoc_url=None)
 _security = HTTPBasic()
 
-# 只读行情客户端（懒加载，单例）
-_market_client: ExchangeClient | None = None
-_market_lock = asyncio.Lock()
-# 交易所实时持仓缓存：WS 每秒推送，但私有持仓接口不需要每帧都打交易所。
-_positions_lock = asyncio.Lock()
-_positions_cache: dict[str, Any] = {
-    "ts_ms": 0,
-    "positions": [],
-    "condition_orders": [],
-    "error": "",
-    "condition_error": "",
-}
-_POSITIONS_TTL_MS = int(os.environ.get("WEB_POSITIONS_TTL_MS", "2000"))
-_balance_lock = asyncio.Lock()
-_balance_cache: dict[str, Any] = {
-    "ts_ms": 0,
-    "total_equity": None,
-    "available_margin": None,
-}
-_BALANCE_TTL_MS = int(os.environ.get("WEB_BALANCE_TTL_MS", "2000"))
 # 行情数据源注册表：mainnet/testnet 双源（REST + WS），供看板行情用
 _feeds = MarketFeedRegistry()
 # 默认行情源跟随交易模式；需要单独看主网时可用 WEB_MARKET_SOURCE=mainnet 覆盖。
@@ -73,6 +59,8 @@ _SOURCE_ENV = os.environ.get("WEB_MARKET_SOURCE", _settings.mode.value).lower()
 _DEFAULT_SOURCE = _SOURCE_ENV if _SOURCE_ENV in ("mainnet", "testnet") else _settings.mode.value
 # 控制命令写入用的 Store（懒加载）
 _store: Store | None = None
+_confirmations: dict[str, dict[str, Any]] = {}
+_MAINNET_CONFIRM_TTL_SECONDS = 120
 
 
 def _ws_auth_cookie_value() -> str:
@@ -105,6 +93,7 @@ def _check_auth(
         _ws_auth_cookie_value(),
         httponly=True,
         samesite="lax",
+        secure=os.environ.get("WEB_COOKIE_SECURE", "true").lower() in ("1", "true", "yes"),
         max_age=7 * 24 * 3600,
     )
     return credentials.username
@@ -117,16 +106,6 @@ async def _get_store() -> Store:
         await _store.connect()
         await _store.sync_config_symbols(_settings.symbols)
     return _store
-
-
-async def _get_market() -> ExchangeClient:
-    global _market_client
-    async with _market_lock:
-        if _market_client is None:
-            client = ExchangeClient(_settings, _creds)
-            await client.load_markets()
-            _market_client = client
-    return _market_client
 
 
 def _parse_bool_setting(raw: str | None, default: bool) -> bool:
@@ -210,69 +189,6 @@ async def _registered_symbols() -> list[str]:
     return [normalize_symbol(row["symbol"]) for row in rows]
 
 
-async def _live_positions_snapshot() -> dict[str, Any]:
-    """Fetch current exchange positions with a short cache for dashboard pushes."""
-    now = int(time.time() * 1000)
-    async with _positions_lock:
-        cached_ts = int(_positions_cache.get("ts_ms") or 0)
-        if cached_ts and now - cached_ts <= _POSITIONS_TTL_MS:
-            return dict(_positions_cache)
-
-        try:
-            client = await _get_market()
-            raw_positions = await client.fetch_positions(await _registered_symbols())
-            positions = []
-            for raw in raw_positions:
-                pos = normalize_position(raw)
-                if pos["contracts"] > 0:
-                    positions.append(pos)
-            condition_orders, condition_error = await _live_condition_orders(
-                client, [p["symbol"] for p in positions]
-            )
-            registered = await _registered_symbols()
-            open_orders, open_orders_error = await _live_open_orders(client, registered)
-            _attach_protection_orders(positions, condition_orders)
-            _attach_local_trade_metadata(positions)
-            _positions_cache.update({
-                "ts_ms": int(time.time() * 1000),
-                "positions": positions,
-                "condition_orders": condition_orders,
-                "error": "",
-                "condition_error": condition_error,
-                "open_orders": open_orders,
-                "open_orders_error": open_orders_error,
-            })
-        except Exception as e:
-            _positions_cache["error"] = str(e)
-            raise
-        return dict(_positions_cache)
-
-
-async def _live_balance_snapshot() -> dict[str, Any]:
-    """Fetch current exchange USDT equity with a short dashboard cache."""
-    now = int(time.time() * 1000)
-    async with _balance_lock:
-        cached_ts = int(_balance_cache.get("ts_ms") or 0)
-        if cached_ts and now - cached_ts <= _BALANCE_TTL_MS:
-            return dict(_balance_cache)
-
-        client = await _get_market()
-        balance = await client.fetch_balance()
-        quote = _settings.account.quote_asset
-        total_raw = (balance.get("total") or {}).get(quote)
-        free_raw = (balance.get("free") or {}).get(quote)
-        total = float(total_raw) if total_raw is not None else 0.0
-        free = float(free_raw) if free_raw is not None else 0.0
-        if total <= 0 or free < 0:
-            raise ValueError(f"invalid {quote} balance: total={total_raw} free={free_raw}")
-        _balance_cache.update({
-            "ts_ms": int(time.time() * 1000),
-            "total_equity": total,
-            "available_margin": free,
-        })
-        return dict(_balance_cache)
-
-
 def _apply_live_balance(summary: dict[str, Any], live_balance: dict[str, Any]) -> None:
     balance = dict(summary.get("balance") or {})
     total = float(live_balance["total_equity"])
@@ -290,108 +206,70 @@ def _apply_live_balance(summary: dict[str, Any], live_balance: dict[str, Any]) -
     summary["balance"] = balance
 
 
-async def _live_condition_orders(
-    client: ExchangeClient,
-    symbols: list[str],
-) -> tuple[list[dict[str, Any]], str]:
-    merged: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    for symbol in symbols:
-        try:
-            open_orders = await client.fetch_open_condition_orders(symbol)
-            for raw in open_orders:
-                order = normalize_condition_order(raw)
-                if order["kind"] in ("SL", "TP"):
-                    order["status"] = "placed"
-                    merged[order["id"] or f"{symbol}:{order['kind']}:{order['ts_ms']}"] = order
-        except Exception as e:
-            errors.append(f"{symbol} open: {e}")
-    orders = sorted(merged.values(), key=lambda x: (x["symbol"], x["kind"], -(x["ts_ms"] or 0)))
-    return orders, "; ".join(errors)
-
-
-async def _live_open_orders(
-    client: ExchangeClient,
-    symbols: list[str],
-) -> tuple[list[dict[str, Any]], str]:
-    """拉取普通未成交挂单（限价/限价 maker/...），不含 SL/TP 算法单。"""
-    merged: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    for symbol in symbols:
-        try:
-            raws = await client.fetch_open_orders(symbol)
-        except Exception as e:
-            errors.append(f"{symbol} open: {e}")
-            continue
-        for raw in raws:
-            order = normalize_open_order(raw)
-            if not order["id"] and not order["client_order_id"]:
-                continue
-            key = order["id"] or f"{order['symbol']}:{order['client_order_id']}:{order['ts_ms']}"
-            merged[key] = order
-    orders = sorted(merged.values(), key=lambda x: (x["symbol"], x["side"], -(x["ts_ms"] or 0)))
-    return orders, "; ".join(errors)
-
-
-def _attach_protection_orders(positions: list[dict], orders: list[dict[str, Any]]) -> None:
+def _attach_projection_metadata(
+    positions: list[dict[str, Any]], orders: list[dict[str, Any]]
+) -> None:
     by_symbol: dict[str, list[dict[str, Any]]] = {}
     for order in orders:
-        by_symbol.setdefault(order["symbol"], []).append(order)
-
-    for pos in positions:
-        related = by_symbol.get(pos["symbol"], [])
-        protection: dict[str, Any] = {
-            "sl": _select_protection_order(related, "SL"),
-            "tp": _select_protection_order(related, "TP"),
+        by_symbol.setdefault(str(order.get("symbol") or ""), []).append(order)
+    local = st.open_trade_metadata(_DB)
+    for position in positions:
+        symbol = str(position.get("symbol") or "")
+        related = [
+            row for row in by_symbol.get(symbol, [])
+            if row.get("status") in ("placed", "new", "open", "working", "partial")
+        ]
+        sl = next((row for row in related if row.get("kind") == "SL"), None)
+        tp = next((row for row in related if row.get("kind") == "TP"), None)
+        position["protection_orders"] = related
+        position["protection"] = {
+            "sl": sl, "tp": tp, "sl_active": sl is not None, "tp_active": tp is not None,
+            "missing_sl": sl is None, "missing_tp": tp is None,
         }
-        protection["sl_active"] = (protection["sl"] or {}).get("status") == "placed"
-        protection["tp_active"] = (protection["tp"] or {}).get("status") == "placed"
-        protection["missing_sl"] = not protection["sl_active"]
-        protection["missing_tp"] = not protection["tp_active"]
-        pos["protection_orders"] = related
-        pos["protection"] = protection
-
-
-def _attach_local_trade_metadata(positions: list[dict]) -> None:
-    meta = st.open_trade_metadata(_DB)
-    for pos in positions:
-        item = meta.get(pos.get("symbol") or "")
-        if not item:
-            continue
-        pos.update(item)
-        if not pos.get("leverage") and item.get("local_leverage"):
-            pos["leverage"] = item["local_leverage"]
-
-
-def _select_protection_order(orders: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
-    active = [o for o in orders if o["kind"] == kind and o["status"] == "placed"]
-    if not active:
-        return None
-    return sorted(active, key=lambda x: x.get("ts_ms") or 0, reverse=True)[0]
+        metadata = local.get(symbol)
+        if metadata:
+            position.update(metadata)
+            if not position.get("leverage") and metadata.get("local_leverage"):
+                position["leverage"] = metadata["local_leverage"]
 
 
 async def _status_summary() -> dict[str, Any]:
     summary = st.status_summary(_DB)
     try:
-        _apply_live_balance(summary, await _live_balance_snapshot())
+        store = await _get_store()
+        live = await store.live_account_state()
+        quote_balance = next(
+            (row for row in live["balances"] if row["asset"] == _settings.account.quote_asset),
+            None,
+        )
+        if quote_balance:
+            _apply_live_balance(summary, {
+                "ts_ms": quote_balance["updated_at_ms"],
+                "total_equity": quote_balance["wallet_balance"],
+                "available_margin": quote_balance["available_balance"],
+            })
+            summary["balance"]["equity_source"] = "account_projection"
+        summary["positions"] = live["positions"]
+        summary["positions_source"] = "account_projection"
+        summary["positions_error"] = ""
+        summary["positions_synced_at_ms"] = max(
+            [int(row.get("updated_at_ms") or 0) for row in live["positions"]] or [None]
+        )
+        summary["open_orders"] = live["open_orders"]
+        summary["condition_orders"] = [
+            row for row in live["open_orders"] if row.get("order_class") == "algo"
+        ]
+        _attach_projection_metadata(summary["positions"], live["open_orders"])
+        summary["open_orders_error"] = ""
+        summary["condition_orders_error"] = ""
+        summary["open_orders_synced_at_ms"] = max(
+            [int(row.get("updated_at_ms") or 0) for row in live["open_orders"]] or [None]
+        )
     except Exception as e:
-        logger.warning("live balance unavailable, fallback to db snapshot: {}", e)
+        logger.warning("account projection unavailable, fallback to db snapshots: {}", e)
         if summary.get("balance"):
             summary["balance"]["equity_source"] = "db_snapshot"
             summary["balance"]["equity_error"] = str(e)
-    try:
-        live = await _live_positions_snapshot()
-        summary["positions"] = live["positions"]
-        summary["positions_source"] = "exchange"
-        summary["positions_error"] = live.get("error", "")
-        summary["condition_orders"] = live.get("condition_orders", [])
-        summary["condition_orders_error"] = live.get("condition_error", "")
-        summary["positions_synced_at_ms"] = live.get("ts_ms")
-        summary["open_orders"] = live.get("open_orders", [])
-        summary["open_orders_error"] = live.get("open_orders_error", "")
-        summary["open_orders_synced_at_ms"] = live.get("ts_ms")
-    except Exception as e:
-        logger.warning("live positions unavailable, fallback to db snapshot: {}", e)
         summary["positions_source"] = "db_snapshot"
         summary["positions_error"] = str(e)
         summary["condition_orders"] = []
@@ -415,17 +293,45 @@ async def _status_summary() -> dict[str, Any]:
     return summary
 
 
+async def _stream_status() -> dict[str, Any]:
+    store = await _get_store()
+    runtime = await store.runtime_settings()
+    event_stats = await store.exchange_event_stats()
+    now = int(time.time() * 1000)
+    drift_count = await store.recent_drift_count(now - 86400 * 1000)
+    updated = int(event_stats["last_event_at_ms"] or runtime.get("stream.updated_at_ms") or 0)
+    return {
+        "enabled": _settings.user_stream.enabled,
+        "status": runtime.get("stream.status", "STARTING"),
+        "reason": runtime.get("stream.reason", ""),
+        "session_id": runtime.get("stream.session_id", ""),
+        "updated_at_ms": updated,
+        "last_resync_at_ms": int(runtime.get("stream.last_resync_at_ms") or 0),
+        "event_lag_ms": max(0, now - updated) if updated else None,
+        "pending_events": event_stats["pending_events"],
+        "failed_events": event_stats["failed_events"],
+        "drift_count_24h": drift_count,
+        "entry_ready": runtime.get("stream.status") == "LIVE",
+    }
+
+
 # ---------- REST：只读数据 ----------
 @app.get("/api/summary")
 async def api_summary(_: str = Depends(_check_auth)):
-    return await _status_summary()
+    summary = await _status_summary()
+    summary["stream"] = await _stream_status()
+    return summary
+
+
+@app.get("/api/stream-status")
+async def api_stream_status(_: str = Depends(_check_auth)):
+    return await _stream_status()
 
 
 @app.get("/api/positions")
 async def api_positions(_: str = Depends(_check_auth)):
     try:
-        live = await _live_positions_snapshot()
-        return live["positions"]
+        return (await (await _get_store()).live_account_state())["positions"]
     except Exception as e:
         logger.warning("live positions endpoint fallback to db snapshot: {}", e)
         return st.latest_positions(_DB)
@@ -473,16 +379,16 @@ async def api_orders(limit: int = 100, _: str = Depends(_check_auth)):
 
 @app.get("/api/open-orders")
 async def api_open_orders(_: str = Depends(_check_auth)):
-    """交易所当前普通未成交挂单（限价/限价 maker/...），不含 SL/TP 算法单。
-
-    数据走 ``_live_positions_snapshot`` 缓存（默认 2s TTL），与 /api/summary 共享。
-    """
-    snapshot = await _live_positions_snapshot()
+    """Return the engine's canonical current-order projection."""
+    snapshot = await (await _get_store()).live_account_state()
+    orders = list(snapshot.get("open_orders") or [])
     return {
-        "open_orders": list(snapshot.get("open_orders") or []),
-        "condition_orders": list(snapshot.get("condition_orders") or []),
-        "error": snapshot.get("open_orders_error") or snapshot.get("error") or "",
-        "synced_at_ms": snapshot.get("ts_ms"),
+        "open_orders": [row for row in orders if row.get("order_class") == "regular"],
+        "condition_orders": [row for row in orders if row.get("order_class") == "algo"],
+        "error": "",
+        "synced_at_ms": max(
+            [int(row.get("updated_at_ms") or 0) for row in orders] or [None]
+        ),
     }
 
 
@@ -537,24 +443,26 @@ async def api_pnl(
         "end_ts_ms": end,
     }
     try:
-        live_balance = await _live_balance_snapshot()
+        live = await (await _get_store()).live_account_state()
+        live_balance = next(
+            row for row in live["balances"] if row["asset"] == _settings.account.quote_asset
+        )
         stats.update(st.day_equity_change(
             _DB,
-            current_equity=float(live_balance["total_equity"]),
-            now_ms=int(live_balance["ts_ms"]),
+            current_equity=float(live_balance["wallet_balance"]),
+            now_ms=int(live_balance["updated_at_ms"]),
         ))
-        stats["equity_source"] = "exchange"
+        stats["equity_source"] = "account_projection"
     except Exception as e:
         logger.warning("live pnl equity unavailable, fallback to db snapshot: {}", e)
         stats["equity_source"] = "db_snapshot"
         stats["equity_error"] = str(e)
     try:
-        live = await _live_positions_snapshot()
         stats["day_unrealized_pnl"] = sum(
             float(position.get("unrealized_pnl") or 0.0)
             for position in live.get("positions", [])
         )
-        stats["unrealized_source"] = "exchange"
+        stats["unrealized_source"] = "account_projection"
     except Exception as e:
         logger.warning("live unrealized pnl unavailable, fallback to db snapshot: {}", e)
         positions = st.latest_positions(_DB)
@@ -601,6 +509,11 @@ async def api_config(_: str = Depends(_check_auth)):
     symbol_enabled = await _effective_symbol_enabled()
     symbols_state = await _symbol_rows()
     symbols = [row["symbol"] for row in symbols_state]
+    store = await _get_store()
+    effective_risk = decode_risk(
+        await store.get_runtime_setting(RUNTIME_RISK_KEY), s.risk
+    )
+    risk_version = int(await store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY) or 0)
     return {
         "mode": s.mode.value,
         "db_path": s.storage.db_path,
@@ -613,17 +526,10 @@ async def api_config(_: str = Depends(_check_auth)):
         "cycle_interval": s.cycle.interval,
         # 看板默认行情源（mainnet 真实价 / testnet 沙盒），供前端初始化源切换
         "market_source": _DEFAULT_SOURCE,
-        "risk": {
-            "max_leverage": s.risk.max_leverage,
-            # 保证金/亏损限额按「账户权益」动态缩放
-            "max_order_margin_pct": s.risk.max_order_margin_pct,
-            "max_symbol_margin_pct": s.risk.max_symbol_margin_pct,
-            "max_total_margin_pct": s.risk.max_total_margin_pct,
-            "max_loss_per_trade_pct": s.risk.max_loss_per_trade_pct,
-            "max_drawdown_pct": s.risk.max_drawdown_pct,
-            "daily_max_loss_pct": s.risk.daily_max_loss_pct,
-            "min_confidence": s.risk.min_confidence,
-        },
+        "risk": risk_public(effective_risk),
+        "risk_defaults": risk_public(s.risk),
+        "risk_version": risk_version,
+        "user_stream": await _stream_status(),
     }
 
 
@@ -704,20 +610,178 @@ _ALLOWED_COMMANDS = {
     "CANCEL_AND_FLATTEN",
     "STOP_ENGINE",
     "SWITCH_LLM_PROFILE",
+    "UPDATE_RISK_SETTINGS",
+}
+
+_MAINNET_HIGH_RISK_COMMANDS = {
+    "KILL_SWITCH", "RESUME", "RESUME_ALL_SYMBOLS", "SET_SYMBOL_ENABLED",
+    "CLOSE_POSITION", "CANCEL_AND_FLATTEN", "STOP_ENGINE", "UPDATE_RISK_SETTINGS",
 }
 
 
+def _require_environment(expected: str | None) -> None:
+    if expected and expected.lower() != _settings.mode.value:
+        raise HTTPException(status_code=409, detail="target environment mismatch")
+
+
+def _check_mainnet_origin(request: Request) -> None:
+    if not _settings.is_mainnet:
+        return
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        raise HTTPException(status_code=403, detail="cross-site mainnet mutation rejected")
+    origin = request.headers.get("origin", "")
+    host = request.headers.get("host", "")
+    if origin and host and not origin.endswith(f"://{host}"):
+        raise HTTPException(status_code=403, detail="mainnet origin mismatch")
+
+
+def _payload_hash(action: str, payload: str) -> str:
+    canonical = payload
+    try:
+        canonical = json.dumps(json.loads(payload), sort_keys=True, separators=(",", ":"))
+    except Exception:
+        pass
+    return hashlib.sha256(f"{_settings.mode.value}:{action}:{canonical}".encode()).hexdigest()
+
+
+def _consume_confirmation(token: str, action: str, payload: str) -> None:
+    if not _settings.is_mainnet:
+        return
+    item = _confirmations.pop(token, None)
+    if not item or item["expires_at"] < time.time():
+        raise HTTPException(status_code=403, detail="mainnet confirmation missing or expired")
+    if item["hash"] != _payload_hash(action, payload):
+        raise HTTPException(status_code=403, detail="mainnet confirmation payload mismatch")
+
+
+from pydantic import BaseModel, Field  # noqa: E402
+
+
+class _ConfirmationRequest(BaseModel):
+    action: str = Field(min_length=1, max_length=64)
+    payload: str = Field(default="", max_length=20000)
+    confirmation: str = Field(min_length=1, max_length=32)
+
+
+class _RiskUpdateRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+    values: dict[str, Any]
+    confirmation_token: str = ""
+
+
+@app.post("/api/confirmations")
+async def api_confirmation(
+    body: _ConfirmationRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    _: str = Depends(_check_auth),
+):
+    _check_mainnet_origin(request)
+    _require_environment(expected_environment)
+    if not _settings.is_mainnet:
+        return {"token": "", "expires_in": 0}
+    if body.confirmation != "MAINNET":
+        raise HTTPException(status_code=403, detail="type MAINNET to confirm")
+    token = secrets.token_urlsafe(32)
+    _confirmations[token] = {
+        "hash": _payload_hash(body.action.upper(), body.payload),
+        "expires_at": time.time() + _MAINNET_CONFIRM_TTL_SECONDS,
+    }
+    return {"token": token, "expires_in": _MAINNET_CONFIRM_TTL_SECONDS}
+
+
 @app.post("/api/command/{name}")
-async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)):
+async def api_command(
+    name: str,
+    request: Request,
+    arg: str = "",
+    confirmation_token: str = "",
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    user: str = Depends(_check_auth),
+):
     """下发控制命令。交易进程快速消费执行。"""
     name = name.upper()
     if name not in _ALLOWED_COMMANDS:
         raise HTTPException(status_code=400, detail=f"unknown command: {name}")
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    if name in _MAINNET_HIGH_RISK_COMMANDS:
+        _consume_confirmation(confirmation_token, name, arg)
     store = await _get_store()
     cmd_id = await store.enqueue_command(name, arg=arg, source=f"web:{user}")
     logger.warning("web command queued: {} arg={} by={} id={}", name, arg, user, cmd_id)
     return {"queued": True, "id": cmd_id, "command": name,
             "note": "交易进程将尽快消费执行"}
+
+
+@app.get("/api/risk-settings")
+async def api_risk_settings(_: str = Depends(_check_auth)):
+    store = await _get_store()
+    effective = decode_risk(await store.get_runtime_setting(RUNTIME_RISK_KEY), _settings.risk)
+    version = int(await store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY) or 0)
+    return {
+        "mode": _settings.mode.value,
+        "version": version,
+        "defaults": risk_public(_settings.risk),
+        "effective": risk_public(effective),
+    }
+
+
+@app.post("/api/risk-settings/preview")
+async def api_risk_settings_preview(body: _RiskUpdateRequest, _: str = Depends(_check_auth)):
+    store = await _get_store()
+    current = decode_risk(await store.get_runtime_setting(RUNTIME_RISK_KEY), _settings.risk)
+    current_version = int(await store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY) or 0)
+    if body.expected_version != current_version:
+        raise HTTPException(status_code=409, detail=f"version conflict: current={current_version}")
+    try:
+        updated = validate_risk_payload(body.values, current)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    before = risk_public(current)
+    after = risk_public(updated)
+    balance = st.latest_balance(_DB) or {}
+    equity = float(balance.get("total_equity") or 0.0)
+    day_pnl = float(balance.get("day_realized_pnl") or 0.0)
+    drawdown = float(balance.get("drawdown_pct") or 0.0)
+    daily_limit = equity * updated.daily_max_loss_pct / 100.0
+    return {
+        "mode": _settings.mode.value,
+        "version": current_version,
+        "changes": {
+            key: {"before": before[key], "after": after[key]}
+            for key in after if before[key] != after[key]
+        },
+        "effective": after,
+        "impact": {
+            "equity": equity,
+            "day_realized_pnl": day_pnl,
+            "drawdown_pct": drawdown,
+            "would_trigger_daily_loss": daily_limit > 0 and day_pnl <= -daily_limit,
+            "would_trigger_drawdown": drawdown >= updated.max_drawdown_pct,
+        },
+    }
+
+
+@app.post("/api/risk-settings/apply")
+async def api_risk_settings_apply(
+    body: _RiskUpdateRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    user: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    payload = json.dumps(
+        {"expected_version": body.expected_version, **body.values},
+        sort_keys=True, separators=(",", ":"),
+    )
+    _consume_confirmation(body.confirmation_token, "UPDATE_RISK_SETTINGS", payload)
+    store = await _get_store()
+    cmd_id = await store.enqueue_command(
+        "UPDATE_RISK_SETTINGS", arg=payload, source=f"web:{user}"
+    )
+    return {"queued": True, "id": cmd_id, "command": "UPDATE_RISK_SETTINGS"}
 
 
 # ---------- LLM profile 管理 ----------
@@ -727,7 +791,6 @@ async def api_command(name: str, arg: str = "", user: str = Depends(_check_auth)
 # - 创建/更新时只接受 api_key 明文（POST/PUT body），明文直接入库（单租户自托管）。
 # - fallback 链：active 主源 + fallback_enabled 备源，按 priority 升序串联。
 
-from pydantic import BaseModel, Field  # noqa: E402
 from src.llm.providers import build_provider  # noqa: E402
 
 

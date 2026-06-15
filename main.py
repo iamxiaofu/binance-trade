@@ -76,8 +76,10 @@ async def _cmd_kill(args) -> int:
     setup_logger(settings.logging)
     engine = TradingEngine(settings, creds)
     await engine.startup()
-    await engine.kill("manual kill-switch command")
-    await engine.shutdown()
+    try:
+        await engine.kill("manual kill-switch command")
+    finally:
+        await engine.shutdown()
     print("kill-switch 完成：已撤单并平仓。")
     return 0
 

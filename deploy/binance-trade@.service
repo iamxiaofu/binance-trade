@@ -1,0 +1,28 @@
+[Unit]
+Description=binance-trade engine (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/binance-trade
+Environment=PYTHONPATH=/opt/binance-trade
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/binance-trade/%i.env
+ExecStartPre=/opt/binance-trade/scripts/check_env_ready.sh /etc/binance-trade/%i.env
+ExecStart=/opt/binance-trade/.venv/bin/python main.py -c /etc/binance-trade/config.%i.yaml -e /etc/binance-trade/%i.env run --yes
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/binance-trade/%i /var/log/binance-trade/%i
+
+[Install]
+WantedBy=multi-user.target

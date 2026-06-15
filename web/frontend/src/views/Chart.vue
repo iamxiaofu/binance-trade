@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { init, dispose } from 'klinecharts'
 import * as echarts from 'echarts'
-import { api } from '../api'
+import { api, wsPath } from '../api'
 import { ElMessage } from 'element-plus'
 
 const CFG_SYMBOLS = ref([])
@@ -170,7 +170,7 @@ function marketWsUrl() {
     symbol: symbol.value,
     timeframe: timeframe.value,
   })
-  return `${proto}://${location.host}/ws/market?${q.toString()}`
+  return `${proto}://${location.host}${wsPath('/market')}?${q.toString()}`
 }
 
 function closeMarketWs() {

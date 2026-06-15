@@ -3,11 +3,13 @@ import { onMounted, onUnmounted, computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useLiveStore } from './stores/live'
 import { utc8Time } from './labels'
+import { getEnvironment, setEnvironment } from './api'
 
 const live = useLiveStore()
 const route = useRoute()
 const router = useRouter()
 const theme = ref(localStorage.getItem('binance-trade-theme') || 'light')
+const environment = ref(getEnvironment())
 
 const menu = [
   { index: '/dashboard', title: '总览', icon: 'Odometer' },
@@ -60,6 +62,12 @@ function toggleTheme() {
   applyTheme(isDark.value ? 'light' : 'dark')
 }
 
+function switchEnvironment(value) {
+  setEnvironment(value)
+  live.disconnect()
+  live.connect()
+}
+
 onMounted(() => {
   applyTheme(theme.value)
   live.connect()
@@ -75,7 +83,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <el-container class="app-shell">
+  <el-container class="app-shell" :class="{ 'mainnet-shell': environment === 'mainnet' }">
     <el-aside width="200px" class="app-sidebar">
       <div class="brand-title">
         Binance-trade
@@ -92,6 +100,13 @@ onUnmounted(() => {
       <el-header class="app-header">
         <span style="font-size:18px; font-weight:600">{{ route.meta.title || '' }}</span>
         <div class="header-actions">
+          <el-select v-model="environment" size="small" style="width:120px" @change="switchEnvironment">
+            <el-option label="TESTNET" value="testnet" />
+            <el-option label="MAINNET" value="mainnet" />
+          </el-select>
+          <el-tag :type="environment === 'mainnet' ? 'danger' : 'success'" effect="dark">
+            {{ environment.toUpperCase() }}
+          </el-tag>
           <el-button
             circle
             size="small"
@@ -106,7 +121,7 @@ onUnmounted(() => {
       </el-header>
 
       <el-main class="app-main">
-        <router-view />
+        <router-view :key="environment" />
       </el-main>
     </el-container>
   </el-container>

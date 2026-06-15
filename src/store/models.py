@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 
-from sqlalchemy import Boolean, Float, Integer, String, Text
+from sqlalchemy import Boolean, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -317,3 +317,99 @@ class ControlCommandRow(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending/done/failed
     result: Mapped[str] = mapped_column(String(300), default="")
     executed_at: Mapped[str] = mapped_column(String(32), default="")
+
+
+class ExchangeEventRow(Base):
+    """Durable idempotent inbox for raw Binance private/account events."""
+    __tablename__ = "exchange_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    event_type: Mapped[str] = mapped_column(String(48), default="", index=True)
+    event_time_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    transaction_time_ms: Mapped[int] = mapped_column(Integer, default=0)
+    received_at_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    applied_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="received", index=True)
+    error: Mapped[str] = mapped_column(String(500), default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+
+
+class ExchangeStreamSessionRow(Base):
+    __tablename__ = "exchange_stream_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), default="", index=True)
+    listen_key_hash: Mapped[str] = mapped_column(String(64), default="")
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    connected_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    disconnected_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    keepalive_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    last_event_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    last_resync_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at_ms: Mapped[int] = mapped_column(Integer, default=_now_ms)
+
+
+class LiveBalanceRow(Base):
+    __tablename__ = "live_balances"
+
+    asset: Mapped[str] = mapped_column(String(16), primary_key=True)
+    wallet_balance: Mapped[float] = mapped_column(Float, default=0.0)
+    available_balance: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    updated_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+
+
+class LivePositionRow(Base):
+    __tablename__ = "live_positions"
+
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    side: Mapped[str] = mapped_column(String(8), default="")
+    contracts: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    mark_price: Mapped[float] = mapped_column(Float, default=0.0)
+    leverage: Mapped[int] = mapped_column(Integer, default=0)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    notional: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    updated_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+
+
+class LiveOrderRow(Base):
+    __tablename__ = "live_orders"
+    __table_args__ = (UniqueConstraint("order_class", "exchange_order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_class: Mapped[str] = mapped_column(String(16), default="regular", index=True)
+    exchange_order_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    client_order_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    symbol: Mapped[str] = mapped_column(String(20), default="", index=True)
+    kind: Mapped[str] = mapped_column(String(16), default="")
+    side: Mapped[str] = mapped_column(String(8), default="")
+    order_type: Mapped[str] = mapped_column(String(32), default="")
+    qty: Mapped[float] = mapped_column(Float, default=0.0)
+    filled_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    trigger_price: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(24), default="")
+    reduce_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    updated_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+
+
+class ExchangeStateDriftRow(Base):
+    __tablename__ = "exchange_state_drifts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    entity_type: Mapped[str] = mapped_column(String(24), default="", index=True)
+    entity_key: Mapped[str] = mapped_column(String(64), default="", index=True)
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    projection_json: Mapped[str] = mapped_column(Text, default="")
+    rest_json: Mapped[str] = mapped_column(Text, default="")
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)

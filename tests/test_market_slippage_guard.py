@@ -112,8 +112,8 @@ async def test_slippage_buy_side_uses_asks():
     assert est == pytest.approx(66.67, abs=1e-6)
 
 
-async def test_slippage_book_fetch_failure_allows():
-    """盘口拉取失败 → 保守放行，不阻塞交易。"""
+async def test_slippage_book_fetch_failure_rejects():
+    """盘口拉取失败 → 开仓 fail-closed。"""
     class _BrokenClient(_FakeClient):
         async def fetch_order_book(self, symbol, limit=20):
             raise RuntimeError("network down")
@@ -124,12 +124,12 @@ async def test_slippage_book_fetch_failure_allows():
     ok, _est, reason = await ex._preflight_market_slippage(
         symbol="SOLUSDT", side="sell", ref_price=66.61, qty=1.0,
     )
-    assert ok
-    assert reason == ""
+    assert not ok
+    assert "orderbook unavailable" in reason
 
 
-async def test_slippage_depth_insufficient_allows_with_warning():
-    """盘口深度不够覆盖 qty → 仍放行（保守），避免完全卡死。"""
+async def test_slippage_depth_insufficient_rejects():
+    """盘口深度不够覆盖 qty → 拒绝开仓。"""
     cfg = _exec_cfg(default=8.0)
     ex = Executor.__new__(Executor)
     ex._cfg = cfg
@@ -140,4 +140,4 @@ async def test_slippage_depth_insufficient_allows_with_warning():
     ok, _est, _reason = await ex._preflight_market_slippage(
         symbol="SOLUSDT", side="sell", ref_price=66.61, qty=5.0,
     )
-    assert ok  # 不阻塞
+    assert not ok

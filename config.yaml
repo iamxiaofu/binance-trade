@@ -8,6 +8,7 @@ mode: testnet                 # testnet | mainnet，一键切换
 symbols:
   - BTCUSDT
   - ETHUSDT
+  - SOLUSDT
   - BNBUSDT
 
 # ===== 账户与保证金 =====
@@ -42,17 +43,16 @@ throttle:                     # 行情变化门槛（纯函数，全部可单测
   review_high_vol_minutes: 5
 
 # ===== 风控（硬约束，优先级永远高于 LLM）=====
-# 保证金与亏损上限均按「当前账户权益」动态计算，随资金自动缩放。
-# LLM 会被告知资金尺度、单笔保证金上限和止损亏损上限；代码层仍以此为硬兜底。
+# 保证金上限按当前账户权益动态计算；止损亏损上限按本订单保证金计算。
 risk:
   max_leverage: 5                  # LLM 建议 > 此值 → 直接拒单（不截断）
   on_leverage_exceed: REJECT       # 固定为 REJECT
   max_order_margin_pct: 0.2        # 单笔最多占用保证金 = 权益 × 20%
   max_symbol_margin_pct: 0.4       # 单标的累计占用保证金 = 权益 × 40%
-  max_total_margin_pct: 0.8        # 全账户累计占用保证金 = 权益 × 80%
-  max_loss_per_trade_pct: 2        # 止损触发时理论亏损 <= 权益 × 2%
+  max_total_margin_pct: 0.8        # testnet 保持原有全账户累计占用保证金 80%
+  max_loss_per_order_margin_pct: 30 # 止损理论亏损 <= 本订单保证金 × 30%
   max_drawdown_pct: 20             # 账户最大回撤熔断阈值(%) → 平仓+停开新仓
-  daily_max_loss_pct: 10           # 每日最大亏损 = 权益 × 10% → 当日停交易
+  daily_max_loss_pct: 10           # testnet 保持原有每日最大亏损 10%
   liq_distance_min_pct: 5          # 开仓前估算强平价，距现价 < 5% → 拒单
   min_confidence: 0.6              # LLM confidence 低于此值视为 HOLD
 
@@ -60,8 +60,7 @@ risk:
 llm:
   provider: anthropic
   model: claude-opus-4-8
-  base_url: https://api.ikuncode.cc   # Anthropic 兼容中转；官方留空
-  timeout: 60                 # 秒，超时降级 HOLD（中转比官方慢，留足余量）
+  timeout: 30                 # 秒，超时降级 HOLD
   max_tokens: 1024
   max_retries: 2
   kline_lookback: 100         # 喂给 LLM 的 K 线根数
@@ -99,6 +98,17 @@ execution:
 storage:
   db_path_template: ./data/trade-{mode}.db  # SQLite，按 testnet/mainnet 隔离
   reconcile_on_start: true    # 启动与交易所对账
+
+user_stream:
+  enabled: true
+  keepalive_seconds: 1800
+  rotate_seconds: 82800
+  reconnect_max_seconds: 30
+  startup_buffer_limit: 10000
+  reconcile_active_seconds: 30
+  reconcile_idle_seconds: 120
+  confirm_timeout_seconds: 10
+  event_retention_days: 30
 
 # ===== 监控告警 =====
 notify:

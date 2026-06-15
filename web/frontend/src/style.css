@@ -45,6 +45,10 @@ body {
   height: 100vh;
 }
 
+.mainnet-shell .app-header {
+  border-top: 4px solid #f56c6c;
+}
+
 .app-sidebar {
   background: var(--bt-sidebar);
   color: #fff;

@@ -17,24 +17,33 @@ from loguru import logger
 
 from src.config.schema import Credentials, ExecutionMode, Settings
 from src.exchange.client import ExchangeClient
+from src.exchange.events import rest_snapshot_event
 from src.exchange.filters import normalize_order, round_price
 from src.exchange.market_data import MarketData
 from src.exchange.orders import normalize_condition_order
 from src.exchange.positions import normalize_position, normalize_symbol
+from src.exchange.user_stream import BinanceUserDataStream
 from src.execution.executor import Executor, realized_pnl
 from src.features.builder import build_context, build_position_snapshot
 from src.llm.client import LLMClient
 from src.llm.schema import Action, MarketContext, TradeDecision
 from src.notify.telegram import Event, Notifier
 from src.risk.manager import RejectCode, RiskContext, Verdict, validate
+from src.risk.settings import (
+    RUNTIME_RISK_KEY,
+    RUNTIME_RISK_VERSION_KEY,
+    decode_risk,
+    encode_risk,
+    risk_public,
+    validate_risk_payload,
+)
 from src.state.runtime import RuntimeState
+from src.state.account import AccountStateCoordinator
 from src.store.repo import Store
 from src.throttle.feature_snapshot import FeatureSnapshot, build_feature_snapshot
 from src.throttle.gate import should_call_llm
 
 
-_RECONCILE_ACTIVE_INTERVAL_SECONDS = 15.0
-_RECONCILE_IDLE_INTERVAL_SECONDS = 30.0
 _COMMAND_POLL_INTERVAL_SECONDS = 1.0
 _ENTRY_CLAIM_TTL_MS = 300_000
 _POST_OPEN_POSITION_CONFIRM_DELAYS_SECONDS = (0.0, 0.3, 0.7, 1.2, 2.0, 3.0)
@@ -64,8 +73,10 @@ class TradingEngine:
         self._client = ExchangeClient(settings, creds)
         self._market = MarketData(self._client, settings)
         self._executor = Executor(self._client, settings)
-        # 启动期使用 yaml 默认；启动后如果 DB 里有 active profile，会被替换。
-        self._llm = LLMClient(settings.llm, creds.anthropic_api_key)
+        # LLM provider credentials only come from the environment-specific profile DB.
+        # An empty chain safely degrades to HOLD until an operator activates a profile.
+        from src.llm.failover import LLMFailoverClient
+        self._llm = LLMFailoverClient([])
         # 热替换守护：lock 让「关旧 + 开新」与「正在调用 LLM」互斥。
         self._llm_lock = asyncio.Lock()
         # 单调递增，每次成功替换 +1；web 端通过 /api/llm/status.active.version
@@ -73,26 +84,55 @@ class TradingEngine:
         self._llm_version = 0
         self._llm_profile_name = ""
         self._store = Store(settings.storage.db_path)
+        self.runtime = RuntimeState()
+        self._account = AccountStateCoordinator(
+            self._store, self.runtime, settings.account.quote_asset,
+        )
         self._notifier = Notifier(
             settings.notify, creds.telegram_bot_token, creds.telegram_chat_id
         )
         self._symbol_enabled = {symbol: True for symbol in settings.symbols}
         self._symbols = list(settings.symbols)
         self._symbol_needs_review: set[str] = set()
-        self.runtime = RuntimeState()
+        self._user_stream = BinanceUserDataStream(
+            self._client, settings, self._on_private_event, self._on_stream_health
+        )
+        self._executor.set_account_state(self._account)
         self._stopped = asyncio.Event()
         self._state_sync_lock = asyncio.Lock()
         self._just_adopted: dict[str, bool] = {}  # B4: 标记本周期刚接管的 symbol
         self._recent_explicit_closes: dict[str, float] = {}
         self._reconcile_task: asyncio.Task | None = None
         self._cycle_leader_snapshot: FeatureSnapshot | None = None
+        self._risk_defaults = settings.risk.model_copy(deep=True)
+        self._risk_version = 0
+        self._stream_halted_entries = False
+        self._private_invariant_task: asyncio.Task | None = None
+        self._stream_verify_task: asyncio.Task | None = None
+        self._buffer_private_events = True
+        self._private_event_buffer: list = []
+        self._startup_complete = False
 
     # ---------- 生命周期 ----------
     async def startup(self) -> None:
         await self._store.connect()
+        await self._store.prune_exchange_events(self._settings.user_stream.event_retention_days)
+        await self._account.start()
         await self._store.sync_config_symbols(self._settings.symbols)
         await self._apply_runtime_settings()
         await self._client.load_markets()
+        if self._settings.is_mainnet and not self._settings.execution.attach_sl_tp:
+            raise RuntimeError("mainnet requires execution.attach_sl_tp=true")
+        try:
+            await self._client.validate_account_mode()
+        except Exception as e:
+            self.runtime.halt_entries(f"account mode validation failed: {e}")
+            await self._persist_strategy_pause_reason(
+                reason_code="ACCOUNT_MODE_INVALID",
+                reason=self.runtime.halt_new_entries_reason,
+                source="engine:startup",
+            )
+            raise
         for symbol in self._symbols:
             filters = await self._client.ensure_symbol(symbol)
             await self._store.update_symbol_filters(symbol, filters)
@@ -112,21 +152,33 @@ class TradingEngine:
         except Exception as e:  # noqa: BLE001
             logger.warning("day pnl rehydrate failed, fallback to 0: {}", e)
             self.runtime.roll_day_if_needed()
-        if self._settings.storage.reconcile_on_start:
+        if self._settings.user_stream.enabled:
             try:
-                positions = await self._client.fetch_positions(self._symbols)
-                open_orders = await self._fetch_open_orders_safe()
-                await self._store.reconcile(
-                    positions, self.runtime, open_orders, symbols=self._symbols
+                await self._user_stream.start()
+                await self._user_stream.wait_connected()
+            except Exception as e:
+                logger.warning("private user stream startup failed: {}", e)
+                if not self.runtime.halt_new_entries:
+                    self._stream_halted_entries = True
+                self.runtime.halt_entries(f"private user stream unavailable: {e}")
+                await self._persist_strategy_pause_reason(
+                    reason_code="USER_STREAM_UNAVAILABLE",
+                    reason=self.runtime.halt_new_entries_reason,
+                    source="engine:startup",
                 )
+        if self._settings.storage.reconcile_on_start or self._settings.user_stream.enabled:
+            try:
+                await self._submit_rest_account_snapshot("startup")
+                await self._replay_private_event_buffer()
             except Exception as e:
                 logger.warning("startup reconcile failed: {}", e)
-        # 启动即拉一次权益，确保第一个周期的风控/上限基于真实权益而非退回保证金
-        try:
-            bal = await self._client.fetch_balance()
-            await self._record_balance_snapshot(bal)
-        except Exception as e:
-            logger.warning("startup equity fetch failed: {}", e)
+                self.runtime.halt_entries(f"startup reconcile failed: {e}")
+                await self._persist_strategy_pause_reason(
+                    reason_code="STARTUP_RECONCILE_FAILED",
+                    reason=self.runtime.halt_new_entries_reason,
+                    source="engine:startup",
+                )
+        self._startup_complete = True
         self._reconcile_task = asyncio.create_task(
             self._reconcile_loop(), name="exchange-reconciler"
         )
@@ -172,12 +224,153 @@ class TradingEngine:
             except asyncio.CancelledError:
                 pass
             self._reconcile_task = None
+        if self._private_invariant_task is not None:
+            self._private_invariant_task.cancel()
+            try:
+                await self._private_invariant_task
+            except asyncio.CancelledError:
+                pass
+            self._private_invariant_task = None
+        if self._stream_verify_task is not None:
+            self._stream_verify_task.cancel()
+            try:
+                await self._stream_verify_task
+            except asyncio.CancelledError:
+                pass
+            self._stream_verify_task = None
+        await self._user_stream.close()
+        await self._account.close()
         await self._market.stop()
         await self._llm.close()
         await self._notifier.close()
         await self._store.close()
         await self._client.close()
         logger.info("engine shutdown complete")
+
+    async def _on_private_event(self, event) -> None:
+        if self._buffer_private_events:
+            if event.event_type == "MARGIN_CALL":
+                self.runtime.halt_entries("Binance margin call: new entries paused")
+            if len(self._private_event_buffer) >= self._settings.user_stream.startup_buffer_limit:
+                self.runtime.halt_entries("private user stream buffer overflow")
+                await self._persist_strategy_pause_reason(
+                    reason_code="USER_STREAM_BUFFER_OVERFLOW",
+                    reason=self.runtime.halt_new_entries_reason,
+                    source="binance:user-stream",
+                )
+                return
+            self._private_event_buffer.append(event)
+            return
+        await self._apply_private_event(event)
+
+    async def _apply_private_event(self, event) -> None:
+        await self._account.submit(event)
+        await self._account.drain()
+        if event.event_type == "ORDER_TRADE_UPDATE":
+            order = event.payload.get("o") or {}
+            client_id = str(order.get("c") or "")
+            status = str(order.get("X") or "").upper()
+            symbol = normalize_symbol(order.get("s"))
+            if symbol and client_id and not client_id.startswith("bt-") and status in (
+                "NEW", "PARTIALLY_FILLED", "FILLED",
+            ):
+                await self._set_symbol_disabled(
+                    symbol,
+                    reason_code="EXTERNAL_ORDER_DETECTED",
+                    reason=f"external Binance order detected: {client_id} status={status}",
+                    source="binance:user-stream",
+                    action="auto_takeover_and_protect",
+                )
+        if event.event_type == "MARGIN_CALL":
+            self.runtime.halt_entries("Binance margin call: new entries paused")
+            await self._persist_strategy_pause_reason(
+                reason_code="MARGIN_CALL",
+                reason=self.runtime.halt_new_entries_reason,
+                source="binance:user-stream",
+            )
+            await self._notifier.send(Event.ERROR, self.runtime.halt_new_entries_reason)
+        elif event.event_type in ("CONDITIONAL_ORDER_TRIGGER_REJECT", "ACCOUNT_CONFIG_UPDATE"):
+            self.runtime.halt_entries(f"Binance private event requires review: {event.event_type}")
+            await self._persist_strategy_pause_reason(
+                reason_code=event.event_type,
+                reason=self.runtime.halt_new_entries_reason,
+                source="binance:user-stream",
+            )
+            if event.event_type == "CONDITIONAL_ORDER_TRIGGER_REJECT":
+                details = event.payload.get("or") or event.payload.get("o") or {}
+                symbol = normalize_symbol(details.get("s") or details.get("symbol"))
+                if symbol:
+                    await self._set_symbol_disabled(
+                        symbol,
+                        reason_code="CONDITIONAL_ORDER_TRIGGER_REJECT",
+                        reason="Binance rejected a conditional protection trigger",
+                        source="binance:user-stream",
+                        action="repair_or_emergency_close",
+                    )
+            asyncio.create_task(
+                self._reconcile_exchange_state(event.event_type.lower()),
+                name=f"private-event-reconcile-{event.event_type.lower()}",
+            )
+        elif event.event_type in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE", "ALGO_UPDATE"):
+            if self._private_invariant_task is None or self._private_invariant_task.done():
+                self._private_invariant_task = asyncio.create_task(
+                    self._enforce_exchange_invariants("private_event"),
+                    name="private-event-invariant-check",
+                )
+
+    async def _replay_private_event_buffer(self) -> None:
+        while self._private_event_buffer:
+            pending = self._private_event_buffer
+            self._private_event_buffer = []
+            for event in pending:
+                await self._apply_private_event(event)
+        self._buffer_private_events = False
+
+    async def _rest_resync_with_event_buffer(self, reason: str) -> None:
+        self._buffer_private_events = True
+        try:
+            await self._submit_rest_account_snapshot(reason)
+            await self._replay_private_event_buffer()
+        except Exception:
+            raise
+        if self._stream_halted_entries and self._account.snapshot().stream_status == "LIVE":
+            self._stream_halted_entries = False
+            self.runtime.resume_entries()
+            await self._store.set_runtime_settings({
+                "strategy.paused": "false",
+                "strategy.pause.reason_code": "",
+                "strategy.pause.reason": "",
+                "strategy.pause.source": "engine:user-stream-resync",
+                "strategy.pause.at_ms": str(int(time.time() * 1000)),
+            })
+
+    async def _on_stream_health(self, health: dict) -> None:
+        await self._account.set_stream_health(health)
+        status = str(health.get("status") or "")
+        if status in ("DISCONNECTED", "RESYNCING"):
+            if not self.runtime.halt_new_entries:
+                self._stream_halted_entries = True
+                self.runtime.halt_entries(
+                    f"private user stream {status.lower()}: "
+                    f"{health.get('reason') or 'resync required'}"
+                )
+                await self._persist_strategy_pause_reason(
+                    reason_code=f"USER_STREAM_{status}",
+                    reason=self.runtime.halt_new_entries_reason,
+                    source="binance:user-stream",
+                )
+            if status == "DISCONNECTED":
+                if self._stream_verify_task is None or self._stream_verify_task.done():
+                    self._stream_verify_task = asyncio.create_task(
+                        self._reconcile_exchange_state("user_stream_disconnected"),
+                        name="user-stream-disconnect-rest-verify",
+                    )
+        elif status == "LIVE" and health.get("connected_at_ms") and self._startup_complete:
+            self._buffer_private_events = True
+            asyncio.create_task(
+                self._reconcile_exchange_state("user_stream_connected"),
+                name="user-stream-rest-resync",
+            )
 
     # ---------- 主循环 ----------
     async def run(self) -> None:
@@ -336,6 +529,7 @@ class TradingEngine:
             await self._notifier.send(Event.CIRCUIT_BREAK, "paused via web (no new entries)")
             return "strategy paused (persisted)"
         if name == "RESUME":
+            self._assert_stream_ready_for_entries()
             self.runtime.resume_entries()
             await self._store.set_runtime_settings({
                 "strategy.paused": "false",
@@ -345,6 +539,8 @@ class TradingEngine:
                 "strategy.pause.at_ms": "",
             })
             return "strategy resumed (persisted)"
+        if name == "UPDATE_RISK_SETTINGS":
+            return await self._update_risk_settings(arg)
         if name == "RESUME_ALL_SYMBOLS":
             return await self._resume_all_symbols()
         if name == "SET_SYMBOL_ENABLED":
@@ -377,8 +573,34 @@ class TradingEngine:
     async def _apply_runtime_settings(self) -> None:
         """启动时加载持久化运行态；缺省时用 config.yaml 并写入 DB。"""
         await self._reload_symbols_from_store()
+        raw_risk = await self._store.get_runtime_setting(RUNTIME_RISK_KEY)
+        raw_version = await self._store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY)
+        raw_equity_peak = await self._store.get_runtime_setting("risk.equity_peak")
+        try:
+            self.runtime.equity_peak = max(float(raw_equity_peak or 0.0), 0.0)
+        except (TypeError, ValueError):
+            self.runtime.halt_entries("invalid persisted equity peak")
+        try:
+            self._settings.risk = decode_risk(raw_risk, self._risk_defaults)
+            self._risk_version = int(raw_version or 0)
+        except Exception as e:
+            self.runtime.halt_entries(f"invalid runtime risk settings: {e}")
+            logger.error("invalid runtime risk settings; keeping yaml defaults: {}", e)
+            self._settings.risk = self._risk_defaults.model_copy(deep=True)
+        if raw_risk is None:
+            await self._store.set_runtime_settings({
+                RUNTIME_RISK_KEY: encode_risk(self._settings.risk),
+                RUNTIME_RISK_VERSION_KEY: str(self._risk_version),
+            })
         raw_paused = await self._store.get_runtime_setting("strategy.paused")
-        if raw_paused is None:
+        if self._settings.is_mainnet:
+            self.runtime.halt_entries("mainnet restart guard: manual resume required")
+            await self._persist_strategy_pause_reason(
+                reason_code="MAINNET_RESTART_GUARD",
+                reason=self.runtime.halt_new_entries_reason,
+                source="engine:startup",
+            )
+        elif raw_paused is None:
             await self._store.set_runtime_setting("strategy.paused", "false")
         else:
             paused = raw_paused.strip().lower() in ("1", "true", "yes", "on")
@@ -401,6 +623,30 @@ class TradingEngine:
             )
             self._symbol_enabled[symbol] = enabled
             logger.info("runtime setting applied: {}={}", key, enabled)
+
+    async def _update_risk_settings(self, arg: str) -> str:
+        payload = json.loads(arg or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("UPDATE_RISK_SETTINGS requires a JSON object")
+        expected_version = int(payload.pop("expected_version", -1))
+        if expected_version != self._risk_version:
+            raise ValueError(
+                f"risk settings version conflict: expected {expected_version}, "
+                f"current {self._risk_version}"
+            )
+        updated = validate_risk_payload(payload, self._settings.risk)
+        self._settings.risk = updated
+        self._risk_version += 1
+        await self._store.set_runtime_settings({
+            RUNTIME_RISK_KEY: encode_risk(updated),
+            RUNTIME_RISK_VERSION_KEY: str(self._risk_version),
+        })
+        tripped = await self._check_circuit_breaker()
+        return json.dumps({
+            "version": self._risk_version,
+            "effective": risk_public(updated),
+            "breaker_tripped": tripped,
+        }, sort_keys=True)
 
     async def _set_symbol_enabled(self, arg: str) -> str:
         """持久化单个币种的策略启用状态。"""
@@ -549,6 +795,7 @@ class TradingEngine:
 
     async def _resume_all_symbols(self) -> str:
         """Resume strategy and enable every configured symbol after a strict live precheck."""
+        self._assert_stream_ready_for_entries()
         await self._assert_exchange_clear_for_resume_all()
         rows = await self._store.list_symbols()
         eligible = [
@@ -579,6 +826,13 @@ class TradingEngine:
             f"strategy resumed; enabled all symbols: {symbols}; "
             "precheck passed (no live positions/open orders/condition orders)"
         )
+
+    def _assert_stream_ready_for_entries(self) -> None:
+        if not self._settings.user_stream.enabled or not self._account.started:
+            return
+        status = self._account.snapshot().stream_status
+        if status != "LIVE":
+            raise ValueError(f"private user stream is not ready: {status}")
 
     async def _assert_exchange_clear_for_resume_all(self) -> None:
         """Block bulk resume unless exchange has no positions and no live orders."""
@@ -866,6 +1120,7 @@ class TradingEngine:
                 mark=mark,
                 qty=qty,
                 equity=equity,
+                leverage=int(position.get("leverage") or 0),
             )
             if reason:
                 if kind == "SL":
@@ -1034,6 +1289,7 @@ class TradingEngine:
                 mark=mark,
                 qty=target_qty,
                 equity=equity,
+                leverage=int(position.get("leverage") or 0),
             )
             if reason:
                 errors.append(f"{kind}@{trigger:.2f}: {reason}")
@@ -1947,6 +2203,7 @@ class TradingEngine:
         mark: float,
         qty: float,
         equity: float,
+        leverage: int = 0,
     ) -> str:
         if trigger <= 0 or entry <= 0 or mark <= 0 or qty <= 0:
             return "价格或数量无效"
@@ -1966,9 +2223,12 @@ class TradingEngine:
 
         if kind == "SL":
             loss = (entry - trigger) * qty if side == "long" else (trigger - entry) * qty
-            max_loss = equity * (self._settings.risk.max_loss_per_trade_pct / 100.0)
-            if equity <= 0 or max_loss <= 0:
-                return "无法获取账户权益，不能校验止损风险"
+            margin = entry * qty / max(leverage or self._settings.risk.max_leverage, 1)
+            max_loss = margin * (
+                self._settings.risk.max_loss_per_order_margin_pct / 100.0
+            )
+            if max_loss <= 0:
+                return "无法计算订单保证金，不能校验止损风险"
             # loss < 0 means profit-lock (SL above entry for long / below entry for short).
             # That is a valid state from ADJUST_SLTP — skip the max_loss cap check since
             # hitting this SL would lock in profit, not incur a loss.
@@ -1977,7 +2237,8 @@ class TradingEngine:
             elif loss > max_loss:
                 return (
                     f"理论止损亏损 {loss:.2f} USDT 超过上限 {max_loss:.2f} USDT "
-                    f"({self._settings.risk.max_loss_per_trade_pct}% of {equity:.2f})"
+                    f"({self._settings.risk.max_loss_per_order_margin_pct}% of "
+                    f"estimated order margin {margin:.2f})"
                 )
         logger.debug(
             "repair trigger valid {} {} side={} trigger={} entry={} mark={} qty={}",
@@ -1998,7 +2259,10 @@ class TradingEngine:
                         f"({risk.daily_max_loss_pct}% of {base:.2f})")
         elif rt.drawdown_pct >= risk.max_drawdown_pct:
             breached = f"drawdown {rt.drawdown_pct:.2f}% >= {risk.max_drawdown_pct}%"
-        if breached and not rt.halt_new_entries:
+        if breached and (
+            not rt.halt_new_entries
+            or not rt.halt_new_entries_reason.startswith("circuit breaker")
+        ):
             logger.warning("CIRCUIT BREAKER: {}", breached)
             rt.trip_breaker(breached)
             reason_code = "DAILY_LOSS" if breached.startswith("daily loss") else "MAX_DRAWDOWN"
@@ -2007,6 +2271,7 @@ class TradingEngine:
                 reason=rt.halt_new_entries_reason,
                 source="engine:circuit_breaker",
             )
+            flatten_error: Exception | None = None
             try:
                 results = await self._executor.flatten_all(symbols=self._tracked_symbols())
                 for result in results:
@@ -2014,6 +2279,7 @@ class TradingEngine:
                 flattened = sum(1 for result in results if result.get("filled"))
             except Exception as e:
                 logger.error("circuit-breaker flatten failed: {}", e)
+                flatten_error = e
                 flattened = 0
                 await self._store.record_system_command(
                     "CIRCUIT_BREAKER",
@@ -2031,6 +2297,10 @@ class TradingEngine:
                     result=f"{rt.halt_new_entries_reason}; flattened {flattened} positions",
                 )
             await self._notifier.send(Event.CIRCUIT_BREAK, breached)
+            if flatten_error is not None:
+                raise RuntimeError(
+                    f"circuit breaker tripped but emergency flatten failed: {flatten_error}"
+                ) from flatten_error
             return True
         return rt.halt_new_entries
 
@@ -2171,6 +2441,14 @@ class TradingEngine:
 
     async def _handle_open(self, decision: TradeDecision, ctx: MarketContext) -> None:
         symbol = decision.symbol
+        snap = self._market.snapshot(symbol)
+        if not snap.fresh:
+            verdict = Verdict.reject(
+                RejectCode.STALE_MARKET_DATA,
+                "market ticker/klines refresh incomplete; new entry blocked",
+            )
+            await self._store.log_reject(symbol=symbol, verdict=verdict, decision=decision)
+            return
         sym_margin = self._position_margin(symbol)
         total_margin = sum(self._position_margin(s) for s in self._tracked_symbols())
         rctx = RiskContext(
@@ -2348,6 +2626,24 @@ class TradingEngine:
                 client_order_id=str(result.get("client_order_id") or ""),
                 raw=result.get("raw") if isinstance(result.get("raw"), dict) else None,
             )
+            await self._refresh_positions_after_open()
+
+    async def _refresh_positions_after_open(self) -> None:
+        """Refresh account exposure before another symbol can open in this cycle."""
+        positions = await self._fetch_positions_safe()
+        if positions is None:
+            self.runtime.halt_entries("post-open position query failed")
+            await self._persist_strategy_pause_reason(
+                reason_code="POST_OPEN_POSITION_QUERY_FAILED",
+                reason=self.runtime.halt_new_entries_reason,
+                source="engine:post_open",
+            )
+            return
+        self.runtime.positions = {
+            normalize_symbol(p.get("symbol")): p
+            for p in positions
+            if float(p.get("contracts") or 0.0) != 0
+        }
 
     async def _handle_close(self, symbol: str) -> None:
         raw = self.runtime.positions.get(symbol)
@@ -2440,7 +2736,7 @@ class TradingEngine:
             reason = self._validate_adjust_trigger(
                 symbol=symbol, side=side, kind=kind,
                 trigger=trigger, entry=entry, mark=mark,
-                qty=qty, equity=equity,
+                qty=qty, equity=equity, leverage=int(position.get("leverage") or 0),
             )
             if reason:
                 rejected.append(f"{kind}@{trigger:.4f}: {reason}")
@@ -2451,12 +2747,8 @@ class TradingEngine:
             logger.warning("[{}] ADJUST_SLTP: 全部触发价校验失败 {}", symbol, rejected)
             return
 
-        # 先校验完再撤旧单，降低裸奔风险
-        remaining = await self._cancel_symbol_condition_orders(symbol, reason="adjust_sltp")
-        if remaining:
-            details = ", ".join(self._condition_order_label(o) for o in remaining)
-            logger.warning("[{}] ADJUST_SLTP: 部分旧条件单未撤成功: {}，仍尝试补挂", symbol, details)
-
+        # 先放置并确认新保护单，再逐个撤销被替换的旧单，避免出现裸仓窗口。
+        old_orders = await self._active_protection_orders(symbol)
         results = await self._executor.place_protection_orders(
             symbol=symbol, pos_side=side, qty=qty, specs=specs,
         )
@@ -2485,6 +2777,18 @@ class TradingEngine:
             await self._emergency_close_unprotected_position(
                 symbol, reason="ADJUST_SLTP SL not placed"
             )
+            return
+
+        replaced_kinds = {
+            o.get("kind") for o in results if o.get("status") == "placed"
+        }
+        stale_old = [o for o in old_orders if o.get("kind") in replaced_kinds]
+        remaining = await self._cancel_stale_condition_orders(
+            symbol=symbol, orders=stale_old, reason="adjust_sltp_replace"
+        )
+        if remaining:
+            details = ", ".join(self._condition_order_label(o) for o in remaining)
+            logger.warning("[{}] ADJUST_SLTP: replaced old conditions remain: {}", symbol, details)
 
     def _validate_adjust_trigger(
         self,
@@ -2497,6 +2801,7 @@ class TradingEngine:
         mark: float,
         qty: float,
         equity: float,
+        leverage: int = 0,
     ) -> str:
         """校验 ADJUST_SLTP 触发价。基准是 mark（允许止损移至盈利侧）。"""
         if trigger <= 0 or mark <= 0 or qty <= 0:
@@ -2521,11 +2826,15 @@ class TradingEngine:
                 # 止损在盈利侧（loss<0 表示锁利），直接通过
                 pass
             else:
-                max_loss = equity * (self._settings.risk.max_loss_per_trade_pct / 100.0)
+                margin = entry * qty / max(leverage or self._settings.risk.max_leverage, 1)
+                max_loss = margin * (
+                    self._settings.risk.max_loss_per_order_margin_pct / 100.0
+                )
                 if max_loss > 0 and loss > max_loss:
                     return (
                         f"理论止损亏损 {loss:.2f} USDT 超过上限 {max_loss:.2f} USDT "
-                        f"({self._settings.risk.max_loss_per_trade_pct}% of {equity:.2f})"
+                        f"({self._settings.risk.max_loss_per_order_margin_pct}% of "
+                        f"estimated order margin {margin:.2f})"
                     )
         return ""
 
@@ -2631,12 +2940,12 @@ class TradingEngine:
             self._cycle_leader_snapshot = None
         return self._cycle_leader_snapshot
 
-    async def _fetch_positions_safe(self) -> list[dict]:
+    async def _fetch_positions_safe(self) -> list[dict] | None:
         try:
             return await self._client.fetch_positions(self._tracked_symbols())
         except Exception as e:
             logger.warning("fetch positions failed: {}", e)
-            return []
+            return None
 
     async def _fetch_open_orders_safe(self) -> list[dict]:
         """启动对账用：拉取普通未完成单和条件单，失败跳过单个 symbol。"""
@@ -2656,9 +2965,9 @@ class TradingEngine:
         """独立交易所对账循环。paused 时也运行，避免页面和 runtime 变成旧状态。"""
         while not self.runtime.kill_switch and not self._stopped.is_set():
             interval = (
-                _RECONCILE_ACTIVE_INTERVAL_SECONDS
+                self._settings.user_stream.reconcile_active_seconds
                 if self.runtime.positions
-                else _RECONCILE_IDLE_INTERVAL_SECONDS
+                else self._settings.user_stream.reconcile_idle_seconds
             )
             try:
                 await asyncio.wait_for(self._stopped.wait(), timeout=interval)
@@ -2675,16 +2984,18 @@ class TradingEngine:
     async def _reconcile_exchange_state(self, reason: str) -> None:
         """同步交易所当前状态，并执行保护单不变量检查。"""
         logger.debug("exchange reconcile start: {}", reason)
-        await self._snapshot()
-        await self._sync_open_orders_snapshot()
+        async with self._state_sync_lock:
+            await self._rest_resync_with_event_buffer(reason)
         await self._enforce_exchange_invariants(reason)
 
     async def _sync_open_orders_snapshot(self) -> None:
         orders = await self._fetch_open_orders_safe()
-        self.runtime.open_orders = {}
-        for order in orders:
-            sym = normalize_symbol(order.get("symbol"))
-            self.runtime.open_orders.setdefault(sym, []).append(order)
+        if not self._account.started:
+            self.runtime.open_orders = {}
+            for order in orders:
+                self.runtime.open_orders.setdefault(
+                    normalize_symbol(order.get("symbol")), []
+                ).append(order)
         if orders:
             await self._store.snapshot_open_orders(orders)
 
@@ -3216,13 +3527,19 @@ class TradingEngine:
 
     async def _snapshot_unlocked(self) -> None:
         prev_positions = dict(self.runtime.positions)
-        positions = await self._fetch_positions_safe()
-        new_positions = {
-            (p.get("symbol") or "").replace("/USDT:USDT", "USDT"): p for p in positions
-        }
+        try:
+            await self._rest_resync_with_event_buffer("cycle_snapshot")
+        except Exception as e:
+            self.runtime.halt_entries("position query failed; retaining last known positions")
+            await self._persist_strategy_pause_reason(
+                reason_code="POSITION_QUERY_FAILED",
+                reason=self.runtime.halt_new_entries_reason,
+                source="engine:snapshot",
+            )
+            logger.error("position snapshot aborted; last known state retained: {}", e)
+            return
+        new_positions = dict(self.runtime.positions)
         condition_exits = self._detect_external_closes(prev_positions, new_positions)
-        self.runtime.positions = new_positions
-        await self._store.snapshot_positions(positions, symbols=self._tracked_symbols())
         for exit_event in condition_exits:
             remaining = await self._cancel_symbol_condition_orders(
                 exit_event["symbol"], reason="external_close"
@@ -3235,11 +3552,45 @@ class TradingEngine:
                 await self._store.mark_orders_status_by_exchange_ids(remaining_ids, "placed")
                 details = ", ".join(self._condition_order_label(order) for order in remaining)
                 await self._disable_symbol_due_stale_conditions(exit_event["symbol"], details)
-        try:
-            bal = await self._client.fetch_balance()
-            await self._record_balance_snapshot(bal)
-        except Exception as e:
-            logger.warning("balance snapshot failed: {}", e)
+
+    async def _submit_rest_account_snapshot(self, reason: str) -> None:
+        positions = await self._client.fetch_positions(self._tracked_symbols())
+        open_orders = await self._fetch_open_orders_safe()
+        balance = await self._client.fetch_balance()
+        # Unit tests and one-shot maintenance helpers may call snapshot methods without
+        # starting the coordinator lifecycle. Keep that path synchronous and explicit.
+        if not self._account.started:
+            self.runtime.positions = {
+                normalize_position(p)["symbol"]: p
+                for p in positions
+                if normalize_position(p)["contracts"] > 0
+            }
+            self.runtime.open_orders = {}
+            for order in open_orders:
+                self.runtime.open_orders.setdefault(
+                    normalize_symbol(order.get("symbol")), []
+                ).append(order)
+            await self._store.snapshot_positions(positions, symbols=self._tracked_symbols())
+            if open_orders:
+                await self._store.snapshot_open_orders(open_orders)
+            await self._sync_exchange_day_pnl()
+            await self._record_balance_snapshot(balance)
+            return
+        await self._account.submit(rest_snapshot_event(
+            positions=positions,
+            open_orders=open_orders,
+            balance=balance,
+            reason=reason,
+        ))
+        await self._account.drain()
+        await self._store.snapshot_positions(positions, symbols=self._tracked_symbols())
+        if open_orders:
+            await self._store.snapshot_open_orders(open_orders)
+        await self._sync_exchange_day_pnl()
+        await self._record_balance_snapshot(balance)
+        await self._store.set_runtime_setting(
+            "stream.last_resync_at_ms", str(int(time.time() * 1000))
+        )
 
     async def _record_balance_snapshot(self, balance: dict) -> None:
         # 兜底：ccxt 在限频/限流/接口偶发残缺时，`bal['total'][USDT]`
@@ -3265,12 +3616,45 @@ class TradingEngine:
             )
             return
         self.runtime.update_equity(total)
+        await self._store.set_runtime_setting(
+            "risk.equity_peak", str(self.runtime.equity_peak)
+        )
         await self._store.snapshot_balance(
             total_equity=total,
             available_margin=free,
             runtime=self.runtime,
             quote_asset=quote,
         )
+
+    async def _sync_exchange_day_pnl(self) -> None:
+        """Recompute today's net realized PnL from Binance's authoritative ledger."""
+        if not hasattr(self._client, "fetch_income_history"):
+            return
+        now = time.time()
+        local = time.localtime(now)
+        start_ms = int(time.mktime((
+            local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0,
+            local.tm_wday, local.tm_yday, local.tm_isdst,
+        )) * 1000)
+        try:
+            rows = await self._client.fetch_income_history(start_ms)
+        except Exception as e:
+            logger.warning("exchange income sync failed; retaining local day pnl: {}", e)
+            return
+        allowed = {"REALIZED_PNL", "FUNDING_FEE", "COMMISSION"}
+        quote = self._settings.account.quote_asset
+        total = 0.0
+        for row in rows:
+            if str(row.get("incomeType") or "") not in allowed:
+                continue
+            if str(row.get("asset") or quote) != quote:
+                continue
+            try:
+                total += float(row.get("income") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        self.runtime.roll_day_if_needed(now)
+        self.runtime.day_realized_pnl = total
 
     def _detect_external_closes(self, prev: dict[str, dict], curr: dict[str, dict]) -> list[dict]:
         """对比前后持仓，对消失的持仓估算已实现盈亏并累加。
@@ -3332,54 +3716,37 @@ class TradingEngine:
         logger.warning("KILL SWITCH triggered: {}", reason)
         self.runtime.trigger_kill()
         self._stopped.set()
+        failure: Exception | None = None
         try:
             symbols = self._tracked_symbols()
             await self._executor.cancel_all_orders(symbols=symbols)
             await self._executor.flatten_all(symbols=symbols)
         except Exception as e:
             logger.error("kill switch flatten failed: {}", e)
+            failure = e
         await self._notifier.send(Event.KILL_SWITCH, reason)
+        if failure is not None:
+            raise RuntimeError(f"kill switch incomplete: {failure}") from failure
 
     # ---------- LLM profile 热替换 ----------
     async def _bootstrap_llm_profile(self) -> None:
-        """启动时把 DB 中 active profile（+备源）建成 fallback 链；首次启动写 yaml 默认。"""
+        """Build the active DB-backed profile chain; never bootstrap credentials from env."""
         active = await self._store.get_active_llm_profile()
         if active is not None:
             try:
                 await self._apply_llm_chain(source="db")
                 return
             except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "failed to build llm chain from stored profiles: {}; falling back to yaml", e,
-                )
-        # 首次启动或 active profile 失效：把 yaml 默认写一条 default profile。
-        s = self._settings.llm
-        await self._ensure_default_profile_from_yaml(s, self._creds.anthropic_api_key)
-
-    async def _ensure_default_profile_from_yaml(self, llm_cfg, api_key: str) -> None:
-        """把 yaml + 环境变量 api_key 写一条 default profile（明文入库），标记 active。
-
-        存量迁移落点：旧库 default profile 的 api_key 为空（原 keyring 模式，明文在 OS
-        钥匙串里取不回）时，用 .env 的 ANTHROPIC_API_KEY 回填明文。
-        """
-        existing = await self._store.get_llm_profile("default")
-        existing_secret = ""
-        if existing is not None:
-            existing_secret = await self._store.get_llm_profile_secret("default")
-        if existing is None or not existing_secret:
-            await self._store.upsert_llm_profile(
-                name="default",
-                provider=llm_cfg.provider,
-                model=llm_cfg.model,
-                base_url=llm_cfg.base_url,
-                timeout=llm_cfg.timeout,
-                max_tokens=llm_cfg.max_tokens,
-                max_retries=llm_cfg.max_retries,
-                api_key=api_key,
-                priority=0,
-            )
-        await self._store.activate_llm_profile("default")
-        await self._apply_llm_chain(source="yaml-default")
+                logger.error("failed to build stored LLM profile chain: {}", e)
+        self.runtime.halt_entries("no active usable LLM profile")
+        await self._persist_strategy_pause_reason(
+            reason_code="LLM_PROFILE_REQUIRED",
+            reason=self.runtime.halt_new_entries_reason,
+            source="engine:startup",
+        )
+        logger.warning(
+            "no active usable LLM profile; entries remain paused until a profile is activated"
+        )
 
     async def _build_llm_chain(self):
         """按 priority 升序把 active 主源 + fallback_enabled 备源建成 LLMFailoverClient。"""

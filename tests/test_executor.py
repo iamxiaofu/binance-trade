@@ -81,6 +81,33 @@ async def test_open_calls_exchange_and_sets_leverage(settings):
     assert client.setup_called == [("BTCUSDT", 3)]
 
 
+async def test_ambiguous_market_open_recovers_by_client_order_id(settings):
+    class AmbiguousClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.create_calls = 0
+            self.recovered_client_id = ""
+
+        async def create_order(self, symbol, side, amount, order_type="market", price=None, params=None):
+            self.create_calls += 1
+            self.recovered_client_id = params["newClientOrderId"]
+            raise ccxt.NetworkError("response lost")
+
+        async def fetch_order_by_client_id(self, symbol, client_order_id):
+            assert client_order_id == self.recovered_client_id
+            return {
+                "id": "recovered-1", "clientOrderId": client_order_id,
+                "filled": 0.05, "average": 100.0, "status": "closed",
+            }
+
+    client = AmbiguousClient()
+    ex = Executor(client, settings)
+    result = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
+    assert result["status"] == "filled"
+    assert result["id"] == "recovered-1"
+    assert client.create_calls == 1
+
+
 def test_fee_summary_deduplicates_duplicate_trade_fee_sources():
     trade = {
         "amount": 2.494,

@@ -123,7 +123,7 @@ def build_user_prompt(
 风控允许最大杠杆(max_leverage_allowed): {ctx.max_leverage_allowed}x
 单笔保证金硬上限: margin_used ≤ {ctx.max_order_margin_abs:.2f} USDT (= max_order_margin_pct {ctx.max_order_margin_pct:.4f} × 账户权益 {ctx.account_equity:.2f})，硬性约束，超出直接拒单
    size_pct 参考上限: 当可用保证金≈账户权益时约 ≤ {ctx.max_order_margin_pct*100:.1f}%；实际必须用 margin_used=可用保证金×size_pct 交叉校验
-单笔止损理论亏损上限: {ctx.max_loss_per_trade_abs:.2f} USDT（= size_pct × 可用保证金 × 杠杆 × stop_loss_pct）
+单笔止损理论亏损上限: {ctx.max_loss_per_trade_abs:.2f} USDT（按单笔保证金止损亏损比例约束）
 说明: 请据账户权益与上限自主决定 size_pct（占可用保证金比例）与止损距离。
 名义价值=size_pct×杠杆×可用保证金；杠杆不会放大保证金上限，但会放大名义价值与止损亏损。
 {pos_desc}

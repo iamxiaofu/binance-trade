@@ -95,13 +95,28 @@ class ExchangeClient:
         try:
             await self._exchange.set_margin_mode(margin_mode, ccxt_sym)
         except ccxt.ExchangeError as e:
-            # "No need to change margin type" 等幂等错误可忽略
-            logger.debug("set_margin_mode({}) skipped: {}", symbol, e)
+            message = str(e).lower()
+            if "no need to change margin type" in message or "-4046" in message:
+                logger.debug("set_margin_mode({}) already configured: {}", symbol, e)
+            else:
+                logger.warning("set_margin_mode({}) failed: {}", symbol, e)
+                raise
         try:
             await self._exchange.set_leverage(leverage, ccxt_sym)
         except ccxt.ExchangeError as e:
             logger.warning("set_leverage({}, {}) failed: {}", symbol, leverage, e)
             raise
+
+    async def validate_account_mode(self) -> None:
+        """Fail closed for account modes unsupported by the execution model."""
+        position_mode = await self._exchange.fapiPrivateGetPositionSideDual()
+        dual = str(position_mode.get("dualSidePosition", "")).lower() == "true"
+        if dual:
+            raise RuntimeError("hedge position mode is unsupported; switch Binance to one-way mode")
+        multi_assets = await self._exchange.fapiPrivateGetMultiAssetsMargin()
+        enabled = str(multi_assets.get("multiAssetsMargin", "")).lower() == "true"
+        if enabled:
+            raise RuntimeError("multi-assets margin mode is unsupported")
 
     # ---------- 查询 ----------
     async def fetch_server_time(self) -> int:
@@ -110,6 +125,13 @@ class ExchangeClient:
     async def fetch_balance(self) -> dict[str, Any]:
         bal = await self._exchange.fetch_balance()
         return bal
+
+    async def fetch_income_history(self, start_ms: int, limit: int = 1000) -> list[dict[str, Any]]:
+        """Fetch Binance's realized PnL, funding and commission ledger."""
+        rows = await self._exchange.fapiPrivateGetIncome(
+            {"startTime": int(start_ms), "limit": min(max(int(limit), 1), 1000)}
+        )
+        return list(rows or [])
 
     async def fetch_available_margin(self, quote: str = "USDT") -> float:
         bal = await self._exchange.fetch_balance()
@@ -172,6 +194,25 @@ class ExchangeClient:
             self._to_ccxt_symbol(symbol),
             params or {},
         )
+
+    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> dict | None:
+        """Recover an ambiguously acknowledged regular order by client ID."""
+        try:
+            raw = await self._exchange.fapiPrivateGetOrder({
+                "symbol": symbol,
+                "origClientOrderId": client_order_id,
+            })
+        except ccxt.OrderNotFound:
+            return None
+        return {
+            "id": str(raw.get("orderId") or ""),
+            "clientOrderId": str(raw.get("clientOrderId") or client_order_id),
+            "status": str(raw.get("status") or "").lower(),
+            "filled": float(raw.get("executedQty") or 0.0),
+            "average": float(raw.get("avgPrice") or 0.0),
+            "amount": float(raw.get("origQty") or 0.0),
+            "info": raw,
+        }
 
     async def fetch_order_trades(self, symbol: str, order_id: str, limit: int = 100) -> list[dict]:
         return await self._exchange.fetch_my_trades(

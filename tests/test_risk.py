@@ -5,6 +5,7 @@ import pytest
 
 from src.llm.schema import Action, TradeDecision
 from src.risk.manager import RejectCode, RiskContext, estimate_liq_distance_pct, validate
+from src.risk.settings import decode_risk, risk_public, validate_risk_payload
 
 
 def _decision(**kw) -> TradeDecision:
@@ -73,8 +74,8 @@ def test_total_margin_limit(settings):
 
 
 def test_trade_loss_limit(settings):
-    # margin=40, lev=3, notional=120, stop=5% => estimated loss=6 > max 4
-    d = _decision(leverage=3, size_pct=0.2, stop_loss_pct=0.05)
+    # margin=40, lev=3, notional=120, stop=20% => loss=24 > margin cap 12
+    d = _decision(leverage=3, size_pct=0.2, stop_loss_pct=0.20)
     v = validate(d, _ctx(), settings)
     assert v.passed is False
     assert v.code is RejectCode.TRADE_LOSS
@@ -138,3 +139,18 @@ def test_invalid_size(settings):
     v = validate(_decision(size_pct=0.0), _ctx(), settings)
     # size_pct=0 在 schema 合法(ge=0)，但风控判 INVALID_SIZE
     assert v.code is RejectCode.INVALID_SIZE
+
+
+def test_runtime_risk_payload_validates_consistency(settings):
+    updated = validate_risk_payload(
+        {"max_total_margin_pct": 1.0, "max_loss_per_order_margin_pct": 30},
+        settings.risk,
+    )
+    assert updated.max_total_margin_pct == 1.0
+    assert risk_public(updated)["max_loss_per_order_margin_pct"] == 30
+
+
+def test_legacy_equity_loss_key_migrates_to_order_margin_default(settings):
+    raw = '{"max_loss_per_trade_pct":2,"max_leverage":3}'
+    migrated = decode_risk(raw, settings.risk)
+    assert migrated.max_loss_per_order_margin_pct == settings.risk.max_loss_per_order_margin_pct

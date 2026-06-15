@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -113,12 +113,25 @@ class RiskConfig(_Base):
     max_order_margin_pct: float = Field(gt=0, le=1)       # 单笔保证金占权益比例
     max_symbol_margin_pct: float = Field(gt=0, le=1)      # 单标的累计保证金占权益比例
     max_total_margin_pct: float = Field(gt=0, le=1)       # 全账户累计保证金占权益比例
-    max_loss_per_trade_pct: float = Field(gt=0, le=100)   # 止损触发时理论亏损占权益百分比
+    # 单笔理论止损亏损占该订单保证金百分比。旧配置键
+    # max_loss_per_trade_pct 仅作为迁移兼容输入，语义不再是账户权益百分比。
+    max_loss_per_order_margin_pct: float = Field(default=30, gt=0, le=100)
     max_drawdown_pct: float = Field(gt=0, le=100)
     # 日亏限额也按权益百分比（随资金缩放）
     daily_max_loss_pct: float = Field(gt=0, le=100)
     liq_distance_min_pct: float = Field(ge=0, le=100)
     min_confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_loss_key(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            # 旧值是“占账户权益百分比”，不能无损转换成“占订单保证金百分比”。
+            # 迁移时使用新规则默认值 30%，避免把旧 2% 误解释成极端严格的
+            # 订单保证金 2%；显式的新字段始终优先。
+            data.pop("max_loss_per_trade_pct", None)
+        return data
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "RiskConfig":
@@ -251,6 +264,19 @@ class StorageConfig(_Base):
         return self.db_path
 
 
+class UserStreamConfig(_Base):
+    enabled: bool = True
+    private_ws_base_url: str | None = None
+    keepalive_seconds: int = Field(default=1800, ge=60, le=3600)
+    rotate_seconds: int = Field(default=82800, ge=3600, le=86400)
+    reconnect_max_seconds: int = Field(default=30, ge=1, le=300)
+    startup_buffer_limit: int = Field(default=10000, ge=100, le=100000)
+    reconcile_active_seconds: int = Field(default=30, ge=5, le=3600)
+    reconcile_idle_seconds: int = Field(default=120, ge=10, le=7200)
+    confirm_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    event_retention_days: int = Field(default=30, ge=1, le=365)
+
+
 class NotifyConfig(_Base):
     telegram_enabled: bool = False
     telegram_bot_token_env: str = "TELEGRAM_BOT_TOKEN"
@@ -281,6 +307,7 @@ class Settings(_Base):
     llm: LLMConfig
     execution: ExecutionConfig
     storage: StorageConfig
+    user_stream: UserStreamConfig = Field(default_factory=UserStreamConfig)
     notify: NotifyConfig
     logging: LoggingConfig
 
@@ -314,7 +341,9 @@ class Credentials(BaseModel):
     """敏感凭据，单独从 .env 读取，绝不写日志、绝不落库。"""
     binance_api_key: str
     binance_api_secret: str
-    anthropic_api_key: str
+    # LLM credentials are managed dynamically in per-environment llm_profiles.
+    # Kept as an optional compatibility field so older env files still load.
+    anthropic_api_key: str = ""
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 

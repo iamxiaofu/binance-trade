@@ -2,7 +2,7 @@
 # 密钥一律走 .env，本文件只放环境变量名。
 
 # ===== 运行模式 =====
-mode: testnet                 # testnet | mainnet，一键切换
+mode: mainnet                # 独立子账户现网实例
 
 # ===== 交易标的（USDT-M 永续）=====
 symbols:
@@ -50,10 +50,10 @@ risk:
   on_leverage_exceed: REJECT       # 固定为 REJECT
   max_order_margin_pct: 0.2        # 单笔最多占用保证金 = 权益 × 20%
   max_symbol_margin_pct: 0.4       # 单标的累计占用保证金 = 权益 × 40%
-  max_total_margin_pct: 0.8        # testnet 默认全账户累计占用保证金 = 权益 × 80%
+  max_total_margin_pct: 1.0        # 全账户累计占用保证金 = 权益 × 100%
   max_loss_per_order_margin_pct: 30 # 止损理论亏损 <= 本订单保证金 × 30%
   max_drawdown_pct: 20             # 账户最大回撤熔断阈值(%) → 平仓+停开新仓
-  daily_max_loss_pct: 10           # testnet 默认每日最大亏损 = 权益 × 10%
+  daily_max_loss_pct: 20           # 每日最大亏损 = 权益 × 20% → 当日停交易
   liq_distance_min_pct: 5          # 开仓前估算强平价，距现价 < 5% → 拒单
   min_confidence: 0.6              # LLM confidence 低于此值视为 HOLD
 
@@ -91,13 +91,13 @@ execution:
 
 # ===== 持久化 =====
 storage:
-  db_path_template: ./data/trade-{mode}.db  # SQLite，按 testnet/mainnet 隔离
+  db_path: /var/lib/binance-trade/mainnet/trade.db
   reconcile_on_start: true    # 启动与交易所对账
 
 # ===== Binance 私有账户流 =====
 user_stream:
   enabled: true
-  # private_ws_base_url: wss://fstream.binancefuture.com/ws
+  private_ws_base_url: wss://fstream.binance.com/private/ws
   keepalive_seconds: 1800
   rotate_seconds: 82800
   reconnect_max_seconds: 30
@@ -117,7 +117,7 @@ notify:
 # ===== 日志 =====
 logging:
   level: INFO
-  dir: ./logs
+  dir: /var/log/binance-trade/mainnet
   rotation: 50 MB
   retention: 30 days
   serialize: false            # true 输出 JSON 行日志

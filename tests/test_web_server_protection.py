@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from web import server
-from web.server import _apply_live_balance, _attach_protection_orders, _live_balance_snapshot
+from web.server import _apply_live_balance, _attach_projection_metadata
 
 
 def test_attach_protection_ignores_historical_condition_orders():
@@ -26,7 +26,7 @@ def test_attach_protection_ignores_historical_condition_orders():
         },
     ]
 
-    _attach_protection_orders(positions, orders)
+    _attach_projection_metadata(positions, orders)
 
     protection = positions[0]["protection"]
     assert protection["sl"] is None
@@ -54,7 +54,7 @@ def test_attach_protection_uses_active_placed_condition_orders():
         },
     ]
 
-    _attach_protection_orders(positions, orders)
+    _attach_projection_metadata(positions, orders)
 
     protection = positions[0]["protection"]
     assert protection["sl"]["status"] == "placed"
@@ -92,24 +92,13 @@ def test_apply_live_balance_recomputes_day_equity_from_exchange(monkeypatch):
     assert balance["equity_source"] == "exchange"
 
 
-async def test_live_balance_snapshot_uses_cache(monkeypatch):
-    calls = 0
-
-    class FakeClient:
-        async def fetch_balance(self):
-            nonlocal calls
-            calls += 1
-            return {"total": {"USDT": 150.0}, "free": {"USDT": 140.0}}
-
-    async def get_market():
-        return FakeClient()
-
-    monkeypatch.setattr(server, "_get_market", get_market)
-    server._balance_cache.update({"ts_ms": 0, "total_equity": None, "available_margin": None})
-
-    first = await _live_balance_snapshot()
-    second = await _live_balance_snapshot()
-
-    assert calls == 1
-    assert first["total_equity"] == pytest.approx(150.0)
-    assert second["total_equity"] == pytest.approx(150.0)
+def test_projection_metadata_applies_local_trade_fields(monkeypatch):
+    monkeypatch.setattr(
+        server.st,
+        "open_trade_metadata",
+        lambda _db: {"BTCUSDT": {"trade_id": 7, "local_leverage": 5}},
+    )
+    positions = [{"symbol": "BTCUSDT", "leverage": 0}]
+    _attach_projection_metadata(positions, [])
+    assert positions[0]["trade_id"] == 7
+    assert positions[0]["leverage"] == 5

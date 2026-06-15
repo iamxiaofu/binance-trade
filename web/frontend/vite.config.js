@@ -14,8 +14,22 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/ws': { target: 'ws://127.0.0.1:8000', ws: true },
+      '/api/testnet': {
+        target: 'http://127.0.0.1:8000', changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/testnet/, '/api'),
+      },
+      '/api/mainnet': {
+        target: 'http://127.0.0.1:8001', changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/mainnet/, '/api'),
+      },
+      '/ws/testnet': {
+        target: 'ws://127.0.0.1:8000', ws: true,
+        rewrite: (path) => path.replace(/^\/ws\/testnet/, '/ws'),
+      },
+      '/ws/mainnet': {
+        target: 'ws://127.0.0.1:8001', ws: true,
+        rewrite: (path) => path.replace(/^\/ws\/mainnet/, '/ws'),
+      },
       '/healthz': { target: 'http://127.0.0.1:8000', changeOrigin: true },
     },
   },

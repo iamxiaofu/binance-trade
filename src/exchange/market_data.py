@@ -28,6 +28,7 @@ class SymbolSnapshot:
     change_24h_pct: float = 0.0
     klines: list[list[float]] = field(default_factory=list)  # [[ts,o,h,l,c,v],...]
     updated_ms: int = 0
+    fresh: bool = True
 
     @property
     def is_ready(self) -> bool:
@@ -84,7 +85,9 @@ class MarketData:
                 self._client.fetch_funding_rate(symbol),
                 return_exceptions=True,
             )
-            if not isinstance(ticker, Exception) and ticker:
+            ticker_ok = not isinstance(ticker, Exception) and bool(ticker)
+            klines_ok = not isinstance(klines, Exception) and bool(klines)
+            if ticker_ok:
                 snap.last_price = float(ticker.get("last") or snap.last_price)
                 mark = ticker.get("mark") or (ticker.get("info") or {}).get("markPrice")
                 snap.mark_price = float(mark) if mark else snap.last_price
@@ -94,7 +97,7 @@ class MarketData:
             else:
                 logger.warning("ticker refresh failed {}: {}", symbol, ticker)
 
-            if not isinstance(klines, Exception) and klines:
+            if klines_ok:
                 snap.klines = klines
             else:
                 logger.warning("ohlcv refresh failed {}: {}", symbol, klines)
@@ -104,6 +107,9 @@ class MarketData:
                 if fr is not None:
                     snap.funding_rate = float(fr)
 
-            snap.updated_ms = int(time.time() * 1000)
+            snap.fresh = ticker_ok and klines_ok
+            if snap.fresh:
+                snap.updated_ms = int(time.time() * 1000)
         except Exception as e:  # 兜底：整体失败也不让主循环崩
+            snap.fresh = False
             logger.exception("market refresh error {}: {}", symbol, e)

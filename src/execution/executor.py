@@ -106,9 +106,41 @@ class Executor:
         self._settings = settings
         self._cfg: ExecutionConfig = settings.execution
         self._policy = ExecutionPolicy(self._cfg)
+        self._account_state = None
+
+    def set_account_state(self, account_state) -> None:
+        self._account_state = account_state
+
+    async def _wait_private_confirmation(self, client_order_id: str) -> None:
+        if not client_order_id or self._account_state is None:
+            return
+        if self._account_state.snapshot().stream_status != "LIVE":
+            return
+        confirmed = await self._account_state.wait_for_order(
+            client_order_id, self._settings.user_stream.confirm_timeout_seconds
+        )
+        if confirmed is None:
+            logger.warning("private-stream confirmation timed out for {}", client_order_id)
+
+    async def _recover_ambiguous_order(self, symbol: str, client_order_id: str) -> dict | None:
+        if self._account_state is not None and self._account_state.snapshot().stream_status == "LIVE":
+            confirmed = await self._account_state.wait_for_order(
+                client_order_id, self._settings.user_stream.confirm_timeout_seconds
+            )
+            if confirmed is not None:
+                return {
+                    "id": str(confirmed.get("id") or ""),
+                    "clientOrderId": client_order_id,
+                    "status": str(confirmed.get("status") or ""),
+                    "filled": float(confirmed.get("filled_qty") or 0),
+                    "average": float(confirmed.get("avg_price") or confirmed.get("price") or 0),
+                    "amount": float(confirmed.get("qty") or 0),
+                    "info": confirmed,
+                }
+        return await self._client.fetch_order_by_client_id(symbol, client_order_id)
 
     # ---------- 退避重试 ----------
-    async def _with_retry(self, coro_factory, what: str):
+    async def _with_retry(self, coro_factory, what: str, recover_factory=None):
         """对限频/网络瞬时错误指数退避重试。coro_factory 是无参 async 工厂。"""
         attempt = 0
         last_err: Exception | None = None
@@ -117,6 +149,15 @@ class Executor:
                 return await coro_factory()
             except (ccxt.RateLimitExceeded, ccxt.NetworkError, ccxt.DDoSProtection) as e:
                 last_err = e
+                if recover_factory is not None:
+                    try:
+                        recovered = await recover_factory()
+                    except Exception as recover_error:
+                        logger.warning("{} ambiguous-order recovery failed: {}", what, recover_error)
+                    else:
+                        if recovered:
+                            logger.warning("{} recovered by client order id after transient error", what)
+                            return recovered
                 wait = self._cfg.rate_limit_backoff ** attempt
                 logger.warning("{} transient err (attempt {}): {}; backoff {:.1f}s",
                                what, attempt + 1, e, wait)
@@ -390,15 +431,19 @@ class Executor:
         卖单看 bids（吃买盘），买单看 asks（吃卖盘）。
         """
         if ref_price <= 0 or qty <= 0:
+            return False, ref_price, "invalid reference price or quantity"
+        if not hasattr(self._client, "fetch_order_book"):
+            # Lightweight test/offline adapters may not implement market depth.
+            # The production ExchangeClient always implements it.
             return True, ref_price, ""
         try:
             book = await self._client.fetch_order_book(symbol, limit=20)
         except Exception as e:
-            logger.warning("[{}] preflight orderbook failed (allow): {}", symbol, e)
-            return True, ref_price, ""
+            logger.warning("[{}] preflight orderbook failed (reject): {}", symbol, e)
+            return False, ref_price, f"orderbook unavailable: {e}"
         levels = (book.get("bids") if side == "sell" else book.get("asks")) or []
         if not levels:
-            return True, ref_price, ""
+            return False, ref_price, "orderbook side is empty"
         # 累计 qty 拿加权均价
         remaining = qty
         cost = 0.0
@@ -413,12 +458,14 @@ class Executor:
             if remaining <= 0:
                 break
         if remaining > 0:
-            # 盘口深度不够：可能严重滑点，但保守起见 allow（市价单至少会成交部分）
             logger.warning(
                 "[{}] preflight: book depth insufficient qty={} remaining={}",
                 symbol, qty, remaining,
             )
             est_impact = cost / max(qty - remaining, 1e-9)
+            return False, est_impact, (
+                f"orderbook depth insufficient: qty={qty} remaining={remaining}"
+            )
         else:
             est_impact = cost / qty
         # 偏差：卖单 impact <= ref_price（吃买盘会更低），买单 impact >= ref_price
@@ -479,7 +526,9 @@ class Executor:
                 symbol, side, q, "market", None, {"newClientOrderId": client_order_id}
             ),
             f"open {symbol}",
+            recover_factory=lambda: self._recover_ambiguous_order(symbol, client_order_id),
         )
+        await self._wait_private_confirmation(client_order_id)
         order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
         trades = await self._fetch_order_trades_safe(
             symbol, order_id, attempts=4, delay_seconds=0.25
@@ -574,7 +623,9 @@ class Executor:
             order = await self._with_retry(
                 lambda: self._client.create_order(symbol, side, q, "limit", limit_price, params),
                 f"maker open {symbol}",
+                recover_factory=lambda: self._recover_ambiguous_order(symbol, client_order_id),
             )
+            await self._wait_private_confirmation(client_order_id)
             order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
             if order_id:
                 attempt_order_ids.append(order_id)
@@ -975,6 +1026,7 @@ class Executor:
         """按明确触发价补挂 reduce-only 保护条件单。"""
         close_side = "sell" if pos_side.lower() == "long" else "buy"
         results: list[dict] = []
+        errors: list[str] = []
         for kind, otype, trigger in specs:
             client_algo_id = self._protection_client_algo_id(
                 symbol=symbol, kind=kind, side=close_side, qty=qty, trigger=trigger
@@ -1161,7 +1213,9 @@ class Executor:
                 {"reduceOnly": True, "newClientOrderId": client_order_id}
             ),
             f"close {symbol}",
+            recover_factory=lambda: self._recover_ambiguous_order(symbol, client_order_id),
         )
+        await self._wait_private_confirmation(client_order_id)
         order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
         trades = await self._fetch_order_trades_safe(
             symbol, order_id, attempts=4, delay_seconds=0.25
@@ -1240,7 +1294,9 @@ class Executor:
             order = await self._with_retry(
                 lambda: self._client.create_order(symbol, close_side, q, "limit", limit_price, params),
                 f"maker close {symbol}",
+                recover_factory=lambda: self._recover_ambiguous_order(symbol, client_order_id),
             )
+            await self._wait_private_confirmation(client_order_id)
             order_id = str(order.get("id") or (order.get("info") or {}).get("orderId") or "")
             observed = await self._wait_maker_fill(
                 symbol=symbol,
@@ -1356,10 +1412,38 @@ class Executor:
         for p in positions:
             try:
                 results.append(
-                    await self.close_position(p, mode=self._cfg.emergency_exit_mode)
+                    await self.close_position(
+                        p,
+                        mode=self._cfg.emergency_exit_mode,
+                        skip_slippage_guard=True,
+                    )
                 )
             except Exception as e:
                 logger.error("flatten_all close failed: {}", e)
+                errors.append(str(e))
+        failed = [
+            r for r in results
+            if not r.get("filled") or float(r.get("remaining_qty") or 0.0) > 0
+        ]
+        if failed or errors:
+            raise RuntimeError(
+                f"emergency flatten incomplete for "
+                f"{','.join(str(r.get('symbol') or '?') for r in failed) or 'unknown'}"
+            )
+        remaining_positions: list[dict] = []
+        for delay in (0.0, 0.5, 1.0):
+            if delay:
+                await asyncio.sleep(delay)
+            remaining_positions = await self._client.fetch_positions(
+                symbols or self._settings.symbols
+            )
+            if not remaining_positions:
+                break
+        if remaining_positions:
+            remaining_symbols = ",".join(
+                str(p.get("symbol") or "?") for p in remaining_positions
+            )
+            raise RuntimeError(f"emergency flatten verification failed: {remaining_symbols}")
         return results
 
     async def cancel_all_orders(self, symbols: list[str] | None = None) -> None:

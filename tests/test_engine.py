@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import src.engine.loop as engine_loop
-from src.config.schema import Credentials
+from src.config.schema import Credentials, Mode
 from src.engine.loop import TradingEngine
 from src.exchange.filters import SymbolFilters
 from src.exchange.market_data import SymbolSnapshot
@@ -605,6 +605,71 @@ async def test_no_breaker_under_limits(settings, creds, monkeypatch):
     assert eng._executor.flattened == 0
 
 
+async def test_runtime_risk_update_is_versioned_and_applied(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._risk_version = 2
+    result = await eng._update_risk_settings(json.dumps({
+        "expected_version": 2,
+        "max_total_margin_pct": 1.0,
+        "daily_max_loss_pct": 20,
+    }))
+    assert eng._settings.risk.max_total_margin_pct == 1.0
+    assert eng._risk_version == 3
+    assert '"version": 3' in result
+    assert eng._store.runtime_settings["risk.version"] == "3"
+
+
+async def test_mainnet_runtime_settings_force_restart_pause(settings, creds, monkeypatch):
+    settings.mode = Mode.MAINNET
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.runtime_settings["strategy.paused"] = "false"
+    await eng._apply_runtime_settings()
+    assert eng.runtime.halt_new_entries is True
+    assert eng._store.runtime_settings["strategy.paused"] == "true"
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == "MAINNET_RESTART_GUARD"
+
+
+async def test_missing_llm_profile_halts_entries_without_env_bootstrap(
+    settings, creds, monkeypatch, tmp_path
+):
+    from src.store.repo import Store
+
+    eng = TradingEngine(settings, creds)
+    store = Store(str(tmp_path / "profiles.db"))
+    await store.connect()
+    eng._store = store
+    try:
+        await eng._bootstrap_llm_profile()
+        assert eng.runtime.halt_new_entries is True
+        assert await store.list_llm_profiles() == []
+        assert await store.get_runtime_setting("strategy.pause.reason_code") == "LLM_PROFILE_REQUIRED"
+    finally:
+        await store.close()
+        await eng._llm.close()
+        await eng._client.close()
+
+
+async def test_snapshot_position_query_failure_retains_last_state(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    previous = {
+        "BTCUSDT": {
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1,
+            "entryPrice": 100.0, "markPrice": 100.0,
+        }
+    }
+    eng.runtime.positions = previous.copy()
+
+    async def fail_positions(_symbols):
+        raise RuntimeError("exchange unavailable")
+
+    monkeypatch.setattr(eng._client, "fetch_positions", fail_positions)
+    await eng._snapshot_unlocked()
+
+    assert eng.runtime.positions == previous
+    assert eng.runtime.halt_new_entries is True
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == "POSITION_QUERY_FAILED"
+
+
 async def test_paused_cycle_still_snapshots(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng.runtime.halt_new_entries = True
@@ -627,6 +692,24 @@ async def test_record_balance_snapshot_updates_runtime(settings, creds, monkeypa
     assert eng.runtime.current_equity == pytest.approx(321.0)
     assert eng._store.balance_snapshots[0]["total_equity"] == pytest.approx(321.0)
     assert eng._store.balance_snapshots[0]["available_margin"] == pytest.approx(300.0)
+
+
+async def test_exchange_income_sync_includes_realized_funding_and_commission(
+    settings, creds, monkeypatch
+):
+    eng = _engine(settings, creds, monkeypatch)
+
+    async def income(_start_ms):
+        return [
+            {"incomeType": "REALIZED_PNL", "asset": "USDT", "income": "10"},
+            {"incomeType": "FUNDING_FEE", "asset": "USDT", "income": "-1"},
+            {"incomeType": "COMMISSION", "asset": "USDT", "income": "-0.5"},
+            {"incomeType": "TRANSFER", "asset": "USDT", "income": "100"},
+        ]
+
+    monkeypatch.setattr(eng._client, "fetch_income_history", income, raising=False)
+    await eng._sync_exchange_day_pnl()
+    assert eng.runtime.day_realized_pnl == pytest.approx(8.5)
 
 
 async def test_record_balance_snapshot_skips_when_total_missing(settings, creds, monkeypatch):
@@ -923,7 +1006,7 @@ async def test_reconcile_disables_managed_position_missing_stop_without_auto_clo
 
 
 async def test_reconcile_repairs_disabled_managed_position_missing_stop(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._symbol_enabled["BTCUSDT"] = False
     eng._store.open_trades.add("BTCUSDT")
@@ -1166,7 +1249,8 @@ async def test_open_waits_for_position_visibility_before_attaching_protection(se
 
     await eng._handle_open(decision, _ctx())
 
-    assert eng._client.fetch_positions_calls == 3
+    # Three visibility checks plus one post-open account-risk refresh.
+    assert eng._client.fetch_positions_calls == 4
     assert [o["kind"] for o in eng._store.orders] == ["OPEN", "SL", "TP"]
     assert eng._symbol_enabled["BTCUSDT"] is True
 
@@ -1580,7 +1664,7 @@ class ManualCloseExecutor(FakeExecutor):
 
 
 async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
         position={
@@ -1605,7 +1689,7 @@ async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monke
 
 
 async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
         position={
@@ -1636,7 +1720,7 @@ async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, m
 
 
 async def test_reconcile_emergency_closes_when_repair_sl_crossed_mark(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._symbol_enabled["BTCUSDT"] = True
     eng._store.open_trades.add("BTCUSDT")
@@ -1670,7 +1754,7 @@ async def test_reconcile_emergency_closes_when_repair_sl_crossed_mark(settings, 
 
 
 async def test_command_repair_sl_tp_keeps_active_tp_after_mark_crosses_trigger(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
         position={
@@ -1700,7 +1784,7 @@ async def test_command_repair_sl_tp_keeps_active_tp_after_mark_crosses_trigger(s
 
 
 async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
         position={
@@ -1732,7 +1816,7 @@ async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, cred
 
 
 async def test_command_protect_position_uses_manual_stop_for_takeover(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._client = RepairClient(
         position={
@@ -1762,7 +1846,7 @@ async def test_command_protect_position_uses_manual_stop_for_takeover(settings, 
 
 
 async def test_command_protect_position_takeover_only_residual_qty(settings, creds, monkeypatch):
-    settings.risk.max_loss_per_trade_pct = 10
+    settings.risk.max_loss_per_order_margin_pct = 10
     eng = _engine(settings, creds, monkeypatch)
     eng._store.open_trades.add("BTCUSDT")
     eng._store.open_qty["BTCUSDT"] = 0.08

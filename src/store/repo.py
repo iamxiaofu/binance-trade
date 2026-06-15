@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import text, select, or_
+from sqlalchemy import text, select, or_, delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.exchange.positions import normalize_position, normalize_symbol
@@ -36,7 +37,15 @@ from src.store.models import (
     RuntimeSettingRow,
     SymbolRow,
     TradeRow,
+    ExchangeEventRow,
+    ExchangeStateDriftRow,
+    ExchangeStreamSessionRow,
+    LiveBalanceRow,
+    LivePositionRow,
+    LiveOrderRow,
 )
+from src.exchange.events import ExchangeEvent
+from src.exchange.orders import normalize_condition_order, normalize_open_order
 
 
 _ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -335,6 +344,10 @@ class Store:
             await conn.run_sync(Base.metadata.create_all)
             await self._upgrade_schema(conn)
         await self.backfill_trades()
+        try:
+            Path(self._db_path).chmod(0o600)
+        except OSError as e:
+            logger.warning("failed to restrict sqlite permissions {}: {}", self._db_path, e)
         logger.info("store connected: {}", self._db_path)
 
     async def _upgrade_schema(self, conn) -> None:
@@ -384,6 +397,264 @@ class Store:
         async with self._sessionmaker() as session:
             session.add(row)
             await session.commit()
+
+    # ---------- 私有流事件与当前账户投影 ----------
+    async def record_exchange_event(self, event: ExchangeEvent) -> bool:
+        row = ExchangeEventRow(
+            event_key=event.event_key,
+            session_id=event.session_id,
+            source=event.source,
+            event_type=event.event_type,
+            event_time_ms=event.event_time_ms,
+            transaction_time_ms=event.transaction_time_ms,
+            received_at_ms=event.received_at_ms,
+            raw_json=json.dumps(event.payload, default=str)[:100000],
+        )
+        async with self._sessionmaker() as session:
+            session.add(row)
+            try:
+                await session.commit()
+                return True
+            except IntegrityError:
+                await session.rollback()
+                return False
+
+    async def pending_exchange_events(self, limit: int = 10000) -> list[ExchangeEvent]:
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(
+                select(ExchangeEventRow)
+                .where(ExchangeEventRow.status == "received")
+                .order_by(ExchangeEventRow.id)
+                .limit(limit)
+            )).scalars().all()
+        events: list[ExchangeEvent] = []
+        for row in rows:
+            try:
+                payload = json.loads(row.raw_json or "{}")
+            except json.JSONDecodeError:
+                continue
+            events.append(ExchangeEvent(
+                event_type=row.event_type,
+                payload=payload,
+                event_time_ms=row.event_time_ms,
+                transaction_time_ms=row.transaction_time_ms,
+                source=row.source,
+                session_id=row.session_id,
+                received_at_ms=row.received_at_ms,
+                event_key=row.event_key,
+            ))
+        return events
+
+    async def exchange_event_stats(self) -> dict[str, int]:
+        async with self._sessionmaker() as session:
+            row = (await session.execute(text(
+                "SELECT COALESCE(MAX(received_at_ms), 0), "
+                "SUM(CASE WHEN status='received' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) "
+                "FROM exchange_events"
+            ))).first()
+        return {
+            "last_event_at_ms": int(row[0] or 0),
+            "pending_events": int(row[1] or 0),
+            "failed_events": int(row[2] or 0),
+        }
+
+    async def prune_exchange_events(self, retention_days: int) -> int:
+        cutoff = int((_t.time() - max(1, retention_days) * 86400) * 1000)
+        async with self._sessionmaker() as session:
+            result = await session.execute(delete(ExchangeEventRow).where(
+                ExchangeEventRow.status == "applied",
+                ExchangeEventRow.received_at_ms < cutoff,
+            ))
+            await session.commit()
+            return int(result.rowcount or 0)
+
+    async def record_state_drift(
+        self,
+        *,
+        entity_type: str,
+        entity_key: str,
+        reason: str,
+        projection: Any,
+        rest: Any,
+        resolved: bool = True,
+    ) -> None:
+        await self._add(ExchangeStateDriftRow(
+            entity_type=entity_type,
+            entity_key=entity_key,
+            reason=reason[:500],
+            projection_json=json.dumps(projection, default=str)[:50000],
+            rest_json=json.dumps(rest, default=str)[:50000],
+            resolved=resolved,
+        ))
+
+    async def recent_drift_count(self, since_ms: int) -> int:
+        async with self._sessionmaker() as session:
+            return int((await session.execute(
+                select(text("COUNT(*)")).select_from(ExchangeStateDriftRow).where(
+                    ExchangeStateDriftRow.ts_ms >= since_ms
+                )
+            )).scalar_one() or 0)
+
+    async def mark_exchange_event_applied(self, event_key: str) -> None:
+        async with self._sessionmaker() as session:
+            row = (await session.execute(
+                select(ExchangeEventRow).where(ExchangeEventRow.event_key == event_key)
+            )).scalars().first()
+            if row:
+                row.status = "applied"
+                row.applied_at_ms = int(_t.time() * 1000)
+                await session.commit()
+
+    async def mark_exchange_event_failed(self, event_key: str, error: str) -> None:
+        async with self._sessionmaker() as session:
+            row = (await session.execute(
+                select(ExchangeEventRow).where(ExchangeEventRow.event_key == event_key)
+            )).scalars().first()
+            if row:
+                row.status = "failed"
+                row.error = error[:500]
+                await session.commit()
+
+    async def record_stream_health(self, health: dict[str, Any]) -> None:
+        session_id = str(health.get("session_id") or "current")
+        now = int(health.get("ts_ms") or _t.time() * 1000)
+        status = str(health.get("status") or "UNKNOWN")
+        async with self._sessionmaker() as session:
+            row = await session.get(ExchangeStreamSessionRow, session_id)
+            if row is None:
+                row = ExchangeStreamSessionRow(session_id=session_id)
+                session.add(row)
+            row.status = status
+            row.listen_key_hash = str(health.get("listen_key_hash") or row.listen_key_hash)
+            row.reason = str(health.get("reason") or "")[:500]
+            row.updated_at_ms = now
+            if health.get("connected_at_ms"):
+                row.connected_at_ms = int(health["connected_at_ms"])
+            if health.get("keepalive_at_ms"):
+                row.keepalive_at_ms = int(health["keepalive_at_ms"])
+            if health.get("last_resync_at_ms"):
+                row.last_resync_at_ms = int(health["last_resync_at_ms"])
+            if status == "DISCONNECTED":
+                row.disconnected_at_ms = now
+            await session.commit()
+        await self.set_runtime_settings({
+            "stream.status": status,
+            "stream.reason": str(health.get("reason") or ""),
+            "stream.session_id": session_id,
+            "stream.updated_at_ms": str(now),
+            "stream.last_resync_at_ms": str(health.get("last_resync_at_ms") or ""),
+        })
+
+    async def upsert_live_balance(self, balance: dict[str, Any], source: str) -> None:
+        asset = str(balance.get("asset") or "")
+        if not asset:
+            return
+        async with self._sessionmaker() as session:
+            row = await session.get(LiveBalanceRow, asset) or LiveBalanceRow(asset=asset)
+            session.add(row)
+            row.wallet_balance = float(balance.get("wallet_balance") or 0)
+            row.available_balance = float(balance.get("available_balance") or 0)
+            row.source = source
+            row.updated_at_ms = int(balance.get("ts_ms") or _t.time() * 1000)
+            row.raw_json = json.dumps(balance, default=str)[:8000]
+            await session.commit()
+
+    async def upsert_live_position(self, position: dict[str, Any], source: str) -> None:
+        pos = normalize_position(position)
+        if not pos["symbol"]:
+            return
+        async with self._sessionmaker() as session:
+            row = await session.get(LivePositionRow, pos["symbol"]) or LivePositionRow(
+                symbol=pos["symbol"]
+            )
+            session.add(row)
+            for key in ("side", "contracts", "entry_price", "mark_price", "leverage",
+                        "unrealized_pnl", "notional"):
+                setattr(row, key, pos[key])
+            row.source = source
+            row.updated_at_ms = int(pos.get("ts_ms") or _t.time() * 1000)
+            row.raw_json = json.dumps(position, default=str)[:8000]
+            await session.commit()
+
+    async def delete_live_position(self, symbol: str) -> None:
+        async with self._sessionmaker() as session:
+            await session.execute(delete(LivePositionRow).where(LivePositionRow.symbol == symbol))
+            await session.commit()
+
+    async def upsert_live_order(
+        self, order: dict[str, Any], order_class: str, source: str
+    ) -> None:
+        exchange_id = str(order.get("id") or "")
+        if not exchange_id:
+            return
+        async with self._sessionmaker() as session:
+            row = (await session.execute(select(LiveOrderRow).where(
+                LiveOrderRow.order_class == order_class,
+                LiveOrderRow.exchange_order_id == exchange_id,
+            ))).scalars().first()
+            if row is None:
+                row = LiveOrderRow(order_class=order_class, exchange_order_id=exchange_id)
+                session.add(row)
+            row.client_order_id = str(
+                order.get("client_order_id") or order.get("client_algo_id") or ""
+            )
+            row.symbol = str(order.get("symbol") or "")
+            row.kind = str(order.get("kind") or "")
+            row.side = str(order.get("side") or "")
+            row.order_type = str(order.get("order_type") or "")
+            row.qty = float(order.get("qty") or 0)
+            row.filled_qty = float(order.get("filled_qty") or 0)
+            row.price = float(order.get("price") or order.get("avg_price") or 0)
+            row.trigger_price = float(order.get("trigger_price") or 0)
+            row.status = str(order.get("status") or "")
+            row.reduce_only = bool(order.get("reduce_only"))
+            row.source = source
+            row.updated_at_ms = int(order.get("ts_ms") or _t.time() * 1000)
+            row.raw_json = json.dumps(order, default=str)[:8000]
+            await session.commit()
+
+    async def replace_live_account(
+        self,
+        *,
+        positions: list[dict[str, Any]],
+        orders: list[dict[str, Any]],
+        balances: list[dict[str, Any]],
+        source: str,
+        ts_ms: int,
+    ) -> None:
+        async with self._sessionmaker() as session:
+            await session.execute(delete(LivePositionRow))
+            await session.execute(delete(LiveOrderRow))
+            await session.commit()
+        for position in positions:
+            await self.upsert_live_position(position, source)
+        for order in orders:
+            order_class = "algo" if order.get("kind") in ("SL", "TP") else "regular"
+            await self.upsert_live_order(order, order_class, source)
+        for balance in balances:
+            await self.upsert_live_balance({**balance, "ts_ms": ts_ms}, source)
+
+    async def live_account_state(self) -> dict[str, Any]:
+        async with self._sessionmaker() as session:
+            positions = (await session.execute(select(LivePositionRow))).scalars().all()
+            orders = (await session.execute(select(LiveOrderRow))).scalars().all()
+            balances = (await session.execute(select(LiveBalanceRow))).scalars().all()
+        return {
+            "positions": [
+                {c.name: getattr(row, c.name) for c in LivePositionRow.__table__.columns
+                 if c.name != "raw_json"} for row in positions
+            ],
+            "open_orders": [
+                {c.name: getattr(row, c.name) for c in LiveOrderRow.__table__.columns
+                 if c.name not in ("raw_json", "id")}
+                for row in orders if row.status in ("placed", "new", "open", "working", "partial")
+            ],
+            "balances": [
+                {c.name: getattr(row, c.name) for c in LiveBalanceRow.__table__.columns
+                 if c.name != "raw_json"} for row in balances
+            ],
+        }
 
     # ---------- 币种注册表 ----------
     @staticmethod

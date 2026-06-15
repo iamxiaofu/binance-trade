@@ -2,7 +2,8 @@
 
 LLM 驱动的币安 USDT 本位永续合约交易机器人。Claude 出结构化决策，**硬风控**夹断，
 按周期节流调用。安全优先：杠杆超限直接拒单（不截断）、多道名义价值闸、
-日亏熔断、kill-switch。
+日亏熔断、kill-switch。账户状态由 Binance 原生私有流实时驱动，REST 用于启动、
+断线恢复和周期差异审计；testnet 与 mainnet 独立运行。
 
 > ⚠️ 量化交易有资金损失风险。本项目默认 `mode: testnet`，会向 Binance testnet 下单。
 > 切换到 mainnet 真实下单前，请充分回测并自行承担风险。
@@ -43,8 +44,8 @@ pip install -r requirements.txt
    ```
 2. `.env` 填入密钥（**绝不提交到 git**，已在 .gitignore）：
    - `BINANCE_API_KEY` / `BINANCE_API_SECRET`
-   - `ANTHROPIC_API_KEY`
    - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`（启用告警时）
+   - LLM API Key 通过 Web 看板的 LLM Profile 页面按环境添加和动态切换
 3. `config.yaml` 关键开关：
    - `mode`: `testnet`（默认）/ `mainnet`
    - `storage.db_path_template`: 默认 `./data/trade-{mode}.db`，按 testnet/mainnet 隔离 SQLite
@@ -69,18 +70,21 @@ python main.py backtest --symbol BTCUSDT --csv data/btc_5m.csv --leverage 10
 # CSV 格式：ts,open,high,low,close,volume（首行表头可选）
 ```
 
-## 部署（systemd）
+## 部署（双环境 systemd）
 
 ```bash
-sudo cp deploy/binance-trade.service /etc/systemd/system/
-# 按实际路径修改 WorkingDirectory / ExecStart / User
-sudo mkdir -p /var/log/binance-trade && sudo chown trader:trader /var/log/binance-trade
+sudo cp deploy/binance-trade@.service deploy/binance-trade-web@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now binance-trade
-sudo journalctl -u binance-trade -f      # 或看 /var/log/binance-trade/*.log
+sudo systemctl enable --now binance-trade@testnet binance-trade-web@testnet
+sudo systemctl enable --now binance-trade@mainnet binance-trade-web@mainnet
+sudo journalctl -u binance-trade@testnet -f
 ```
 
-收到 `SIGTERM`（`systemctl stop`）时 main.py 捕获信号，先撤单+平仓再退出。
+正式部署中，`/data0/binance-trade` 是唯一源码仓库，`/opt/binance-trade` 是 root
+管理的发布副本。两套实例均由 `trader` 运行，配置在 `/etc/binance-trade`，数据库在
+`/var/lib/binance-trade/{testnet,mainnet}`，日志在 `/var/log/binance-trade/{testnet,mainnet}`。
+
+收到 `SIGTERM` 时仅停止引擎，已有仓位和保护单保持不动；撤单+平仓必须显式执行 kill-switch。
 
 完整步骤（NTP、防火墙、testnet→mainnet 切换）见 **[docs/DEPLOY.md](docs/DEPLOY.md)**；
 日常运维（启停、紧急熔断、看日志、复盘决策、故障排查）见 **[docs/RUNBOOK.md](docs/RUNBOOK.md)**。
@@ -97,7 +101,8 @@ sudo journalctl -u binance-trade -f      # 或看 /var/log/binance-trade/*.log
 
 ## 安全说明
 
-- 密钥只从 `.env` 读取，`Credentials.__repr__` 脱敏，绝不写日志、绝不落库。
+- Binance 密钥只从环境文件读取，`Credentials.__repr__` 脱敏，绝不写日志、绝不落库。
+- LLM Profile 密钥按环境存入权限为 `0600` 的 SQLite，仅通过看板动态管理。
 - `on_leverage_exceed` 用 enum 锁死为 `REJECT`：超限拒单而非静默截断到上限。
 - testnet 和 mainnet 使用独立 SQLite 文件，避免沙盒数据与主网实盘数据混在一起。
 - 风控为硬约束，位于 LLM 之后、执行之前；LLM 任何失败都降级为 HOLD。

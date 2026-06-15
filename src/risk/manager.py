@@ -30,6 +30,7 @@ class RejectCode(str, Enum):
     LIQ_DISTANCE = "LIQ_DISTANCE"              # 强平价距离过近
     INVALID_SIZE = "INVALID_SIZE"              # size_pct<=0 等
     STALE_CONDITION_ORDER = "STALE_CONDITION_ORDER"  # 交易所残留陈旧条件单
+    STALE_MARKET_DATA = "STALE_MARKET_DATA"
 
 
 @dataclass(frozen=True)
@@ -164,19 +165,19 @@ def validate(
             f"> max {max_total_margin:.2f}",
         )
 
-    # ---- 5. 止损触发理论亏损上限 ----
+    # ---- 5. 止损触发理论亏损上限（按本订单保证金）----
     if decision.stop_loss_pct <= 0:
         return Verdict.reject(
             RejectCode.TRADE_LOSS,
             "stop_loss_pct <= 0, cannot bound trade loss",
         )
     estimated_loss = notional * decision.stop_loss_pct
-    max_loss = base * (risk.max_loss_per_trade_pct / 100.0)
+    max_loss = margin_to_use * (risk.max_loss_per_order_margin_pct / 100.0)
     if estimated_loss > max_loss:
         return Verdict.reject(
             RejectCode.TRADE_LOSS,
             f"estimated stop loss {estimated_loss:.2f} > max {max_loss:.2f} "
-            f"({risk.max_loss_per_trade_pct}% of {base:.2f})",
+            f"({risk.max_loss_per_order_margin_pct}% of order margin {margin_to_use:.2f})",
         )
 
     # ---- 6. 强平价距离 ----
