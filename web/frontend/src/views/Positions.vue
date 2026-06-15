@@ -689,4 +689,20 @@ async function cancelConditionOrder(order) {
   color: var(--el-text-color-secondary);
   margin-bottom: 8px;
 }
+
+@media (max-width: 767px) {
+  .positions-header,
+  .positions-meta {
+    align-items: flex-start;
+  }
+
+  .positions-meta,
+  .action-buttons {
+    flex-wrap: wrap;
+  }
+
+  .protect-input {
+    width: 100%;
+  }
+}
 </style>

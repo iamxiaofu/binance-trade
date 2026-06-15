@@ -683,4 +683,11 @@ watch(
   align-items: center;
   margin-bottom: 12px;
 }
+
+@media (max-width: 767px) {
+  .symbol-add {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
 </style>

@@ -336,4 +336,14 @@ onUnmounted(() => {
   line-height: 1;
   transition: color 0.2s ease;
 }
+
+@media (max-width: 767px) {
+  .chart-toolbar {
+    align-items: stretch;
+  }
+
+  .chart-toolbar > * {
+    max-width: 100%;
+  }
+}
 </style>

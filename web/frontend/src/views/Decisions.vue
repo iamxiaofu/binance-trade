@@ -634,4 +634,22 @@ onUnmounted(() => {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+@media (max-width: 767px) {
+  .filter-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .filter-bar > * {
+    width: 100% !important;
+    max-width: 100%;
+  }
+
+  .dialog-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding-right: 22px;
+  }
+}
 </style>

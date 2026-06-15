@@ -361,4 +361,12 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
 .test-ok { color: #67c23a; font-size: 12px; margin-left: 8px; }
 .test-fail { color: #f56c6c; font-size: 12px; margin-left: 8px; }
 code { background: rgba(127,127,127,0.1); padding: 0 4px; border-radius: 3px; }
+
+@media (max-width: 767px) {
+  .table-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
 </style>

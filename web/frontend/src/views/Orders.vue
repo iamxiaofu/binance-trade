@@ -492,3 +492,17 @@ onUnmounted(() => {
     </el-card>
   </div>
 </template>
+
+<style scoped>
+@media (max-width: 767px) {
+  .page :deep(.el-card__header > div),
+  .page :deep(.el-card__body > div) {
+    max-width: 100%;
+  }
+
+  .page :deep(.el-card__body > div[style*="display:flex"]) {
+    align-items: stretch !important;
+    flex-direction: column;
+  }
+}
+</style>

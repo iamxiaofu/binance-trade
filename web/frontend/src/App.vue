@@ -98,9 +98,9 @@ onUnmounted(() => {
 
     <el-container>
       <el-header class="app-header">
-        <span style="font-size:18px; font-weight:600">{{ route.meta.title || '' }}</span>
+        <span class="page-title">{{ route.meta.title || '' }}</span>
         <div class="header-actions">
-          <el-select v-model="environment" size="small" style="width:120px" @change="switchEnvironment">
+          <el-select v-model="environment" size="small" class="environment-select" @change="switchEnvironment">
             <el-option label="TESTNET" value="testnet" />
             <el-option label="MAINNET" value="mainnet" />
           </el-select>
@@ -116,7 +116,7 @@ onUnmounted(() => {
           <el-tag :type="live.connected ? 'success' : 'danger'" size="small" effect="dark">
             {{ live.connected ? (live.transport === 'ws' ? '实时(WS)' : '实时(轮询)') : '已断开' }}
           </el-tag>
-          <span style="margin-left:12px">更新于 {{ lastUpdateText }}</span>
+          <span class="last-update">更新于 {{ lastUpdateText }}</span>
         </div>
       </el-header>
 
@@ -124,5 +124,19 @@ onUnmounted(() => {
         <router-view :key="environment" />
       </el-main>
     </el-container>
+
+    <nav class="mobile-nav" aria-label="移动端主导航">
+      <button
+        v-for="m in menu"
+        :key="m.index"
+        type="button"
+        class="mobile-nav-item"
+        :class="{ active: activePath === m.index }"
+        @click="onMenuSelect(m.index)"
+      >
+        <el-icon><component :is="m.icon" /></el-icon>
+        <span>{{ m.title }}</span>
+      </button>
+    </nav>
   </el-container>
 </template>

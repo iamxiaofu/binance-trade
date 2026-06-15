@@ -33,8 +33,10 @@ html.dark {
 
 body {
   margin: 0;
+  min-width: 320px;
   background: var(--bt-bg);
   color: var(--bt-text);
+  -webkit-text-size-adjust: 100%;
 }
 
 #app {
@@ -43,6 +45,7 @@ body {
 
 .app-shell {
   height: 100vh;
+  height: 100dvh;
 }
 
 .mainnet-shell .app-header {
@@ -79,6 +82,12 @@ body {
   color: var(--bt-text);
 }
 
+.page-title {
+  flex: 0 0 auto;
+  font-size: 18px;
+  font-weight: 600;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
@@ -87,9 +96,21 @@ body {
   color: var(--bt-muted);
 }
 
+.environment-select {
+  width: 120px;
+}
+
+.last-update {
+  margin-left: 12px;
+}
+
 .app-main {
   background: var(--bt-bg);
+  min-width: 0;
+  overflow-x: hidden;
 }
+
+.mobile-nav { display: none; }
 
 .mono { font-family: var(--mono); }
 
@@ -126,6 +147,14 @@ body {
   justify-content: space-between;
 }
 
+.el-table {
+  max-width: 100%;
+}
+
+.el-dialog__body {
+  overflow-wrap: anywhere;
+}
+
 html.dark .el-card,
 html.dark .el-table,
 html.dark .el-descriptions,
@@ -138,4 +167,289 @@ html.dark .el-card {
   background: var(--bt-card);
   border-color: var(--bt-border);
   color: var(--bt-text);
+}
+
+@media (max-width: 767px) {
+  :root {
+    --mobile-nav-height: 64px;
+  }
+
+  body {
+    overscroll-behavior-y: none;
+  }
+
+  .app-shell {
+    min-height: 100vh;
+    min-height: 100dvh;
+    height: auto;
+    padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom));
+  }
+
+  .app-sidebar {
+    display: none;
+  }
+
+  .app-shell > .el-container {
+    min-width: 0;
+  }
+
+  .app-header {
+    height: auto;
+    min-height: 92px;
+    padding: calc(8px + env(safe-area-inset-top)) 10px 8px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .mainnet-shell .app-header {
+    border-top-width: 3px;
+  }
+
+  .page-title {
+    font-size: 16px;
+    line-height: 1.2;
+  }
+
+  .header-actions {
+    width: 100%;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .environment-select {
+    width: 108px;
+  }
+
+  .last-update {
+    display: none;
+  }
+
+  .app-main {
+    padding: 0;
+    overflow: visible;
+  }
+
+  .page {
+    padding: 10px;
+  }
+
+  .page h2 {
+    font-size: 18px;
+  }
+
+  .mobile-nav {
+    position: fixed;
+    z-index: 1500;
+    display: flex;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom));
+    padding: 5px 4px env(safe-area-inset-bottom);
+    overflow-x: auto;
+    overflow-y: hidden;
+    background: var(--bt-header);
+    background: color-mix(in srgb, var(--bt-header) 94%, transparent);
+    border-top: 1px solid var(--bt-border);
+    box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.08);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .mobile-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .mobile-nav-item {
+    appearance: none;
+    flex: 0 0 70px;
+    min-width: 70px;
+    border: 0;
+    border-radius: 8px;
+    padding: 5px 3px;
+    background: transparent;
+    color: var(--bt-muted);
+    font: inherit;
+    font-size: 11px;
+    line-height: 1.2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    touch-action: manipulation;
+  }
+
+  .mobile-nav-item .el-icon {
+    font-size: 20px;
+  }
+
+  .mobile-nav-item.active {
+    color: var(--bt-primary);
+    background: color-mix(in srgb, var(--bt-primary) 12%, transparent);
+  }
+
+  .el-row {
+    row-gap: 10px;
+  }
+
+  .el-col-6,
+  .el-col-8,
+  .el-col-12,
+  .el-col-16 {
+    flex: 0 0 100%;
+    max-width: 100%;
+  }
+
+  .metric-card {
+    padding: 10px 12px;
+  }
+
+  .metric-card .value {
+    font-size: 22px;
+  }
+
+  .card-header-row,
+  .toolbar-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .card-header-row {
+    gap: 8px;
+  }
+
+  .el-card__header,
+  .el-card__body {
+    padding: 12px;
+  }
+
+  .page .el-card__header > div {
+    max-width: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .page .el-select,
+  .page .el-date-editor,
+  .page .el-input-number {
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .page .el-table[style*="height"] {
+    height: min(58dvh, 560px) !important;
+  }
+
+  .page .el-table__body-wrapper,
+  .page .el-scrollbar__wrap {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .el-radio-group {
+    max-width: 100%;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .el-radio-button {
+    flex: 0 0 auto;
+  }
+
+  .el-pagination {
+    max-width: 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .el-dialog {
+    width: calc(100vw - 20px) !important;
+    max-width: none;
+    margin: max(10px, env(safe-area-inset-top)) auto !important;
+    max-height: calc(100dvh - 20px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    display: flex;
+    flex-direction: column;
+  }
+
+  .el-dialog__body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .el-dialog__header,
+  .el-dialog__footer {
+    flex: 0 0 auto;
+    padding: 12px;
+  }
+
+  .el-form-item {
+    display: block;
+  }
+
+  .el-form-item__label {
+    width: auto !important;
+    height: auto;
+    line-height: 1.4;
+    margin-bottom: 5px;
+    justify-content: flex-start;
+  }
+
+  .el-form-item__content {
+    margin-left: 0 !important;
+    min-width: 0;
+  }
+
+  .el-form-item__content > .el-input,
+  .el-form-item__content > .el-select,
+  .el-form-item__content > .el-input-number {
+    width: 100%;
+  }
+
+  .el-input__inner,
+  .el-select__wrapper,
+  .el-textarea__inner {
+    font-size: 16px;
+  }
+
+  .el-message-box {
+    width: calc(100vw - 24px);
+    max-width: 420px;
+  }
+
+  .el-date-editor--datetimerange.el-input__wrapper,
+  .el-date-editor--daterange.el-input__wrapper {
+    width: 100% !important;
+    max-width: 100%;
+  }
+
+  .el-descriptions__label,
+  .el-descriptions__content {
+    overflow-wrap: anywhere;
+  }
+
+  .el-descriptions {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .el-tabs__nav-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .el-tabs__nav-scroll {
+    overflow: visible;
+  }
+
+  .page .el-button + .el-button {
+    margin-left: 0;
+  }
 }
