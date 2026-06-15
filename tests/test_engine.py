@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from decimal import Decimal
@@ -627,6 +628,90 @@ async def test_mainnet_runtime_settings_force_restart_pause(settings, creds, mon
     assert eng.runtime.halt_new_entries is True
     assert eng._store.runtime_settings["strategy.paused"] == "true"
     assert eng._store.runtime_settings["strategy.pause.reason_code"] == "MAINNET_RESTART_GUARD"
+
+
+async def test_account_config_leverage_within_limit_does_not_pause(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    reconciles = []
+
+    async def reconcile(reason):
+        reconciles.append(reason)
+
+    monkeypatch.setattr(eng, "_reconcile_exchange_state", reconcile)
+    event = SimpleNamespace(payload={
+        "e": "ACCOUNT_CONFIG_UPDATE",
+        "ac": {"s": "BTCUSDT", "l": settings.risk.max_leverage},
+    })
+
+    await eng._handle_account_config_update(event)
+    await asyncio.sleep(0)
+
+    assert eng.runtime.halt_new_entries is False
+    assert eng._store.symbols["BTCUSDT"]["enabled"] is True
+    assert reconciles == ["account_config_update_leverage"]
+
+
+async def test_account_config_leverage_above_limit_pauses_and_disables_symbol(
+    settings, creds, monkeypatch
+):
+    eng = _engine(settings, creds, monkeypatch)
+
+    async def reconcile(_reason):
+        return None
+
+    monkeypatch.setattr(eng, "_reconcile_exchange_state", reconcile)
+    leverage = settings.risk.max_leverage + 1
+    event = SimpleNamespace(payload={
+        "e": "ACCOUNT_CONFIG_UPDATE",
+        "ac": {"s": "BTCUSDT", "l": leverage},
+    })
+
+    await eng._handle_account_config_update(event)
+    await asyncio.sleep(0)
+
+    assert eng.runtime.halt_new_entries is True
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == (
+        "ACCOUNT_CONFIG_LEVERAGE_EXCEEDED"
+    )
+    assert eng._store.symbols["BTCUSDT"]["enabled"] is False
+    assert eng._store.symbols["BTCUSDT"]["disabled_reason_code"] == (
+        "ACCOUNT_CONFIG_LEVERAGE_EXCEEDED"
+    )
+
+
+async def test_account_config_multi_assets_mode_classification(settings, creds, monkeypatch):
+    safe = _engine(settings, creds, monkeypatch)
+    unsafe = _engine(settings, creds, monkeypatch)
+
+    async def reconcile(_reason):
+        return None
+
+    monkeypatch.setattr(safe, "_reconcile_exchange_state", reconcile)
+    monkeypatch.setattr(unsafe, "_reconcile_exchange_state", reconcile)
+
+    await safe._handle_account_config_update(SimpleNamespace(payload={"ai": {"j": False}}))
+    await unsafe._handle_account_config_update(SimpleNamespace(payload={"ai": {"j": True}}))
+    await asyncio.sleep(0)
+
+    assert safe.runtime.halt_new_entries is False
+    assert unsafe.runtime.halt_new_entries is True
+    assert unsafe._store.runtime_settings["strategy.pause.reason_code"] == (
+        "ACCOUNT_CONFIG_MULTI_ASSETS_ENABLED"
+    )
+
+
+async def test_unknown_account_config_update_fails_closed(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+
+    async def reconcile(_reason):
+        return None
+
+    monkeypatch.setattr(eng, "_reconcile_exchange_state", reconcile)
+    await eng._handle_account_config_update(SimpleNamespace(payload={"unexpected": True}))
+    await asyncio.sleep(0)
+
+    assert eng.runtime.halt_new_entries is True
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == "ACCOUNT_CONFIG_UPDATE_UNKNOWN"
 
 
 async def test_missing_llm_profile_halts_entries_without_env_bootstrap(

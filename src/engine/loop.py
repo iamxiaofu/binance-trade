@@ -289,24 +289,25 @@ class TradingEngine:
                 source="binance:user-stream",
             )
             await self._notifier.send(Event.ERROR, self.runtime.halt_new_entries_reason)
-        elif event.event_type in ("CONDITIONAL_ORDER_TRIGGER_REJECT", "ACCOUNT_CONFIG_UPDATE"):
+        elif event.event_type == "ACCOUNT_CONFIG_UPDATE":
+            await self._handle_account_config_update(event)
+        elif event.event_type == "CONDITIONAL_ORDER_TRIGGER_REJECT":
             self.runtime.halt_entries(f"Binance private event requires review: {event.event_type}")
             await self._persist_strategy_pause_reason(
                 reason_code=event.event_type,
                 reason=self.runtime.halt_new_entries_reason,
                 source="binance:user-stream",
             )
-            if event.event_type == "CONDITIONAL_ORDER_TRIGGER_REJECT":
-                details = event.payload.get("or") or event.payload.get("o") or {}
-                symbol = normalize_symbol(details.get("s") or details.get("symbol"))
-                if symbol:
-                    await self._set_symbol_disabled(
-                        symbol,
-                        reason_code="CONDITIONAL_ORDER_TRIGGER_REJECT",
-                        reason="Binance rejected a conditional protection trigger",
-                        source="binance:user-stream",
-                        action="repair_or_emergency_close",
-                    )
+            details = event.payload.get("or") or event.payload.get("o") or {}
+            symbol = normalize_symbol(details.get("s") or details.get("symbol"))
+            if symbol:
+                await self._set_symbol_disabled(
+                    symbol,
+                    reason_code="CONDITIONAL_ORDER_TRIGGER_REJECT",
+                    reason="Binance rejected a conditional protection trigger",
+                    source="binance:user-stream",
+                    action="repair_or_emergency_close",
+                )
             asyncio.create_task(
                 self._reconcile_exchange_state(event.event_type.lower()),
                 name=f"private-event-reconcile-{event.event_type.lower()}",
@@ -317,6 +318,69 @@ class TradingEngine:
                     self._enforce_exchange_invariants("private_event"),
                     name="private-event-invariant-check",
                 )
+
+    async def _handle_account_config_update(self, event) -> None:
+        """Classify Binance account-config events instead of pausing on expected leverage updates."""
+        account_config = event.payload.get("ac")
+        if isinstance(account_config, dict):
+            symbol = normalize_symbol(account_config.get("s") or account_config.get("symbol"))
+            try:
+                leverage = int(account_config.get("l") or account_config.get("leverage"))
+            except (TypeError, ValueError):
+                leverage = 0
+            if symbol and 0 < leverage <= self._settings.risk.max_leverage:
+                logger.info(
+                    "Binance leverage configuration updated: {}={}x (within max {}x)",
+                    symbol, leverage, self._settings.risk.max_leverage,
+                )
+                self._schedule_private_event_reconcile("account_config_update_leverage")
+                return
+            if symbol and leverage > self._settings.risk.max_leverage:
+                reason = (
+                    f"Binance leverage configuration exceeds hard limit: "
+                    f"{symbol}={leverage}x > {self._settings.risk.max_leverage}x"
+                )
+                await self._set_symbol_disabled(
+                    symbol,
+                    reason_code="ACCOUNT_CONFIG_LEVERAGE_EXCEEDED",
+                    reason=reason,
+                    source="binance:user-stream",
+                    action="manual_review",
+                )
+                await self._pause_for_private_event("ACCOUNT_CONFIG_LEVERAGE_EXCEEDED", reason)
+                self._schedule_private_event_reconcile("account_config_update_leverage_exceeded")
+                return
+
+        account_info = event.payload.get("ai")
+        if isinstance(account_info, dict) and isinstance(account_info.get("j"), bool):
+            multi_assets_enabled = account_info["j"]
+            if not multi_assets_enabled:
+                logger.info("Binance multi-assets margin mode confirmed disabled")
+                self._schedule_private_event_reconcile("account_config_update_multi_assets_disabled")
+                return
+            reason = "Binance multi-assets margin mode enabled; mode is unsupported"
+            await self._pause_for_private_event("ACCOUNT_CONFIG_MULTI_ASSETS_ENABLED", reason)
+            self._schedule_private_event_reconcile("account_config_update_multi_assets_enabled")
+            return
+
+        reason = "Binance private event requires review: ACCOUNT_CONFIG_UPDATE"
+        await self._pause_for_private_event("ACCOUNT_CONFIG_UPDATE_UNKNOWN", reason)
+        self._schedule_private_event_reconcile("account_config_update_unknown")
+
+    async def _pause_for_private_event(self, reason_code: str, reason: str) -> None:
+        self.runtime.halt_entries(reason)
+        await self._persist_strategy_pause_reason(
+            reason_code=reason_code,
+            reason=reason,
+            source="binance:user-stream",
+        )
+        await self._notifier.send(Event.ERROR, reason)
+
+    def _schedule_private_event_reconcile(self, reason: str) -> None:
+        asyncio.create_task(
+            self._reconcile_exchange_state(reason),
+            name=f"private-event-reconcile-{reason}",
+        )
 
     async def _replay_private_event_buffer(self) -> None:
         while self._private_event_buffer:
