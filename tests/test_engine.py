@@ -1392,6 +1392,21 @@ async def test_external_close_detected_in_snapshot(settings, creds, monkeypatch)
 
 async def test_private_condition_order_update_marks_exact_exit(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
+    async def noop_sleep(_seconds):
+        return None
+    monkeypatch.setattr(engine_loop.asyncio, "sleep", noop_sleep)
+    eng._client.condition_orders = [{
+        "id": "2000001132311412",
+        "symbol": "BTCUSDT",
+        "type": "TAKE_PROFIT_MARKET",
+        "side": "sell",
+        "amount": 0.001,
+        "triggerPrice": 67761.4,
+        "status": "open",
+        "reduceOnly": True,
+        "clientAlgoId": "bt-tp",
+        "timestamp": 1_781_594_103_000,
+    }]
     event = SimpleNamespace(
         event_time_ms=1_781_594_103_000,
         transaction_time_ms=1_781_594_103_083,
@@ -1422,6 +1437,8 @@ async def test_private_condition_order_update_marks_exact_exit(settings, creds, 
         "fee": 0.03313915,
         "fee_asset": "USDT",
     }]
+    assert eng._client.canceled_condition_symbols == ["BTCUSDT"]
+    assert eng._store.marked_status_calls == [(["2000001132311412"], "canceled")]
 
 
 async def test_external_close_ignores_still_open(settings, creds, monkeypatch):

@@ -359,6 +359,12 @@ class TradingEngine:
             fee=self._safe_float(order.get("n")),
             fee_asset=str(order.get("N") or ""),
         )
+        remaining = await self._cancel_symbol_condition_orders(
+            symbol, reason="condition_exit_private_event"
+        )
+        if remaining:
+            details = ", ".join(self._condition_order_label(item) for item in remaining)
+            await self._disable_symbol_due_stale_conditions(symbol, details)
 
     async def _handle_account_config_update(self, event) -> None:
         """Classify Binance account-config events instead of pausing on expected leverage updates."""
