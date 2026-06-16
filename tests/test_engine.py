@@ -1072,6 +1072,29 @@ async def test_reconcile_waits_for_active_opening_claim(settings, creds, monkeyp
     assert not any("no local open trade" in msg for _event, msg in eng._notifier.events)
 
 
+async def test_reconcile_waits_for_active_protecting_claim_even_with_open_trade(
+    settings, creds, monkeypatch
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._symbol_enabled["BTCUSDT"] = True
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.1
+    eng._store.active_claims.add("BTCUSDT")
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 0.1,
+        "entryPrice": 100.0,
+        "markPrice": 101.0,
+    }]
+
+    await eng._enforce_exchange_invariants("private_event")
+
+    assert eng._symbol_enabled["BTCUSDT"] is True
+    assert eng._store.orders == []
+    assert eng._client.canceled_condition_symbols == []
+
+
 async def test_reconcile_disables_managed_position_missing_stop_without_auto_close(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng._store.open_trades.add("BTCUSDT")
@@ -1439,6 +1462,58 @@ async def test_private_condition_order_update_marks_exact_exit(settings, creds, 
     }]
     assert eng._client.canceled_condition_symbols == ["BTCUSDT"]
     assert eng._store.marked_status_calls == [(["2000001132311412"], "canceled")]
+
+
+def test_repair_trigger_ignores_older_opposite_side_template(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    trigger, source = eng._desired_protection_trigger(
+        symbol="ETHUSDT",
+        side="long",
+        entry=1768.81,
+        kind="SL",
+        template={
+            "kind": "SL",
+            "side": "buy",
+            "price": 1795.0,
+            "ts_ms": 1_781_562_581_145,
+        },
+        latest_decision={
+            "id": 1056,
+            "action": "OPEN_LONG",
+            "stop_loss_pct": 0.007,
+            "take_profit_pct": 0.01,
+            "ts_ms": 1_781_578_764_232,
+        },
+    )
+
+    assert trigger == pytest.approx(1756.42833)
+    assert source == "最近开仓决策"
+
+
+def test_repair_trigger_keeps_newer_same_side_template(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    trigger, source = eng._desired_protection_trigger(
+        symbol="ETHUSDT",
+        side="long",
+        entry=1768.81,
+        kind="SL",
+        template={
+            "kind": "SL",
+            "side": "sell",
+            "price": 1756.43,
+            "ts_ms": 1_781_578_777_191,
+        },
+        latest_decision={
+            "id": 1056,
+            "action": "OPEN_LONG",
+            "stop_loss_pct": 0.007,
+            "take_profit_pct": 0.01,
+            "ts_ms": 1_781_578_764_232,
+        },
+    )
+
+    assert trigger == pytest.approx(1756.43)
+    assert source == "历史条件单"
 
 
 async def test_external_close_ignores_still_open(settings, creds, monkeypatch):

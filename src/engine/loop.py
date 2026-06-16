@@ -2282,26 +2282,42 @@ class TradingEngine:
         template: dict | None,
         latest_decision: dict | None,
     ) -> tuple[float, str]:
-        if template and float(template.get("price") or 0.0) > 0:
-            return float(template["price"]), "历史条件单"
-
         action = (latest_decision or {}).get("action", "")
         expected_action = "OPEN_LONG" if side == "long" else "OPEN_SHORT"
-        if action != expected_action:
-            return 0.0, ""
-        pct_key = "stop_loss_pct" if kind == "SL" else "take_profit_pct"
-        pct = float((latest_decision or {}).get(pct_key) or 0.0)
-        if pct <= 0:
-            return 0.0, ""
-        if kind == "SL":
-            trigger = entry * (1 - pct) if side == "long" else entry * (1 + pct)
-        else:
-            trigger = entry * (1 + pct) if side == "long" else entry * (1 - pct)
-        logger.info(
-            "repair {} {} trigger reconstructed from decision {} pct={}",
-            symbol, kind, (latest_decision or {}).get("id"), pct,
-        )
-        return trigger, "最近开仓决策"
+        decision_ts = int((latest_decision or {}).get("ts_ms") or 0)
+        decision_trigger = 0.0
+        if action == expected_action:
+            pct_key = "stop_loss_pct" if kind == "SL" else "take_profit_pct"
+            pct = float((latest_decision or {}).get(pct_key) or 0.0)
+            if pct > 0:
+                if kind == "SL":
+                    decision_trigger = entry * (1 - pct) if side == "long" else entry * (1 + pct)
+                else:
+                    decision_trigger = entry * (1 + pct) if side == "long" else entry * (1 - pct)
+
+        close_side = "sell" if side == "long" else "buy"
+        template_trigger = 0.0
+        template_ts = 0
+        template_side = str((template or {}).get("side") or "").lower()
+        if (
+            template
+            and template_side in ("", close_side)
+            and float(template.get("price") or 0.0) > 0
+        ):
+            template_trigger = float(template["price"])
+            template_ts = int(template.get("ts_ms") or 0)
+
+        if template_trigger > 0 and (decision_trigger <= 0 or template_ts >= decision_ts):
+            return template_trigger, "历史条件单"
+        if decision_trigger > 0:
+            logger.info(
+                "repair {} {} trigger reconstructed from decision {}",
+                symbol, kind, (latest_decision or {}).get("id"),
+            )
+            return decision_trigger, "最近开仓决策"
+        if template_trigger > 0:
+            return template_trigger, "历史条件单"
+        return 0.0, ""
 
     def _validate_repair_trigger(
         self,
@@ -3422,17 +3438,6 @@ class TradingEngine:
             )
             return False
         try:
-            managed = await self._store.has_open_trade(symbol)
-        except Exception as e:
-            logger.warning(
-                "{} live position detected during {}, but local trade ownership check failed: {}; "
-                "skip auto protection enforcement",
-                symbol, reason, e,
-            )
-            return False
-        if managed:
-            return True
-        try:
             claimed = await self._store.has_active_position_claim(symbol)
         except Exception as e:
             logger.warning(
@@ -3448,6 +3453,17 @@ class TradingEngine:
                 symbol, reason,
             )
             return False
+        try:
+            managed = await self._store.has_open_trade(symbol)
+        except Exception as e:
+            logger.warning(
+                "{} live position detected during {}, but local trade ownership check failed: {}; "
+                "skip auto protection enforcement",
+                symbol, reason, e,
+            )
+            return False
+        if managed:
+            return True
 
         # B4：尝试孤儿接管。返回 True 表示已接管成功（_enforce_exchange_invariants
         # 会继续做 SL/TP 修补）；返回 False 才走禁用。
