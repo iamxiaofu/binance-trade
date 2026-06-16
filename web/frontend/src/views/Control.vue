@@ -16,6 +16,12 @@ const riskState = ref(null)
 const riskForm = ref({})
 const riskPreview = ref(null)
 const riskLoading = ref(false)
+const engineState = ref(null)
+const engineForm = ref({})
+const enginePreview = ref(null)
+const engineLoading = ref(false)
+const isTouchDevice = ref(false)
+const tooltipTrigger = computed(() => (isTouchDevice.value ? 'click' : 'hover'))
 const riskFields = [
   { key: 'max_leverage', label: '最大杠杆', min: 1, max: 125, step: 1 },
   { key: 'max_order_margin_pct', label: '单笔保证金占权益上限 (%)', min: 0.01, max: 100, step: 1, scale: 100 },
@@ -27,8 +33,59 @@ const riskFields = [
   { key: 'max_drawdown_pct', label: '回撤熔断 (%)', min: 0.01, max: 100, step: 1 },
   { key: 'min_confidence', label: '最小置信度', min: 0, max: 1, step: 0.05 },
 ]
+const engineCadenceFields = [
+  { key: 'cycle_interval_seconds', label: '分析周期/主循环间隔（秒）', min: 60, max: 3600, step: 30 },
+  { key: 'review_flat_seconds', label: '空仓最长复查间隔（秒）', min: 30, max: 86400, step: 30 },
+  { key: 'review_position_seconds', label: '持仓最长复查间隔（秒）', min: 30, max: 86400, step: 30 },
+  { key: 'review_near_exit_seconds', label: '接近退出最长复查间隔（秒）', min: 30, max: 86400, step: 30 },
+  { key: 'review_high_vol_seconds', label: '高波动最长复查间隔（秒）', min: 30, max: 86400, step: 30 },
+  { key: 'max_skip_cycles', label: '最大连续跳过周期', min: 1, max: 100, step: 1 },
+]
+const engineTriggerFields = [
+  { key: 'price_change_pct', label: '价格变化触发 LLM (%)', min: 0, max: 20, step: 0.05 },
+  { key: 'pnl_alert_pct', label: '持仓浮盈亏触发 LLM (%)', min: 0, max: 100, step: 0.1 },
+  { key: 'near_exit_pnl_pct', label: '接近退出浮盈亏阈值 (%)', min: 0, max: 100, step: 0.1 },
+  { key: 'trigger_on_order_event', label: '订单事件立即触发 LLM', type: 'bool' },
+]
+const engineSnapshotFields = [
+  { key: 'feature_snapshot_enabled', label: '启用快照变化触发', type: 'bool' },
+  { key: 'ema_spread_cross_min_pct', label: 'EMA spread 穿越最小幅度 (%)', min: 0, max: 5, step: 0.01 },
+  { key: 'macd_hist_cross_min_abs', label: 'MACD histogram 穿越 deadzone', min: 0, max: 1000, step: 0.001 },
+  { key: 'rsi_midline', label: 'RSI 中线', min: 1, max: 99, step: 1 },
+  { key: 'boll_bandwidth_low_pct', label: 'Boll 低波动带宽 (%)', min: 0, max: 100, step: 0.1 },
+  { key: 'boll_bandwidth_expand_pct', label: 'Boll 带宽扩张触发 (%)', min: 0, max: 1000, step: 1 },
+  { key: 'volume_zscore_trigger', label: '成交量 z-score 触发', min: 0, max: 20, step: 0.1 },
+  { key: 'micro_return_5m_trigger_pct', label: '1m 微观 5m return 触发 (%)', min: 0, max: 100, step: 0.05 },
+  { key: 'micro_range_5m_trigger_pct', label: '1m 微观 5m range 触发 (%)', min: 0, max: 100, step: 0.05 },
+]
+const engineFields = [
+  ...engineCadenceFields,
+  ...engineTriggerFields,
+  ...engineSnapshotFields,
+]
+const engineFieldHelp = {
+  cycle_interval_seconds: 'Engine 主循环多久运行一次，单位秒。每轮会刷新行情、检查风控、判断是否需要调用 LLM。调小会更频繁分析，但上一轮 LLM 未返回时不会并发启动下一轮。',
+  review_flat_seconds: '空仓且没有显著行情变化时，距离上次 LLM 决策超过该秒数后强制复查。调小会让空仓状态下更频繁询问 LLM。',
+  review_position_seconds: '已有持仓但未接近退出区时，距离上次 LLM 决策超过该秒数后强制复查。调小会让持仓管理更频繁。',
+  review_near_exit_seconds: '持仓浮盈亏绝对值达到“接近退出浮盈亏阈值”后使用的复查间隔。适合在接近止盈、止损、保本或移动止损区域时提高检查频率。',
+  review_high_vol_seconds: '成交量、微观 return 或微观 range 达到高波动条件后使用的复查间隔。调小会在剧烈波动时更密集调用 LLM。',
+  max_skip_cycles: '连续多少个周期被 throttle 判定“无显著变化”后，仍强制调用一次 LLM。数值越小，兜底调用越频繁。',
+  price_change_pct: '当前价格相对上次 LLM 决策价格的变化百分比。达到该阈值会触发 LLM。数值越小，对价格变化越敏感。',
+  pnl_alert_pct: '持仓浮盈亏百分比的绝对值达到该阈值会触发 LLM。用于盈利扩大或亏损扩大时提前复查。',
+  near_exit_pnl_pct: '判定“接近退出区域”的持仓浮盈亏百分比阈值。达到后会使用接近退出复查间隔。',
+  trigger_on_order_event: '开启后，成交、撤单、订单状态变化等事件会立即触发 LLM 复查，用于让策略快速响应交易所状态变化。',
+  feature_snapshot_enabled: '开启后，Engine 会比较当前技术指标快照和上次 LLM 决策快照；趋势、波动、成交量等变化达到阈值时触发 LLM。',
+  ema_spread_cross_min_pct: 'EMA 快慢线 spread 穿越零轴时，当前 spread 绝对值至少达到该百分比才触发。调小会更容易捕捉趋势翻转。',
+  macd_hist_cross_min_abs: 'MACD histogram 穿越零轴的死区阈值。小于该绝对值的穿越被忽略，用于过滤弱噪音。',
+  rsi_midline: 'RSI 中线阈值。RSI 从下向上或从上向下穿越该值会触发快照变化判断，默认通常为 50。',
+  boll_bandwidth_low_pct: 'Bollinger bandwidth 被视为低波动区的阈值。只有先处于低波动区，再明显扩张，才触发波动扩张判断。',
+  boll_bandwidth_expand_pct: 'Bollinger bandwidth 从低波动区扩张的相对百分比阈值。数值越小，波动刚开始放大时越容易触发。',
+  volume_zscore_trigger: '成交量 z-score 上穿该阈值会触发 LLM，也用于高波动复查判断。数值越小，对放量越敏感。',
+  micro_return_5m_trigger_pct: '1m 微观数据中最近 5 分钟 return 的绝对值阈值。达到后触发 LLM，也参与高波动判断。',
+  micro_range_5m_trigger_pct: '1m 微观数据中最近 5 分钟价格区间百分比阈值。达到后触发 LLM，也参与高波动判断。',
+}
 const configCommandIds = new Set()
-const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED', 'ADD_SYMBOL', 'REVIEW_SYMBOL'])
+const CONFIG_COMMANDS = new Set(['PAUSE', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED', 'ADD_SYMBOL', 'REVIEW_SYMBOL', 'UPDATE_ENGINE_SETTINGS'])
 const SYMBOL_SYNC_ATTEMPTS = 8
 const SYMBOL_SYNC_DELAY_MS = 500
 
@@ -39,7 +96,7 @@ async function loadCfg() {
   cfg.value = await api.config().catch(() => null)
 }
 async function refreshAll() {
-  await Promise.all([loadCfg(), loadCommands(), loadRisk()])
+  await Promise.all([loadCfg(), loadCommands(), loadRisk(), loadEngine()])
 }
 
 async function loadRisk() {
@@ -57,6 +114,64 @@ function riskPayload() {
     field.key,
     Number(riskForm.value[field.key]) / (field.scale || 1),
   ]))
+}
+
+async function loadEngine() {
+  engineState.value = await api.engineSettings().catch(() => null)
+  if (!engineState.value) return
+  engineForm.value = Object.fromEntries(engineFields.map((field) => [
+    field.key,
+    field.type === 'bool'
+      ? Boolean(engineState.value.effective[field.key])
+      : Number(engineState.value.effective[field.key]),
+  ]))
+  enginePreview.value = null
+}
+
+function enginePayload() {
+  return Object.fromEntries(engineFields.map((field) => [
+    field.key,
+    field.type === 'bool'
+      ? Boolean(engineForm.value[field.key])
+      : Number(engineForm.value[field.key]),
+  ]))
+}
+
+async function previewEngine() {
+  engineLoading.value = true
+  try {
+    enginePreview.value = await api.enginePreview({
+      expected_version: engineState.value.version,
+      values: enginePayload(),
+    })
+  } catch (e) {
+    ElMessage.error(`Engine 参数校验失败: ${e.message}`)
+  } finally {
+    engineLoading.value = false
+  }
+}
+
+async function applyEngine() {
+  await previewEngine()
+  if (!enginePreview.value || Object.keys(enginePreview.value.changes || {}).length === 0) {
+    ElMessage.info('没有 Engine 参数变化')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将立即应用 ${Object.keys(enginePreview.value.changes).length} 项 Engine 参数修改。当前 LLM 请求不会被中断，下一轮开始使用新参数。`,
+      '确认应用 Engine 参数',
+      { type: 'warning', confirmButtonText: '应用', cancelButtonText: '取消' },
+    )
+    const result = await api.engineApply({
+      expected_version: engineState.value.version,
+      values: enginePayload(),
+    })
+    ElMessage.success(`Engine 参数更新命令已入队 (#${result.id})`)
+    await loadCommands()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error(`应用失败: ${e.message || e}`)
+  }
 }
 
 async function previewRisk() {
@@ -151,6 +266,8 @@ function commandLabel(name) {
     STOP_ENGINE: '停止交易引擎',
     KILL_SWITCH: 'Kill Switch',
     CIRCUIT_BREAKER: '自动熔断',
+    UPDATE_ENGINE_SETTINGS: '更新 Engine 参数',
+    UPDATE_RISK_SETTINGS: '更新风险参数',
   }[name] || name
 }
 
@@ -346,7 +463,12 @@ async function resumeAllSymbols() {
   await send('RESUME_ALL_SYMBOLS')
 }
 
-onMounted(refreshAll)
+onMounted(() => {
+  isTouchDevice.value = Boolean(
+    window.matchMedia?.('(hover: none)').matches || 'ontouchstart' in window
+  )
+  refreshAll()
+})
 
 watch(
   () => live.summary.recent_commands,
@@ -363,7 +485,7 @@ watch(
         configCommandIds.add(row.id)
       }
     })
-    await loadCfg()
+    await Promise.all([loadCfg(), loadEngine()])
   },
   { deep: true }
 )
@@ -648,6 +770,145 @@ watch(
 
     <el-card shadow="never" style="margin-top:16px">
       <template #header>
+        <div style="display:flex; justify-content:space-between; align-items:center">
+          <span>引擎分析与 LLM 调用频率</span>
+          <el-tag v-if="engineState" type="info">版本 {{ engineState.version }}</el-tag>
+        </div>
+      </template>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom:12px"
+        title="说明"
+        description="分析周期控制 Engine 多久跑一轮。Throttle 决定本轮是否调用 LLM；上一轮 LLM 未返回时不会并发调用下一轮，当前请求结束后才进入下一轮。"
+      />
+      <el-form v-if="engineState" label-width="260px">
+        <el-divider content-position="left">分析周期与最长复查</el-divider>
+        <el-row :gutter="16">
+          <el-col v-for="field in engineCadenceFields" :key="field.key" :span="12">
+            <el-form-item>
+              <template #label>
+                <span class="param-label">
+                  {{ field.label }}
+                  <el-tooltip
+                    :content="engineFieldHelp[field.key]"
+                    placement="top"
+                    effect="dark"
+                    :trigger="tooltipTrigger"
+                    popper-class="engine-param-tooltip"
+                    :show-after="200"
+                  >
+                    <span class="param-help">?</span>
+                  </el-tooltip>
+                </span>
+              </template>
+              <el-input-number
+                v-model="engineForm[field.key]"
+                :min="field.min"
+                :max="field.max"
+                :step="field.step"
+                style="width:100%"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-divider content-position="left">LLM 触发条件</el-divider>
+        <el-row :gutter="16">
+          <el-col v-for="field in engineTriggerFields" :key="field.key" :span="12">
+            <el-form-item>
+              <template #label>
+                <span class="param-label">
+                  {{ field.label }}
+                  <el-tooltip
+                    :content="engineFieldHelp[field.key]"
+                    placement="top"
+                    effect="dark"
+                    :trigger="tooltipTrigger"
+                    popper-class="engine-param-tooltip"
+                    :show-after="200"
+                  >
+                    <span class="param-help">?</span>
+                  </el-tooltip>
+                </span>
+              </template>
+              <el-switch v-if="field.type === 'bool'" v-model="engineForm[field.key]" />
+              <el-input-number
+                v-else
+                v-model="engineForm[field.key]"
+                :min="field.min"
+                :max="field.max"
+                :step="field.step"
+                style="width:100%"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-divider content-position="left">快照变化判断阈值</el-divider>
+        <el-alert
+          type="warning"
+          :closable="false"
+          style="margin-bottom:12px"
+          title="快照变化触发包含 EMA/MACD/RSI/Boll/成交量/微观波动/BTC leader 趋势等变化。阈值越低，LLM 调用越频繁。"
+        />
+        <el-row :gutter="16">
+          <el-col v-for="field in engineSnapshotFields" :key="field.key" :span="12">
+            <el-form-item>
+              <template #label>
+                <span class="param-label">
+                  {{ field.label }}
+                  <el-tooltip
+                    :content="engineFieldHelp[field.key]"
+                    placement="top"
+                    effect="dark"
+                    :trigger="tooltipTrigger"
+                    popper-class="engine-param-tooltip"
+                    :show-after="200"
+                  >
+                    <span class="param-help">?</span>
+                  </el-tooltip>
+                </span>
+              </template>
+              <el-switch v-if="field.type === 'bool'" v-model="engineForm[field.key]" />
+              <el-input-number
+                v-else
+                v-model="engineForm[field.key]"
+                :min="field.min"
+                :max="field.max"
+                :step="field.step"
+                style="width:100%"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+      <el-table
+        v-if="enginePreview && Object.keys(enginePreview.changes || {}).length"
+        :data="Object.entries(enginePreview.changes).map(([key, value]) => ({ key, ...value }))"
+        size="small"
+        style="margin-bottom:12px"
+      >
+        <el-table-column prop="key" label="参数" />
+        <el-table-column prop="before" label="修改前" />
+        <el-table-column prop="after" label="修改后" />
+      </el-table>
+      <el-alert
+        v-if="enginePreview?.impact"
+        type="success"
+        :closable="false"
+        style="margin-bottom:12px"
+        :title="`应用后分析周期 ${enginePreview.impact.cycle_interval_seconds}s；最短最长复查 ${enginePreview.impact.shortest_review_seconds}s；LLM 并发调用：否`"
+      />
+      <div class="risk-actions">
+        <el-button :loading="engineLoading" @click="previewEngine">预览 Engine 参数</el-button>
+        <el-button type="primary" :loading="engineLoading" @click="applyEngine">确认并立即应用</el-button>
+      </div>
+    </el-card>
+
+    <el-card shadow="never" style="margin-top:16px">
+      <template #header>
         <div class="card-header-row">
           <span>命令历史</span>
           <el-button size="small" :icon="'Refresh'" @click="refreshAll">刷新</el-button>
@@ -695,6 +956,35 @@ watch(
   flex-wrap: wrap;
 }
 
+.param-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: normal;
+}
+
+.param-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #eef5ff;
+  color: #409eff;
+  cursor: help;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+:global(.engine-param-tooltip) {
+  max-width: min(340px, calc(100vw - 32px));
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 @media (max-width: 767px) {
   .symbol-add {
     align-items: stretch;
@@ -710,6 +1000,11 @@ watch(
   .control-action-row .el-button,
   .risk-actions .el-button {
     width: 100%;
+  }
+
+  .param-label {
+    max-width: 100%;
+    line-height: 1.35;
   }
 }
 </style>

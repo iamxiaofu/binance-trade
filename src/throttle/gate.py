@@ -151,14 +151,14 @@ def _feature_change_reason(
     return None
 
 
-def _review_interval_minutes(
+def _review_interval_seconds(
     *,
     current: FeatureSnapshot | None,
     position: PositionSnapshot,
-    review_flat_minutes: int,
-    review_position_minutes: int,
-    review_near_exit_minutes: int,
-    review_high_vol_minutes: int,
+    review_flat_seconds: int,
+    review_position_seconds: int,
+    review_near_exit_seconds: int,
+    review_high_vol_seconds: int,
     near_exit_pnl_pct: float,
     volume_zscore_trigger: float,
     micro_return_5m_trigger_pct: float,
@@ -171,15 +171,15 @@ def _review_interval_minutes(
             or current.micro_range_5_pct >= micro_range_5m_trigger_pct
         )
         if high_vol:
-            return review_high_vol_minutes
+            return review_high_vol_seconds
 
     if position.has_position:
         pnl = position.unrealized_pnl_pct
         if pnl is not None and abs(pnl) >= near_exit_pnl_pct:
-            return review_near_exit_minutes
-        return review_position_minutes
+            return review_near_exit_seconds
+        return review_position_seconds
 
-    return review_flat_minutes
+    return review_flat_seconds
 
 
 def should_call_llm(
@@ -208,6 +208,10 @@ def should_call_llm(
     micro_return_5m_trigger_pct: float = 0.5,
     micro_range_5m_trigger_pct: float = 0.8,
     near_exit_pnl_pct: float = 0.8,
+    review_flat_seconds: int | None = None,
+    review_position_seconds: int | None = None,
+    review_near_exit_seconds: int | None = None,
+    review_high_vol_seconds: int | None = None,
     review_flat_minutes: int = 60,
     review_position_minutes: int = 15,
     review_near_exit_minutes: int = 5,
@@ -261,23 +265,35 @@ def should_call_llm(
 
     # 6. 动态最长复查间隔
     if last_decision_ts_ms is not None and now_ts_ms is not None:
-        review_minutes = _review_interval_minutes(
+        review_seconds = _review_interval_seconds(
             current=current_snapshot,
             position=position,
-            review_flat_minutes=review_flat_minutes,
-            review_position_minutes=review_position_minutes,
-            review_near_exit_minutes=review_near_exit_minutes,
-            review_high_vol_minutes=review_high_vol_minutes,
+            review_flat_seconds=(
+                review_flat_seconds
+                if review_flat_seconds is not None else review_flat_minutes * 60
+            ),
+            review_position_seconds=(
+                review_position_seconds
+                if review_position_seconds is not None else review_position_minutes * 60
+            ),
+            review_near_exit_seconds=(
+                review_near_exit_seconds
+                if review_near_exit_seconds is not None else review_near_exit_minutes * 60
+            ),
+            review_high_vol_seconds=(
+                review_high_vol_seconds
+                if review_high_vol_seconds is not None else review_high_vol_minutes * 60
+            ),
             near_exit_pnl_pct=near_exit_pnl_pct,
             volume_zscore_trigger=volume_zscore_trigger,
             micro_return_5m_trigger_pct=micro_return_5m_trigger_pct,
             micro_range_5m_trigger_pct=micro_range_5m_trigger_pct,
         )
         elapsed_ms = max(0, now_ts_ms - last_decision_ts_ms)
-        if elapsed_ms >= review_minutes * 60_000 - _EPS:
+        if elapsed_ms >= review_seconds * 1000 - _EPS:
             return ThrottleResult(
                 True,
-                f"dynamic review interval reached ({elapsed_ms / 60000:.1f}m >= {review_minutes}m)",
+                f"dynamic review interval reached ({elapsed_ms / 1000:.0f}s >= {review_seconds}s)",
             )
 
     # 7. 兜底强制触发：连续跳过达到上限

@@ -24,6 +24,15 @@ from src.exchange.orders import normalize_condition_order
 from src.exchange.positions import normalize_position, normalize_symbol
 from src.exchange.user_stream import BinanceUserDataStream
 from src.execution.executor import Executor, realized_pnl
+from src.engine.settings import (
+    RUNTIME_ENGINE_KEY,
+    RUNTIME_ENGINE_VERSION_KEY,
+    decode_engine,
+    encode_engine,
+    engine_defaults_from_settings,
+    engine_public,
+    validate_engine_payload,
+)
 from src.features.builder import build_context, build_position_snapshot
 from src.llm.client import LLMClient
 from src.llm.schema import Action, MarketContext, TradeDecision
@@ -106,6 +115,9 @@ class TradingEngine:
         self._cycle_leader_snapshot: FeatureSnapshot | None = None
         self._risk_defaults = settings.risk.model_copy(deep=True)
         self._risk_version = 0
+        self._engine_defaults = engine_defaults_from_settings(settings)
+        self._engine_settings = self._engine_defaults.model_copy(deep=True)
+        self._engine_version = 0
         self._stream_halted_entries = False
         self._private_invariant_task: asyncio.Task | None = None
         self._stream_verify_task: asyncio.Task | None = None
@@ -499,8 +511,8 @@ class TradingEngine:
             await self.shutdown()
 
     async def _sleep_to_next_cycle(self, cycle_start: float) -> None:
-        interval = self._settings.cycle.interval_seconds
         while not self.runtime.kill_switch and not self._stopped.is_set():
+            interval = self._engine_settings.cycle_interval_seconds
             elapsed = time.monotonic() - cycle_start
             remaining = max(0.0, interval - elapsed)
             if remaining <= 0:
@@ -590,7 +602,7 @@ class TradingEngine:
             if cmd.get("status") != "done":
                 continue
             name = cmd.get("command")
-            if name in ("RESUME", "RESUME_ALL_SYMBOLS"):
+            if name in ("RESUME", "RESUME_ALL_SYMBOLS", "UPDATE_ENGINE_SETTINGS"):
                 return True
             if name == "SET_SYMBOL_ENABLED" and not self.runtime.halt_new_entries:
                 enabled = self._symbol_enabled_arg_value(cmd.get("arg", ""))
@@ -652,6 +664,8 @@ class TradingEngine:
             return "strategy resumed (persisted)"
         if name == "UPDATE_RISK_SETTINGS":
             return await self._update_risk_settings(arg)
+        if name == "UPDATE_ENGINE_SETTINGS":
+            return await self._update_engine_settings(arg)
         if name == "RESUME_ALL_SYMBOLS":
             return await self._resume_all_symbols()
         if name == "SET_SYMBOL_ENABLED":
@@ -686,6 +700,8 @@ class TradingEngine:
         await self._reload_symbols_from_store()
         raw_risk = await self._store.get_runtime_setting(RUNTIME_RISK_KEY)
         raw_version = await self._store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY)
+        raw_engine = await self._store.get_runtime_setting(RUNTIME_ENGINE_KEY)
+        raw_engine_version = await self._store.get_runtime_setting(RUNTIME_ENGINE_VERSION_KEY)
         raw_equity_peak = await self._store.get_runtime_setting("risk.equity_peak")
         try:
             self.runtime.equity_peak = max(float(raw_equity_peak or 0.0), 0.0)
@@ -702,6 +718,18 @@ class TradingEngine:
             await self._store.set_runtime_settings({
                 RUNTIME_RISK_KEY: encode_risk(self._settings.risk),
                 RUNTIME_RISK_VERSION_KEY: str(self._risk_version),
+            })
+        try:
+            self._engine_settings = decode_engine(raw_engine, self._engine_defaults)
+            self._engine_version = int(raw_engine_version or 0)
+        except Exception as e:
+            self.runtime.halt_entries(f"invalid runtime engine settings: {e}")
+            logger.error("invalid runtime engine settings; keeping yaml defaults: {}", e)
+            self._engine_settings = self._engine_defaults.model_copy(deep=True)
+        if raw_engine is None:
+            await self._store.set_runtime_settings({
+                RUNTIME_ENGINE_KEY: encode_engine(self._engine_settings),
+                RUNTIME_ENGINE_VERSION_KEY: str(self._engine_version),
             })
         raw_paused = await self._store.get_runtime_setting("strategy.paused")
         if self._settings.is_mainnet:
@@ -757,6 +785,28 @@ class TradingEngine:
             "version": self._risk_version,
             "effective": risk_public(updated),
             "breaker_tripped": tripped,
+        }, sort_keys=True)
+
+    async def _update_engine_settings(self, arg: str) -> str:
+        payload = json.loads(arg or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("UPDATE_ENGINE_SETTINGS requires a JSON object")
+        expected_version = int(payload.pop("expected_version", -1))
+        if expected_version != self._engine_version:
+            raise ValueError(
+                f"engine settings version conflict: expected {expected_version}, "
+                f"current {self._engine_version}"
+            )
+        updated = validate_engine_payload(payload, self._engine_settings)
+        self._engine_settings = updated
+        self._engine_version += 1
+        await self._store.set_runtime_settings({
+            RUNTIME_ENGINE_KEY: encode_engine(updated),
+            RUNTIME_ENGINE_VERSION_KEY: str(self._engine_version),
+        })
+        return json.dumps({
+            "version": self._engine_version,
+            "effective": engine_public(updated),
         }, sort_keys=True)
 
     async def _set_symbol_enabled(self, arg: str) -> str:
@@ -2471,35 +2521,36 @@ class TradingEngine:
                 last_feature_snapshot = None
 
         # 1. 节流：是否调用 LLM
+        engine_settings = self._engine_settings
         gate = should_call_llm(
             symbol=symbol,
             last_price=snap.last_price,
             last_decision_px=self.runtime.last_decision_price.get(symbol),
             position=position,
-            price_change_pct=self._settings.throttle.price_change_pct,
-            pnl_alert_pct=self._settings.throttle.pnl_alert_pct,
+            price_change_pct=engine_settings.price_change_pct,
+            pnl_alert_pct=engine_settings.pnl_alert_pct,
             order_event=self.runtime.pop_order_event(symbol),
-            trigger_on_order_event=self._settings.throttle.trigger_on_order_event,
+            trigger_on_order_event=engine_settings.trigger_on_order_event,
             skip_count=self.runtime.skip_count.get(symbol, 0),
-            max_skip_cycles=self._settings.throttle.max_skip_cycles,
+            max_skip_cycles=engine_settings.max_skip_cycles,
             last_decision_ts_ms=self.runtime.last_decision_time.get(symbol),
             now_ts_ms=snap.updated_ms or int(time.time() * 1000),
             current_snapshot=current_feature_snapshot,
             last_decision_snapshot=last_feature_snapshot,
-            feature_snapshot_enabled=self._settings.throttle.feature_snapshot_enabled,
-            ema_spread_cross_min_pct=self._settings.throttle.ema_spread_cross_min_pct,
-            macd_hist_cross_min_abs=self._settings.throttle.macd_hist_cross_min_abs,
-            rsi_midline=self._settings.throttle.rsi_midline,
-            boll_bandwidth_low_pct=self._settings.throttle.boll_bandwidth_low_pct,
-            boll_bandwidth_expand_pct=self._settings.throttle.boll_bandwidth_expand_pct,
-            volume_zscore_trigger=self._settings.throttle.volume_zscore_trigger,
-            micro_return_5m_trigger_pct=self._settings.throttle.micro_return_5m_trigger_pct,
-            micro_range_5m_trigger_pct=self._settings.throttle.micro_range_5m_trigger_pct,
-            near_exit_pnl_pct=self._settings.throttle.near_exit_pnl_pct,
-            review_flat_minutes=self._settings.throttle.review_flat_minutes,
-            review_position_minutes=self._settings.throttle.review_position_minutes,
-            review_near_exit_minutes=self._settings.throttle.review_near_exit_minutes,
-            review_high_vol_minutes=self._settings.throttle.review_high_vol_minutes,
+            feature_snapshot_enabled=engine_settings.feature_snapshot_enabled,
+            ema_spread_cross_min_pct=engine_settings.ema_spread_cross_min_pct,
+            macd_hist_cross_min_abs=engine_settings.macd_hist_cross_min_abs,
+            rsi_midline=engine_settings.rsi_midline,
+            boll_bandwidth_low_pct=engine_settings.boll_bandwidth_low_pct,
+            boll_bandwidth_expand_pct=engine_settings.boll_bandwidth_expand_pct,
+            volume_zscore_trigger=engine_settings.volume_zscore_trigger,
+            micro_return_5m_trigger_pct=engine_settings.micro_return_5m_trigger_pct,
+            micro_range_5m_trigger_pct=engine_settings.micro_range_5m_trigger_pct,
+            near_exit_pnl_pct=engine_settings.near_exit_pnl_pct,
+            review_flat_seconds=engine_settings.review_flat_seconds,
+            review_position_seconds=engine_settings.review_position_seconds,
+            review_near_exit_seconds=engine_settings.review_near_exit_seconds,
+            review_high_vol_seconds=engine_settings.review_high_vol_seconds,
         )
         if not gate.trigger:
             self.runtime.record_skip(symbol)

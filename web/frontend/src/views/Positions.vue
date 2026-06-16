@@ -589,7 +589,7 @@ async function cancelConditionOrder(order) {
     <el-card shadow="never" class="open-orders-card">
       <template #header>
         <div class="positions-header">
-          <span>挂单（交易所实时）</span>
+          <span>普通挂单（限价/未成交，交易所实时）</span>
           <span class="positions-meta">
             <el-tag :type="openOrdersError ? 'warning' : 'success'" size="small" effect="dark">
               {{ openOrdersError ? '同步失败' : '交易所实时' }}
@@ -598,6 +598,13 @@ async function cancelConditionOrder(order) {
           </span>
         </div>
       </template>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom:12px"
+        title="普通挂单是已进入交易所订单簿但尚未完全成交的普通订单；不包含止损/止盈条件单。"
+      />
       <el-alert
         v-if="openOrdersError"
         type="warning"
@@ -692,7 +699,14 @@ async function cancelConditionOrder(order) {
       </el-table>
 
       <div class="condition-orders-section">
-        <div class="section-title">条件单（SL/TP）</div>
+        <div class="section-title">条件单（止损/止盈，触发后市价执行）</div>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom:12px"
+          title="条件单不会提前进入普通订单簿，只有达到触发价后才由交易所触发执行；这里主要展示 SL/TP 保护单明细。"
+        />
         <div v-if="(live.summary?.condition_orders || []).length" class="mobile-order-list mobile-only">
           <article
             v-for="row in live.summary?.condition_orders || []"

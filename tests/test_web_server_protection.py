@@ -92,6 +92,54 @@ def test_apply_live_balance_recomputes_day_equity_from_exchange(monkeypatch):
     assert balance["equity_source"] == "exchange"
 
 
+async def test_status_summary_separates_regular_and_condition_orders(monkeypatch):
+    class FakeStore:
+        async def live_account_state(self):
+            return {
+                "balances": [{
+                    "asset": server._settings.account.quote_asset,
+                    "wallet_balance": 200.0,
+                    "available_balance": 180.0,
+                    "updated_at_ms": 1000,
+                }],
+                "positions": [{"symbol": "BTCUSDT", "updated_at_ms": 1000}],
+                "open_orders": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "id": "limit-1",
+                        "order_class": "regular",
+                        "status": "open",
+                        "updated_at_ms": 1000,
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "id": "sl-1",
+                        "order_class": "algo",
+                        "kind": "SL",
+                        "status": "placed",
+                        "updated_at_ms": 1000,
+                    },
+                ],
+            }
+
+    async def fake_get_store():
+        return FakeStore()
+
+    async def fake_effective_symbol_enabled():
+        return {}
+
+    monkeypatch.setattr(server.st, "status_summary", lambda _db: {"balance": {}, "positions": []})
+    monkeypatch.setattr(server.st, "day_equity_change", lambda *_args, **_kw: {})
+    monkeypatch.setattr(server, "_get_store", fake_get_store)
+    monkeypatch.setattr(server, "_effective_symbol_enabled", fake_effective_symbol_enabled)
+
+    summary = await server._status_summary()
+
+    assert [row["id"] for row in summary["open_orders"]] == ["limit-1"]
+    assert [row["id"] for row in summary["condition_orders"]] == ["sl-1"]
+    assert [row["id"] for row in summary["all_open_orders"]] == ["limit-1", "sl-1"]
+
+
 def test_projection_metadata_applies_local_trade_fields(monkeypatch):
     monkeypatch.setattr(
         server.st,

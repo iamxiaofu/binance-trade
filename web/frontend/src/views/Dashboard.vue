@@ -145,7 +145,15 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
               </el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="标的">{{ cfg ? cfg.symbols.join(', ') : '—' }}</el-descriptions-item>
-            <el-descriptions-item label="周期">{{ cfg ? cfg.cycle_interval : '—' }}</el-descriptions-item>
+            <el-descriptions-item label="分析周期">
+              {{
+                cfg
+                  ? (cfg.cycle_interval_seconds || cfg.engine?.cycle_interval_seconds
+                    ? `${cfg.cycle_interval_seconds || cfg.engine?.cycle_interval_seconds}s`
+                    : cfg.cycle_interval)
+                  : '—'
+              }}
+            </el-descriptions-item>
             <el-descriptions-item label="当前持仓数">{{ positions.length }}</el-descriptions-item>
             <el-descriptions-item label="最近决策">
               <span v-if="lastDecision">

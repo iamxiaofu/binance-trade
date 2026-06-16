@@ -29,6 +29,14 @@ from loguru import logger
 from src.config.loader import load_config
 from src.exchange.positions import normalize_symbol
 from src.features.indicators import compute_snapshot
+from src.engine.settings import (
+    RUNTIME_ENGINE_KEY,
+    RUNTIME_ENGINE_VERSION_KEY,
+    decode_engine,
+    engine_defaults_from_settings,
+    engine_public,
+    validate_engine_payload,
+)
 from src.risk.settings import (
     RUNTIME_RISK_KEY,
     RUNTIME_RISK_VERSION_KEY,
@@ -255,11 +263,15 @@ async def _status_summary() -> dict[str, Any]:
         summary["positions_synced_at_ms"] = max(
             [int(row.get("updated_at_ms") or 0) for row in live["positions"]] or [None]
         )
-        summary["open_orders"] = live["open_orders"]
-        summary["condition_orders"] = [
-            row for row in live["open_orders"] if row.get("order_class") == "algo"
+        live_orders = list(live["open_orders"])
+        summary["open_orders"] = [
+            row for row in live_orders if row.get("order_class") == "regular"
         ]
-        _attach_projection_metadata(summary["positions"], live["open_orders"])
+        summary["condition_orders"] = [
+            row for row in live_orders if row.get("order_class") == "algo"
+        ]
+        summary["all_open_orders"] = live_orders
+        _attach_projection_metadata(summary["positions"], live_orders)
         summary["open_orders_error"] = ""
         summary["condition_orders_error"] = ""
         summary["open_orders_synced_at_ms"] = max(
@@ -514,6 +526,11 @@ async def api_config(_: str = Depends(_check_auth)):
         await store.get_runtime_setting(RUNTIME_RISK_KEY), s.risk
     )
     risk_version = int(await store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY) or 0)
+    engine_defaults = engine_defaults_from_settings(s)
+    effective_engine = decode_engine(
+        await store.get_runtime_setting(RUNTIME_ENGINE_KEY), engine_defaults
+    )
+    engine_version = int(await store.get_runtime_setting(RUNTIME_ENGINE_VERSION_KEY) or 0)
     return {
         "mode": s.mode.value,
         "db_path": s.storage.db_path,
@@ -524,11 +541,15 @@ async def api_config(_: str = Depends(_check_auth)):
         "symbol_enabled": symbol_enabled,
         "symbols_state": symbols_state,
         "cycle_interval": s.cycle.interval,
+        "cycle_interval_seconds": effective_engine.cycle_interval_seconds,
         # 看板默认行情源（mainnet 真实价 / testnet 沙盒），供前端初始化源切换
         "market_source": _DEFAULT_SOURCE,
         "risk": risk_public(effective_risk),
         "risk_defaults": risk_public(s.risk),
         "risk_version": risk_version,
+        "engine": engine_public(effective_engine),
+        "engine_defaults": engine_public(engine_defaults),
+        "engine_version": engine_version,
         "user_stream": await _stream_status(),
     }
 
@@ -611,11 +632,13 @@ _ALLOWED_COMMANDS = {
     "STOP_ENGINE",
     "SWITCH_LLM_PROFILE",
     "UPDATE_RISK_SETTINGS",
+    "UPDATE_ENGINE_SETTINGS",
 }
 
 _MAINNET_HIGH_RISK_COMMANDS = {
     "KILL_SWITCH", "RESUME", "RESUME_ALL_SYMBOLS", "SET_SYMBOL_ENABLED",
-    "CLOSE_POSITION", "CANCEL_AND_FLATTEN", "STOP_ENGINE", "UPDATE_RISK_SETTINGS",
+    "CLOSE_POSITION", "CANCEL_AND_FLATTEN", "STOP_ENGINE",
+    "UPDATE_RISK_SETTINGS", "UPDATE_ENGINE_SETTINGS",
 }
 
 
@@ -664,6 +687,12 @@ class _ConfirmationRequest(BaseModel):
 
 
 class _RiskUpdateRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+    values: dict[str, Any]
+    confirmation_token: str = ""
+
+
+class _EngineUpdateRequest(BaseModel):
     expected_version: int = Field(ge=0)
     values: dict[str, Any]
     confirmation_token: str = ""
@@ -782,6 +811,79 @@ async def api_risk_settings_apply(
         "UPDATE_RISK_SETTINGS", arg=payload, source=f"web:{user}"
     )
     return {"queued": True, "id": cmd_id, "command": "UPDATE_RISK_SETTINGS"}
+
+
+@app.get("/api/engine-settings")
+async def api_engine_settings(_: str = Depends(_check_auth)):
+    store = await _get_store()
+    defaults = engine_defaults_from_settings(_settings)
+    effective = decode_engine(await store.get_runtime_setting(RUNTIME_ENGINE_KEY), defaults)
+    version = int(await store.get_runtime_setting(RUNTIME_ENGINE_VERSION_KEY) or 0)
+    return {
+        "mode": _settings.mode.value,
+        "version": version,
+        "defaults": engine_public(defaults),
+        "effective": engine_public(effective),
+    }
+
+
+@app.post("/api/engine-settings/preview")
+async def api_engine_settings_preview(
+    body: _EngineUpdateRequest,
+    _: str = Depends(_check_auth),
+):
+    store = await _get_store()
+    defaults = engine_defaults_from_settings(_settings)
+    current = decode_engine(await store.get_runtime_setting(RUNTIME_ENGINE_KEY), defaults)
+    current_version = int(await store.get_runtime_setting(RUNTIME_ENGINE_VERSION_KEY) or 0)
+    if body.expected_version != current_version:
+        raise HTTPException(status_code=409, detail=f"version conflict: current={current_version}")
+    try:
+        updated = validate_engine_payload(body.values, current)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    before = engine_public(current)
+    after = engine_public(updated)
+    return {
+        "mode": _settings.mode.value,
+        "version": current_version,
+        "changes": {
+            key: {"before": before[key], "after": after[key]}
+            for key in after if before[key] != after[key]
+        },
+        "effective": after,
+        "impact": {
+            "cycle_interval_seconds": after["cycle_interval_seconds"],
+            "shortest_review_seconds": min(
+                after["review_flat_seconds"],
+                after["review_position_seconds"],
+                after["review_near_exit_seconds"],
+                after["review_high_vol_seconds"],
+            ),
+            "llm_calls_overlap": False,
+        },
+    }
+
+
+@app.post("/api/engine-settings/apply")
+async def api_engine_settings_apply(
+    body: _EngineUpdateRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    user: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    payload = json.dumps(
+        {"expected_version": body.expected_version, **body.values},
+        sort_keys=True, separators=(",", ":"),
+    )
+    _consume_confirmation(body.confirmation_token, "UPDATE_ENGINE_SETTINGS", payload)
+    store = await _get_store()
+    cmd_id = await store.enqueue_command(
+        "UPDATE_ENGINE_SETTINGS", arg=payload, source=f"web:{user}"
+    )
+    return {"queued": True, "id": cmd_id, "command": "UPDATE_ENGINE_SETTINGS"}
 
 
 # ---------- LLM profile 管理 ----------

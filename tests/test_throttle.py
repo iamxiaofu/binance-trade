@@ -112,6 +112,17 @@ def test_no_change_skips():
     assert "no significant change" in r.reason
 
 
+def test_dynamic_review_interval_supports_seconds():
+    r = _call(
+        last_price=100.0,
+        last_decision_ts_ms=1_000,
+        now_ts_ms=91_000,
+        review_flat_seconds=90,
+    )
+    assert r.trigger is True
+    assert "90s" in r.reason
+
+
 def test_feature_snapshot_ema_cross_triggers():
     prev = _snap(ema_spread_pct=-0.03)
     cur = _snap(ema_spread_pct=0.04)

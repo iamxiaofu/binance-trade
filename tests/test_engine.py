@@ -620,6 +620,24 @@ async def test_runtime_risk_update_is_versioned_and_applied(settings, creds, mon
     assert eng._store.runtime_settings["risk.version"] == "3"
 
 
+async def test_runtime_engine_update_is_versioned_and_applied(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._engine_version = 2
+    result = await eng._update_engine_settings(json.dumps({
+        "expected_version": 2,
+        "cycle_interval_seconds": 90,
+        "review_position_seconds": 90,
+        "price_change_pct": 0.5,
+    }))
+
+    assert eng._engine_settings.cycle_interval_seconds == 90
+    assert eng._engine_settings.review_position_seconds == 90
+    assert eng._engine_settings.price_change_pct == pytest.approx(0.5)
+    assert eng._engine_version == 3
+    assert '"version": 3' in result
+    assert eng._store.runtime_settings["engine.version"] == "3"
+
+
 async def test_mainnet_runtime_settings_force_restart_pause(settings, creds, monkeypatch):
     settings.mode = Mode.MAINNET
     eng = _engine(settings, creds, monkeypatch)
@@ -1578,6 +1596,28 @@ async def test_sleep_consumes_symbol_enable_and_wakes_when_running(settings, cre
     assert time.monotonic() - started < 0.2
     assert eng._symbol_enabled["BTCUSDT"] is True
     assert eng._store.runtime_settings["symbol.enabled.BTCUSDT"] == "true"
+    assert eng._store.marked[0][0:2] == (1, "done")
+
+
+async def test_sleep_consumes_engine_update_and_wakes_strategy(settings, creds, monkeypatch):
+    monkeypatch.setattr(engine_loop, "_COMMAND_POLL_INTERVAL_SECONDS", 0.01)
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = False
+    eng._store.pending = [{
+        "id": 1,
+        "command": "UPDATE_ENGINE_SETTINGS",
+        "arg": json.dumps({
+            "expected_version": 0,
+            "cycle_interval_seconds": 90,
+        }),
+    }]
+    cycle_start = time.monotonic() - 1.0
+
+    started = time.monotonic()
+    await eng._sleep_to_next_cycle(cycle_start)
+
+    assert time.monotonic() - started < 0.2
+    assert eng._engine_settings.cycle_interval_seconds == 90
     assert eng._store.marked[0][0:2] == (1, "done")
 
 
