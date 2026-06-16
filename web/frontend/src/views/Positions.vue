@@ -345,7 +345,109 @@ async function cancelConditionOrder(order) {
           </span>
         </template>
       </el-alert>
-      <el-table :data="positions" stripe empty-text="当前无持仓">
+      <div v-if="positions.length" class="mobile-position-list mobile-only">
+        <article
+          v-for="row in positions"
+          :key="row.symbol"
+          class="mobile-position-card"
+          :class="[`side-${row.side || 'flat'}`, { 'needs-attention': needsRepair(row) || isSymbolDisabled(row.symbol) }]"
+        >
+          <div class="mobile-position-head">
+            <div>
+              <div class="mobile-symbol">{{ row.symbol }}</div>
+              <div class="mobile-position-time">开仓于 {{ fmtTime(row.local_opened_at_ms) }}</div>
+            </div>
+            <div class="mobile-position-tags">
+              <el-tag
+                :type="row.side === 'long' ? 'success' : row.side === 'short' ? 'danger' : 'info'"
+                effect="dark"
+              >
+                {{ row.side === 'long' ? '多仓' : row.side === 'short' ? '空仓' : '—' }}
+              </el-tag>
+              <el-tag size="small">{{ Number(row.leverage) > 0 ? `${row.leverage}x` : '—' }}</el-tag>
+            </div>
+          </div>
+
+          <div class="mobile-position-pnl">
+            <div>
+              <span class="mobile-field-label">未实现盈亏</span>
+              <strong class="mono" :class="Number(row.unrealized_pnl) >= 0 ? 'pnl-pos' : 'pnl-neg'">
+                {{ fmt(row.unrealized_pnl, 2) }} USDT
+              </strong>
+            </div>
+            <div>
+              <span class="mobile-field-label">保证金收益率</span>
+              <strong class="mono" :class="Number(row.roi_pct) >= 0 ? 'pnl-pos' : 'pnl-neg'">
+                {{ fmtPct(row.roi_pct) }}
+              </strong>
+            </div>
+          </div>
+
+          <div class="mobile-position-grid">
+            <div><span>持仓数量</span><strong class="mono">{{ fmt(row.contracts) }}</strong></div>
+            <div><span>保证金</span><strong class="mono">{{ fmt(margin(row), 2) }}</strong></div>
+            <div><span>开仓价</span><strong class="mono">{{ fmt(row.entry_price, 2) }}</strong></div>
+            <div><span>标记价</span><strong class="mono">{{ fmt(row.mark_price, 2) }}</strong></div>
+            <div><span>名义价值</span><strong class="mono">{{ fmt(row.notional, 2) }}</strong></div>
+            <div><span>强平价格</span><strong class="mono">{{ fmt(row.liquidation_price, 2) }}</strong></div>
+          </div>
+
+          <div class="mobile-protection-grid">
+            <div>
+              <span class="mobile-field-label">止损保护</span>
+              <el-tag :type="protectionTag(protection(row, 'SL'))" size="small">
+                {{ protectionText(protection(row, 'SL')) }}
+              </el-tag>
+            </div>
+            <div>
+              <span class="mobile-field-label">止盈保护</span>
+              <el-tag :type="protectionTag(protection(row, 'TP'))" size="small">
+                {{ protectionText(protection(row, 'TP')) }}
+              </el-tag>
+            </div>
+          </div>
+
+          <div class="mobile-position-actions">
+            <div class="mobile-position-actions__meta">
+              <el-tag v-if="isSymbolDisabled(row.symbol)" type="warning" size="small" effect="dark">
+                币种已禁用
+              </el-tag>
+              <el-tag v-else-if="!needsRepair(row)" type="success" size="small">保护完整</el-tag>
+            </div>
+            <div class="mobile-position-actions__row">
+              <template v-if="needsRepair(row)">
+                <el-button
+                  type="danger"
+                  size="small"
+                  :icon="'CirclePlus'"
+                  :loading="isRepairing(row)"
+                  @click="repairProtection(row)"
+                >
+                  补止盈止损
+                </el-button>
+                <el-button size="small" @click="openTakeover(row)">接管保护</el-button>
+              </template>
+              <el-button
+                v-if="isSymbolDisabled(row.symbol)"
+                size="small"
+                type="success"
+                :loading="enabling[row.symbol]"
+                @click="enableSymbol(row)"
+              >
+                启用并接管
+              </el-button>
+            </div>
+            <div class="mobile-position-actions__row mobile-position-actions__row--full">
+              <el-button type="danger" plain size="small" @click="openManualClose(row)">
+                手动平仓
+              </el-button>
+            </div>
+          </div>
+        </article>
+      </div>
+      <el-empty v-else class="mobile-only" description="当前无持仓" :image-size="70" />
+
+      <el-table class="desktop-only" :data="positions" stripe empty-text="当前无持仓">
         <el-table-column prop="symbol" label="标的" width="120" />
         <el-table-column label="方向" width="90">
           <template #default="{ row }">
@@ -504,7 +606,37 @@ async function cancelConditionOrder(order) {
         style="margin-bottom:12px"
         :title="`交易所普通挂单同步失败：${openOrdersError}`"
       />
+      <div v-if="openOrders.length" class="mobile-order-list mobile-only">
+        <article v-for="row in openOrders" :key="`${row.symbol}-${row.id}`" class="mobile-order-card">
+          <div class="mobile-order-head">
+            <strong>{{ row.symbol }}</strong>
+            <div>
+              <el-tag :type="row.side === 'buy' ? 'success' : 'danger'" size="small">
+                {{ row.side === 'buy' ? '买' : row.side === 'sell' ? '卖' : '—' }}
+              </el-tag>
+              <el-tag size="small">{{ row.status || 'placed' }}</el-tag>
+            </div>
+          </div>
+          <div class="mobile-position-grid compact">
+            <div><span>类型</span><strong>{{ row.order_type || 'LIMIT' }}</strong></div>
+            <div><span>价格</span><strong class="mono">{{ Number(row.price || 0).toFixed(2) }}</strong></div>
+            <div><span>数量</span><strong class="mono">{{ Number(row.qty || 0).toFixed(4) }}</strong></div>
+            <div><span>已成交</span><strong class="mono">{{ Number(row.filled_qty || 0).toFixed(4) }}</strong></div>
+          </div>
+          <el-button
+            type="danger"
+            size="small"
+            plain
+            :loading="isCancelingOrder(row.symbol, row.id)"
+            @click="cancelOpenOrder(row)"
+          >
+            撤销挂单
+          </el-button>
+        </article>
+      </div>
+      <el-empty v-else class="mobile-only compact-empty" description="当前无普通挂单" :image-size="60" />
       <el-table
+        class="desktop-only"
         :data="openOrders"
         stripe
         size="small"
@@ -561,7 +693,44 @@ async function cancelConditionOrder(order) {
 
       <div class="condition-orders-section">
         <div class="section-title">条件单（SL/TP）</div>
+        <div v-if="(live.summary?.condition_orders || []).length" class="mobile-order-list mobile-only">
+          <article
+            v-for="row in live.summary?.condition_orders || []"
+            :key="`${row.symbol}-${row.id}`"
+            class="mobile-order-card"
+          >
+            <div class="mobile-order-head">
+              <strong>{{ row.symbol }}</strong>
+              <div>
+                <el-tag :type="row.kind === 'SL' ? 'danger' : 'success'" size="small">{{ row.kind || '—' }}</el-tag>
+                <el-tag size="small">{{ orderStatusLabel({ client_kind: row.kind, status: row.status || 'placed' }) }}</el-tag>
+              </div>
+            </div>
+            <div class="mobile-position-grid compact">
+              <div><span>方向</span><strong>{{ row.side === 'buy' ? '买' : row.side === 'sell' ? '卖' : '—' }}</strong></div>
+              <div><span>触发价</span><strong class="mono">{{ Number(row.trigger_price || row.price || 0).toFixed(2) }}</strong></div>
+              <div><span>数量</span><strong class="mono">{{ Number(row.qty || 0).toFixed(4) }}</strong></div>
+              <div><span>类型</span><strong>{{ row.kind || '—' }}</strong></div>
+            </div>
+            <el-button
+              type="danger"
+              size="small"
+              plain
+              :loading="isCancelingOrder(row.symbol, row.id)"
+              @click="cancelConditionOrder(row)"
+            >
+              撤销条件单
+            </el-button>
+          </article>
+        </div>
+        <el-empty
+          v-else
+          class="mobile-only compact-empty"
+          description="当前无 SL/TP 条件单"
+          :image-size="60"
+        />
         <el-table
+          class="desktop-only"
           :data="live.summary?.condition_orders || []"
           stripe
           size="small"
@@ -690,7 +859,19 @@ async function cancelConditionOrder(order) {
   margin-bottom: 8px;
 }
 
+.mobile-only {
+  display: none;
+}
+
 @media (max-width: 767px) {
+  .desktop-only {
+    display: none;
+  }
+
+  .mobile-only {
+    display: block;
+  }
+
   .positions-header,
   .positions-meta {
     align-items: flex-start;
@@ -703,6 +884,193 @@ async function cancelConditionOrder(order) {
 
   .protect-input {
     width: 100%;
+  }
+
+  .mobile-position-list,
+  .mobile-order-list {
+    display: grid;
+    gap: 10px;
+  }
+
+  .mobile-position-card,
+  .mobile-order-card {
+    min-width: 0;
+    padding: 12px;
+    overflow: hidden;
+    background: var(--bt-card);
+    border: 1px solid var(--bt-border);
+    border-left: 4px solid var(--bt-muted);
+    border-radius: 10px;
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.05);
+  }
+
+  .mobile-position-card.side-long {
+    border-left-color: #16a34a;
+  }
+
+  .mobile-position-card.side-short {
+    border-left-color: #dc2626;
+  }
+
+  .mobile-position-card.needs-attention {
+    border-top-color: #e6a23c;
+    border-right-color: #e6a23c;
+    border-bottom-color: #e6a23c;
+  }
+
+  .mobile-position-head,
+  .mobile-order-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .mobile-symbol {
+    font-size: 18px;
+    font-weight: 700;
+  }
+
+  .mobile-position-time {
+    margin-top: 3px;
+    color: var(--bt-muted);
+    font-size: 11px;
+  }
+
+  .mobile-position-tags,
+  .mobile-order-head > div {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .mobile-position-pnl {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+    margin: 12px 0;
+    padding: 10px;
+    background: color-mix(in srgb, var(--bt-primary) 7%, transparent);
+    border-radius: 8px;
+  }
+
+  .mobile-position-pnl > div,
+  .mobile-protection-grid > div {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .mobile-position-pnl strong {
+    font-size: 16px;
+    overflow-wrap: anywhere;
+  }
+
+  .mobile-field-label {
+    color: var(--bt-muted);
+    font-size: 11px;
+  }
+
+  .mobile-position-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1px;
+    overflow: hidden;
+    background: var(--bt-border);
+    border: 1px solid var(--bt-border);
+    border-radius: 8px;
+  }
+
+  .mobile-position-grid > div {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px;
+    background: var(--bt-card);
+  }
+
+  .mobile-position-grid span {
+    color: var(--bt-muted);
+    font-size: 11px;
+  }
+
+  .mobile-position-grid strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+  }
+
+  .mobile-position-grid.compact {
+    margin: 10px 0;
+  }
+
+  .mobile-protection-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .mobile-protection-grid .el-tag {
+    max-width: 100%;
+    height: auto;
+    min-height: 24px;
+    padding: 3px 7px;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .mobile-position-actions {
+    display: grid;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--bt-border);
+  }
+
+  .mobile-position-actions__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .mobile-position-actions__row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .mobile-position-actions__row--full {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mobile-position-actions .el-tag,
+  .mobile-position-actions .el-button,
+  .mobile-order-card > .el-button {
+    min-height: 36px;
+  }
+
+  .mobile-position-actions .el-button {
+    width: 100%;
+    min-width: 0;
+    white-space: normal;
+  }
+
+  .mobile-position-actions .el-tag {
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.3;
+  }
+
+  .mobile-order-card {
+    border-left-color: var(--bt-primary);
+  }
+
+  .compact-empty {
+    padding: 8px 0;
   }
 }
 </style>

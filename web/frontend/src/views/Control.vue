@@ -389,7 +389,7 @@ watch(
                 {{ cfg.strategy_status_source === 'runtime' ? '运行时持久化' : '默认状态' }}
               </el-tag>
             </div>
-            <div style="display:flex; gap:12px">
+            <div class="control-action-row">
               <el-button type="warning" :loading="loading" :disabled="strategyPaused" style="flex:1"
                          :icon="'VideoPause'" @click="send('PAUSE')">
                 暂停策略
@@ -465,7 +465,7 @@ watch(
       <el-col :span="12">
         <el-card shadow="never">
           <template #header>引擎控制</template>
-          <div style="display:flex; gap:12px">
+          <div class="control-action-row">
             <el-button
               type="warning"
               :loading="loading"
@@ -640,15 +640,15 @@ watch(
       <el-alert v-if="riskPreview?.impact?.would_trigger_daily_loss || riskPreview?.impact?.would_trigger_drawdown"
         type="error" :closable="false" show-icon style="margin-bottom:12px"
         title="应用后将立即触发熔断并强制平仓" />
-      <el-space>
+      <div class="risk-actions">
         <el-button :loading="riskLoading" @click="previewRisk">预览影响</el-button>
         <el-button type="primary" :loading="riskLoading" @click="applyRisk">确认并立即应用</el-button>
-      </el-space>
+      </div>
     </el-card>
 
     <el-card shadow="never" style="margin-top:16px">
       <template #header>
-        <div style="display:flex; justify-content:space-between; align-items:center">
+        <div class="card-header-row">
           <span>命令历史</span>
           <el-button size="small" :icon="'Refresh'" @click="refreshAll">刷新</el-button>
         </div>
@@ -684,10 +684,32 @@ watch(
   margin-bottom: 12px;
 }
 
+.control-action-row,
+.risk-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.risk-actions {
+  flex-wrap: wrap;
+}
+
 @media (max-width: 767px) {
   .symbol-add {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .control-action-row,
+  .risk-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .control-action-row .el-button,
+  .risk-actions .el-button {
+    width: 100%;
   }
 }
 </style>

@@ -344,6 +344,24 @@ html.dark .el-card {
     height: min(58dvh, 560px) !important;
   }
 
+  .el-table__fixed,
+  .el-table__fixed-right,
+  .el-table__fixed-left,
+  .el-table__fixed-right-patch {
+    display: none !important;
+  }
+
+  .el-table__body-wrapper,
+  .el-table__header-wrapper {
+    overflow-x: auto;
+  }
+
+  .el-table td,
+  .el-table th {
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
   .page .el-table__body-wrapper,
   .page .el-scrollbar__wrap {
     -webkit-overflow-scrolling: touch;
@@ -423,6 +441,13 @@ html.dark .el-card {
     max-width: 420px;
   }
 
+  .el-alert__content,
+  .el-alert__title {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
   .el-date-editor--datetimerange.el-input__wrapper,
   .el-date-editor--daterange.el-input__wrapper {
     width: 100% !important;
@@ -451,5 +476,9 @@ html.dark .el-card {
 
   .page .el-button + .el-button {
     margin-left: 0;
+  }
+
+  .page .el-button {
+    min-height: 36px;
   }
 }
