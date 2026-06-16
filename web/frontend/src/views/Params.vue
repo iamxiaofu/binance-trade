@@ -79,17 +79,29 @@ const engineFieldHelp = {
   micro_range_5m_trigger_pct: '1m 微观数据最近 5 分钟价格区间百分比阈值。',
 }
 
-const executionFields = [
-  { key: 'entry_mode', label: '开仓执行模式', type: 'select', options: ['MAKER_FIRST', 'MAKER_ONLY', 'MARKET_TAKER'] },
+const executionModeField = {
+  key: 'entry_mode',
+  label: '开仓执行模式',
+  type: 'select',
+  options: ['MAKER_FIRST', 'MAKER_ONLY', 'MARKET_TAKER'],
+}
+const executionDetailFields = [
   { key: 'maker_timeout_seconds', label: '单次 maker 等待超时（秒）', min: 1, max: 120, step: 1 },
   { key: 'maker_poll_seconds', label: 'maker 订单轮询间隔（秒）', min: 0.1, max: 10, step: 0.1 },
   { key: 'maker_max_requotes', label: 'maker 重新挂单次数', min: 0, max: 10, step: 1 },
   { key: 'maker_price_offset_bps', label: 'maker 挂单偏移（bps）', min: 0, max: 100, step: 0.1 },
-  { key: 'maker_unfilled_action', label: 'maker 未成交处理', type: 'select', options: ['FALLBACK_MARKET', 'CANCEL'] },
   { key: 'market_slippage_bps', label: '市价兜底滑点上限（bps）', min: 0.1, max: 100, step: 0.1 },
   { key: 'max_order_retries', label: '下单瞬时错误重试次数', min: 0, max: 10, step: 1 },
   { key: 'rate_limit_backoff', label: '限频/网络错误退避倍数', min: 1.01, max: 10, step: 0.1 },
 ]
+const executionFields = [executionModeField, ...executionDetailFields]
+const makerUnfilledField = {
+  key: 'maker_unfilled_action',
+  label: 'maker 未成交处理',
+  type: 'select',
+  options: ['FALLBACK_MARKET', 'CANCEL'],
+}
+const allExecutionFields = [...executionFields, makerUnfilledField]
 const executionFieldHelp = {
   entry_mode: 'MAKER_FIRST 先挂 post-only 限价，未成交按配置兜底；MAKER_ONLY 不兜底；MARKET_TAKER 直接市价。',
   maker_timeout_seconds: '每次 maker 挂单等待成交的最长时间。总最坏等待约等于 (重新挂单次数 + 1) × 该值。',
@@ -167,6 +179,7 @@ async function loadExecution() {
         ? executionState.value.effective[field.key]
         : Number(executionState.value.effective[field.key]),
     ])),
+    maker_unfilled_action: executionState.value.effective.maker_unfilled_action,
     market_slippage_bps_per_symbol: {
       ...(executionState.value.effective.market_slippage_bps_per_symbol || {}),
     },
@@ -181,7 +194,7 @@ async function loadExecution() {
 }
 
 function executionPayload() {
-  const payload = Object.fromEntries(executionFields.map((field) => [
+  const payload = Object.fromEntries(allExecutionFields.map((field) => [
     field.key,
     field.type === 'select' ? executionForm.value[field.key] : Number(executionForm.value[field.key]),
   ]))
@@ -439,13 +452,31 @@ onMounted(() => {
       />
       <el-form v-if="executionState" label-width="260px">
         <el-row :gutter="16">
-          <el-col v-for="field in executionFields" :key="field.key" :span="12">
+          <el-col :span="12">
+            <el-form-item>
+              <template #label><span class="param-label">{{ executionModeField.label }}<el-tooltip :content="executionFieldHelp[executionModeField.key]" placement="top" effect="dark" :trigger="tooltipTrigger" popper-class="param-tooltip" :show-after="200"><span class="param-help">?</span></el-tooltip></span></template>
+              <el-select v-model="executionForm[executionModeField.key]" style="width:100%">
+                <el-option v-for="opt in executionModeField.options" :key="opt" :label="opt" :value="opt" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row v-if="executionForm.entry_mode === 'MAKER_FIRST'" :gutter="16">
+          <el-col :span="12">
+            <el-form-item>
+              <template #label><span class="param-label">{{ makerUnfilledField.label }}<el-tooltip :content="executionFieldHelp[makerUnfilledField.key]" placement="top" effect="dark" :trigger="tooltipTrigger" popper-class="param-tooltip" :show-after="200"><span class="param-help">?</span></el-tooltip></span></template>
+              <el-select v-model="executionForm[makerUnfilledField.key]" style="width:100%">
+                <el-option v-for="opt in makerUnfilledField.options" :key="opt" :label="opt" :value="opt" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-divider content-position="left">执行细节</el-divider>
+        <el-row :gutter="16">
+          <el-col v-for="field in executionDetailFields" :key="field.key" :span="12">
             <el-form-item>
               <template #label><span class="param-label">{{ field.label }}<el-tooltip :content="executionFieldHelp[field.key]" placement="top" effect="dark" :trigger="tooltipTrigger" popper-class="param-tooltip" :show-after="200"><span class="param-help">?</span></el-tooltip></span></template>
-              <el-select v-if="field.type === 'select'" v-model="executionForm[field.key]" style="width:100%">
-                <el-option v-for="opt in field.options" :key="opt" :label="opt" :value="opt" />
-              </el-select>
-              <el-input-number v-else v-model="executionForm[field.key]" :min="field.min" :max="field.max" :step="field.step" style="width:100%" />
+              <el-input-number v-model="executionForm[field.key]" :min="field.min" :max="field.max" :step="field.step" style="width:100%" />
             </el-form-item>
           </el-col>
         </el-row>
