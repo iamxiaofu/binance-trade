@@ -213,6 +213,13 @@ class PositionSnapshotRow(Base):
     leverage: Mapped[int] = mapped_column(Integer, default=0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     notional: Mapped[float] = mapped_column(Float, default=0.0)
+    initial_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    isolated_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    maintenance_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    roi_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    liquidation_price: Mapped[float] = mapped_column(Float, default=0.0)
+    margin_ratio: Mapped[float] = mapped_column(Float, default=0.0)
+    margin_mode: Mapped[str] = mapped_column(String(16), default="")
 
 
 class BalanceSnapshotRow(Base):
@@ -374,6 +381,13 @@ class LivePositionRow(Base):
     leverage: Mapped[int] = mapped_column(Integer, default=0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     notional: Mapped[float] = mapped_column(Float, default=0.0)
+    initial_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    isolated_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    maintenance_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    roi_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    liquidation_price: Mapped[float] = mapped_column(Float, default=0.0)
+    margin_ratio: Mapped[float] = mapped_column(Float, default=0.0)
+    margin_mode: Mapped[str] = mapped_column(String(16), default="")
     source: Mapped[str] = mapped_column(String(16), default="")
     updated_at_ms: Mapped[int] = mapped_column(Integer, default=0)
     raw_json: Mapped[str] = mapped_column(Text, default="")

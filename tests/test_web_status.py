@@ -71,7 +71,8 @@ async def db(tmp_path):
                        "notional": 1.1, "dry_run": False, "status": "filled", "id": "close", "raw": {}})
     await s.snapshot_positions([{"symbol": "BTC/USDT:USDT", "side": "long",
                                  "contracts": 0.01, "entryPrice": 100.0, "markPrice": 101.0,
-                                 "leverage": 3, "unrealizedPnl": 0.01}])
+                                 "leverage": 3, "unrealizedPnl": 0.01,
+                                 "initialMargin": 10.0, "liquidationPrice": 70.0}])
     rt = RuntimeState()
     await s.snapshot_balance(total_equity=200.0, available_margin=180.0, runtime=rt)
     await s.close()
@@ -87,6 +88,8 @@ async def test_recent_queries(db):
 async def test_latest_positions_and_balance(db):
     pos = status.latest_positions(db)
     assert len(pos) == 1 and pos[0]["symbol"] == "BTCUSDT"
+    assert pos[0]["roi_pct"] == 0.1
+    assert pos[0]["liquidation_price"] == 70.0
     bal = status.latest_balance(db)
     assert bal is not None and bal["total_equity"] == 200.0
 

@@ -109,6 +109,15 @@ _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("llm_status", "VARCHAR(16) NOT NULL DEFAULT ''"),
     ("llm_error", "VARCHAR(200) NOT NULL DEFAULT ''"),
 )
+_POSITION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("initial_margin", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("isolated_margin", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("maintenance_margin", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("roi_pct", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("liquidation_price", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("margin_ratio", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("margin_mode", "VARCHAR(16) NOT NULL DEFAULT ''"),
+)
 _LLM_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("api_key", "TEXT NOT NULL DEFAULT ''"),
     ("priority", "INTEGER NOT NULL DEFAULT 100"),
@@ -391,6 +400,14 @@ class Store:
         for name, ddl in _LLM_PROFILE_COLUMNS:
             if llm_profile_existing and name not in llm_profile_existing:
                 await conn.execute(text(f"ALTER TABLE llm_profiles ADD COLUMN {name} {ddl}"))
+        for table_name in ("position_snapshots", "live_positions"):
+            position_existing = {
+                row[1]
+                for row in (await conn.execute(text(f"PRAGMA table_info({table_name})"))).fetchall()
+            }
+            for name, ddl in _POSITION_EXTENSION_COLUMNS:
+                if position_existing and name not in position_existing:
+                    await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {ddl}"))
         for ddl in _SQLITE_INDEX_DDL:
             await conn.execute(text(ddl))
 
@@ -573,8 +590,12 @@ class Store:
                 symbol=pos["symbol"]
             )
             session.add(row)
-            for key in ("side", "contracts", "entry_price", "mark_price", "leverage",
-                        "unrealized_pnl", "notional"):
+            for key in (
+                "side", "contracts", "entry_price", "mark_price", "leverage",
+                "unrealized_pnl", "notional", "initial_margin", "isolated_margin",
+                "maintenance_margin", "roi_pct", "liquidation_price", "margin_ratio",
+                "margin_mode",
+            ):
                 setattr(row, key, pos[key])
             row.source = source
             row.updated_at_ms = int(pos.get("ts_ms") or _t.time() * 1000)
@@ -1701,6 +1722,13 @@ class Store:
                         leverage=pos["leverage"],
                         unrealized_pnl=pos["unrealized_pnl"],
                         notional=pos["notional"],
+                        initial_margin=pos["initial_margin"],
+                        isolated_margin=pos["isolated_margin"],
+                        maintenance_margin=pos["maintenance_margin"],
+                        roi_pct=pos["roi_pct"],
+                        liquidation_price=pos["liquidation_price"],
+                        margin_ratio=pos["margin_ratio"],
+                        margin_mode=pos["margin_mode"],
                     )
                 )
             await session.commit()

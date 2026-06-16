@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from decimal import Decimal
 
@@ -21,6 +22,7 @@ from src.store.models import (
     PositionClaimRow,
     PositionSnapshotRow,
     RejectRow,
+    LivePositionRow,
     RuntimeSettingRow,
     SymbolRow,
     TradeRow,
@@ -61,6 +63,63 @@ async def test_connect_creates_read_query_indexes(store):
     assert "ix_trades_symbol_opened_id" in trade_names
     assert "ix_trades_status_opened_id" in trade_names
     assert "ix_orders_trade_ts_id" in order_names
+
+
+async def test_connect_upgrades_position_projection_columns(tmp_path):
+    db_path = tmp_path / "old.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        """
+        CREATE TABLE live_positions (
+            symbol VARCHAR(20) PRIMARY KEY,
+            side VARCHAR(8),
+            contracts FLOAT,
+            entry_price FLOAT,
+            mark_price FLOAT,
+            leverage INTEGER,
+            unrealized_pnl FLOAT,
+            notional FLOAT,
+            source VARCHAR(16),
+            updated_at_ms INTEGER,
+            raw_json TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE position_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_ms INTEGER,
+            created_at VARCHAR(32),
+            symbol VARCHAR(20),
+            side VARCHAR(8),
+            contracts FLOAT,
+            entry_price FLOAT,
+            mark_price FLOAT,
+            leverage INTEGER,
+            unrealized_pnl FLOAT,
+            notional FLOAT
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+    s = Store(str(db_path))
+    await s.connect()
+    async with s._engine.connect() as conn:
+        live_cols = {
+            row[1] for row in (await conn.execute(text("PRAGMA table_info(live_positions)"))).fetchall()
+        }
+        snapshot_cols = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(position_snapshots)"))).fetchall()
+        }
+    await s.close()
+
+    for column in ("initial_margin", "isolated_margin", "roi_pct", "liquidation_price"):
+        assert column in live_cols
+        assert column in snapshot_cols
 
 
 async def test_log_actual_decision_with_context(store):
@@ -123,14 +182,50 @@ async def test_log_order_and_snapshots(store):
     positions = [{
         "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0.01,
         "entryPrice": 100.0, "markPrice": 101.0, "leverage": 3, "unrealizedPnl": 0.01,
+        "initialMargin": 10.0, "collateral": 10.01, "liquidationPrice": 70.0,
+        "marginRatio": 0.02, "marginMode": "isolated",
     }]
     await store.snapshot_positions(positions)
     assert await _count(store, PositionSnapshotRow) == 1
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        row = (await session.execute(select(PositionSnapshotRow))).scalars().one()
+    assert row.initial_margin == pytest.approx(10.0)
+    assert row.roi_pct == pytest.approx(0.1)
+    assert row.liquidation_price == pytest.approx(70.0)
 
     rt = RuntimeState()
     rt.day_realized_pnl = -5.0
     await store.snapshot_balance(total_equity=200.0, available_margin=180.0, runtime=rt)
     assert await _count(store, BalanceSnapshotRow) == 1
+
+
+async def test_live_position_state_includes_margin_roi_and_liquidation(store):
+    await store.upsert_live_position({
+        "symbol": "SOL/USDT:USDT",
+        "side": "short",
+        "contracts": 1.64,
+        "entryPrice": 74.27,
+        "markPrice": 74.38,
+        "unrealizedPnl": -0.1804,
+        "notional": 121.9832,
+        "initialMargin": 24.39664,
+        "collateral": 24.15579944,
+        "liquidationPrice": 88.66581692,
+        "marginRatio": 0.0252,
+        "marginMode": "isolated",
+    }, "rest")
+
+    state = await store.live_account_state()
+
+    assert await _count(store, LivePositionRow) == 1
+    pos = state["positions"][0]
+    assert pos["symbol"] == "SOLUSDT"
+    assert pos["initial_margin"] == pytest.approx(24.39664)
+    assert pos["isolated_margin"] == pytest.approx(24.15579944)
+    assert pos["roi_pct"] == pytest.approx(-0.1804 / 24.39664 * 100)
+    assert pos["liquidation_price"] == pytest.approx(88.66581692)
+    assert pos["margin_mode"] == "isolated"
 
 
 async def test_log_order_groups_short_trade_with_protection_and_close(store):
