@@ -501,19 +501,19 @@ async function cancelConditionOrder(order) {
           </span>
         </template>
       </el-alert>
-      <div v-if="displayPositions.length" class="mobile-position-list mobile-only">
+      <div v-if="displayPositions.length" class="position-card-list">
         <article
           v-for="row in displayPositions"
           :key="row.symbol"
-          class="mobile-position-card"
+          class="position-card"
           :class="[`side-${row.side || 'flat'}`, { 'needs-attention': needsRepair(row) || isSymbolDisabled(row.symbol) }]"
         >
-          <div class="mobile-position-head">
+          <div class="position-card-head">
             <div>
-              <div class="mobile-symbol">{{ row.symbol }}</div>
-              <div class="mobile-position-time">开仓于 {{ fmtTime(row.local_opened_at_ms) }}</div>
+              <div class="position-symbol">{{ row.symbol }}</div>
+              <div class="position-time">开仓于 {{ fmtTime(row.local_opened_at_ms) }}</div>
             </div>
-            <div class="mobile-position-tags">
+            <div class="position-tags">
               <el-tag
                 :type="row.side === 'long' ? 'success' : row.side === 'short' ? 'danger' : 'info'"
                 effect="dark"
@@ -524,22 +524,22 @@ async function cancelConditionOrder(order) {
             </div>
           </div>
 
-          <div class="mobile-position-pnl">
+          <div class="position-pnl">
             <div>
-              <span class="mobile-field-label">未实现盈亏</span>
+              <span class="position-field-label">未实现盈亏</span>
               <strong class="mono" :class="Number(row.unrealized_pnl) >= 0 ? 'pnl-pos' : 'pnl-neg'">
                 {{ fmt(row.unrealized_pnl, 2) }} USDT
               </strong>
             </div>
             <div>
-              <span class="mobile-field-label">保证金收益率</span>
+              <span class="position-field-label">保证金收益率</span>
               <strong class="mono" :class="Number(row.roi_pct) >= 0 ? 'pnl-pos' : 'pnl-neg'">
                 {{ fmtPct(row.roi_pct) }}
               </strong>
             </div>
           </div>
 
-          <div class="mobile-position-grid">
+          <div class="position-detail-grid">
             <div><span>持仓数量</span><strong class="mono">{{ fmt(row.contracts) }}</strong></div>
             <div><span>保证金</span><strong class="mono">{{ fmt(margin(row), 2) }}</strong></div>
             <div><span>开仓价</span><strong class="mono">{{ fmt(row.entry_price, 2) }}</strong></div>
@@ -556,29 +556,29 @@ async function cancelConditionOrder(order) {
             <div><span>强平价格</span><strong class="mono">{{ fmt(row.liquidation_price, 2) }}</strong></div>
           </div>
 
-          <div class="mobile-protection-grid">
+          <div class="position-protection-grid">
             <div>
-              <span class="mobile-field-label">止损保护</span>
+              <span class="position-field-label">止损保护</span>
               <el-tag :type="protectionTag(protection(row, 'SL'))" size="small">
                 {{ protectionText(protection(row, 'SL')) }}
               </el-tag>
             </div>
             <div>
-              <span class="mobile-field-label">止盈保护</span>
+              <span class="position-field-label">止盈保护</span>
               <el-tag :type="protectionTag(protection(row, 'TP'))" size="small">
                 {{ protectionText(protection(row, 'TP')) }}
               </el-tag>
             </div>
           </div>
 
-          <div class="mobile-position-actions">
-            <div class="mobile-position-actions__meta">
+          <div class="position-actions">
+            <div class="position-actions__meta">
               <el-tag v-if="isSymbolDisabled(row.symbol)" type="warning" size="small" effect="dark">
                 币种已禁用
               </el-tag>
               <el-tag v-else-if="!needsRepair(row)" type="success" size="small">保护完整</el-tag>
             </div>
-            <div class="mobile-position-actions__row">
+            <div v-if="needsRepair(row) || isSymbolDisabled(row.symbol)" class="position-actions__row">
               <template v-if="needsRepair(row)">
                 <el-button
                   type="danger"
@@ -601,7 +601,7 @@ async function cancelConditionOrder(order) {
                 启用并接管
               </el-button>
             </div>
-            <div class="mobile-position-actions__row mobile-position-actions__row--full">
+            <div class="position-actions__row position-actions__row--full">
               <el-button type="danger" plain size="small" @click="openManualClose(row)">
                 手动平仓
               </el-button>
@@ -609,115 +609,7 @@ async function cancelConditionOrder(order) {
           </div>
         </article>
       </div>
-      <el-empty v-else class="mobile-only" description="当前无持仓" :image-size="70" />
-
-      <el-table class="desktop-only" :data="displayPositions" stripe empty-text="当前无持仓">
-        <el-table-column prop="symbol" label="标的" width="120" />
-        <el-table-column label="方向" width="90">
-          <template #default="{ row }">
-            <el-tag
-              :type="row.side === 'long' ? 'success' : row.side === 'short' ? 'danger' : 'info'"
-              size="small"
-            >
-              {{ row.side === 'long' ? '多' : row.side === 'short' ? '空' : '—' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="contracts" label="持仓数量" width="120">
-          <template #default="{ row }"><span class="mono">{{ fmt(row.contracts) }}</span></template>
-        </el-table-column>
-        <el-table-column label="开仓价" width="120">
-          <template #default="{ row }"><span class="mono">{{ fmt(row.entry_price, 2) }}</span></template>
-        </el-table-column>
-        <el-table-column label="标记价" width="120">
-          <template #default="{ row }">
-            <span class="mono mark-value">
-              {{ fmt(row.mark_price, 2) }}
-              <el-tag v-if="row.market_realtime" type="success" size="small">
-                {{ marketPriceLabel(row) }}
-              </el-tag>
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="杠杆" width="80">
-          <template #default="{ row }">{{ Number(row.leverage) > 0 ? `${row.leverage}x` : '—' }}</template>
-        </el-table-column>
-        <el-table-column label="开仓时间" width="170">
-          <template #default="{ row }">{{ fmtTime(row.local_opened_at_ms) }}</template>
-        </el-table-column>
-        <el-table-column label="名义价值" width="120">
-          <template #default="{ row }"><span class="mono">{{ fmt(row.notional, 2) }}</span></template>
-        </el-table-column>
-        <el-table-column label="保证金" width="120">
-          <template #default="{ row }"><span class="mono">{{ fmt(margin(row), 2) }}</span></template>
-        </el-table-column>
-        <el-table-column label="投资回报率" width="120">
-          <template #default="{ row }">
-            <span class="mono" :class="Number(row.roi_pct) >= 0 ? 'pnl-pos' : 'pnl-neg'">
-              {{ fmtPct(row.roi_pct) }}
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="强平价格" width="120">
-          <template #default="{ row }"><span class="mono">{{ fmt(row.liquidation_price, 2) }}</span></template>
-        </el-table-column>
-        <el-table-column label="未实现盈亏" width="120">
-          <template #default="{ row }">
-            <span class="mono" :class="Number(row.unrealized_pnl) >= 0 ? 'pnl-pos' : 'pnl-neg'">
-              {{ fmt(row.unrealized_pnl, 2) }}
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="止损条件单" width="190">
-          <template #default="{ row }">
-            <el-tag :type="protectionTag(protection(row, 'SL'))" size="small">
-              {{ protectionText(protection(row, 'SL')) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="止盈条件单" width="190">
-          <template #default="{ row }">
-            <el-tag :type="protectionTag(protection(row, 'TP'))" size="small">
-              {{ protectionText(protection(row, 'TP')) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="340" fixed="right">
-          <template #default="{ row }">
-            <div class="action-buttons">
-              <el-tag v-if="isSymbolDisabled(row.symbol)" type="warning" size="small"
-                effect="dark" style="margin-right:6px">
-                币种已禁用
-              </el-tag>
-              <template v-if="needsRepair(row)">
-                <el-button
-                  type="danger"
-                  size="small"
-                  :icon="'CirclePlus'"
-                  :loading="isRepairing(row)"
-                  @click="repairProtection(row)"
-                >
-                  历史补单
-                </el-button>
-                <el-button size="small" @click="openTakeover(row)">接管保护</el-button>
-              </template>
-              <el-button
-                v-if="isSymbolDisabled(row.symbol)"
-                size="small"
-                type="success"
-                :loading="enabling[row.symbol]"
-                @click="enableSymbol(row)"
-              >
-                启用并自动接管
-              </el-button>
-              <el-tag v-else type="success" size="small">{{ missingProtectionText(row) }}</el-tag>
-              <el-button type="danger" plain size="small" @click="openManualClose(row)">
-                手动平仓
-              </el-button>
-            </div>
-          </template>
-        </el-table-column>
-      </el-table>
+      <el-empty v-else description="当前无持仓" :image-size="70" />
     </el-card>
 
     <el-dialog v-model="takeoverVisible" title="接管保护" width="520px">
@@ -1021,12 +913,6 @@ async function cancelConditionOrder(order) {
   font-size: 13px;
 }
 
-.action-buttons {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .protect-input {
   width: 180px;
 }
@@ -1052,6 +938,166 @@ async function cancelConditionOrder(order) {
   margin-bottom: 8px;
 }
 
+.position-card-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 12px;
+}
+
+.position-card {
+  min-width: 0;
+  padding: 14px;
+  overflow: hidden;
+  background: var(--bt-card);
+  border: 1px solid var(--bt-border);
+  border-left: 4px solid var(--bt-muted);
+  border-radius: 10px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.05);
+}
+
+.position-card.side-long {
+  border-left-color: #16a34a;
+}
+
+.position-card.side-short {
+  border-left-color: #dc2626;
+}
+
+.position-card.needs-attention {
+  border-top-color: #e6a23c;
+  border-right-color: #e6a23c;
+  border-bottom-color: #e6a23c;
+}
+
+.position-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.position-symbol {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.position-time {
+  margin-top: 3px;
+  color: var(--bt-muted);
+  font-size: 11px;
+}
+
+.position-tags {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.position-pnl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+  padding: 10px;
+  background: color-mix(in srgb, var(--bt-primary) 7%, transparent);
+  border-radius: 8px;
+}
+
+.position-pnl > div,
+.position-protection-grid > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.position-pnl strong {
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.position-field-label {
+  color: var(--bt-muted);
+  font-size: 11px;
+}
+
+.position-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  background: var(--bt-border);
+  border: 1px solid var(--bt-border);
+  border-radius: 8px;
+}
+
+.position-detail-grid > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px;
+  background: var(--bt-card);
+}
+
+.position-detail-grid span {
+  color: var(--bt-muted);
+  font-size: 11px;
+}
+
+.position-detail-grid strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.position-protection-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.position-protection-grid .el-tag {
+  max-width: 100%;
+  height: auto;
+  min-height: 24px;
+  padding: 3px 7px;
+  white-space: normal;
+  line-height: 1.25;
+}
+
+.position-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--bt-border);
+}
+
+.position-actions__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.position-actions__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.position-actions__row--full {
+  display: block;
+}
+
+.position-actions .el-tag {
+  max-width: 100%;
+  white-space: normal;
+  line-height: 1.3;
+}
+
 .mobile-only {
   display: none;
 }
@@ -1070,8 +1116,7 @@ async function cancelConditionOrder(order) {
     align-items: flex-start;
   }
 
-  .positions-meta,
-  .action-buttons {
+  .positions-meta {
     flex-wrap: wrap;
   }
 
@@ -1079,13 +1124,11 @@ async function cancelConditionOrder(order) {
     width: 100%;
   }
 
-  .mobile-position-list,
   .mobile-order-list {
     display: grid;
     gap: 10px;
   }
 
-  .mobile-position-card,
   .mobile-order-card {
     min-width: 0;
     padding: 12px;
@@ -1097,21 +1140,6 @@ async function cancelConditionOrder(order) {
     box-shadow: 0 3px 12px rgba(0, 0, 0, 0.05);
   }
 
-  .mobile-position-card.side-long {
-    border-left-color: #16a34a;
-  }
-
-  .mobile-position-card.side-short {
-    border-left-color: #dc2626;
-  }
-
-  .mobile-position-card.needs-attention {
-    border-top-color: #e6a23c;
-    border-right-color: #e6a23c;
-    border-bottom-color: #e6a23c;
-  }
-
-  .mobile-position-head,
   .mobile-order-head {
     display: flex;
     align-items: flex-start;
@@ -1119,51 +1147,11 @@ async function cancelConditionOrder(order) {
     gap: 8px;
   }
 
-  .mobile-symbol {
-    font-size: 18px;
-    font-weight: 700;
-  }
-
-  .mobile-position-time {
-    margin-top: 3px;
-    color: var(--bt-muted);
-    font-size: 11px;
-  }
-
-  .mobile-position-tags,
   .mobile-order-head > div {
     display: flex;
     flex: 0 0 auto;
     align-items: center;
     gap: 5px;
-  }
-
-  .mobile-position-pnl {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 8px;
-    margin: 12px 0;
-    padding: 10px;
-    background: color-mix(in srgb, var(--bt-primary) 7%, transparent);
-    border-radius: 8px;
-  }
-
-  .mobile-position-pnl > div,
-  .mobile-protection-grid > div {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .mobile-position-pnl strong {
-    font-size: 16px;
-    overflow-wrap: anywhere;
-  }
-
-  .mobile-field-label {
-    color: var(--bt-muted);
-    font-size: 11px;
   }
 
   .mobile-position-grid {
@@ -1200,62 +1188,35 @@ async function cancelConditionOrder(order) {
     margin: 10px 0;
   }
 
-  .mobile-protection-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 8px;
-    margin-top: 10px;
+  .position-card-list {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
   }
 
-  .mobile-protection-grid .el-tag {
-    max-width: 100%;
-    height: auto;
-    min-height: 24px;
-    padding: 3px 7px;
-    white-space: normal;
-    line-height: 1.25;
+  .position-card {
+    padding: 12px;
   }
 
-  .mobile-position-actions {
-    display: grid;
-    gap: 8px;
-    margin-top: 12px;
-    padding-top: 10px;
-    border-top: 1px solid var(--bt-border);
-  }
-
-  .mobile-position-actions__meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-
-  .mobile-position-actions__row {
+  .position-actions__row {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
   }
 
-  .mobile-position-actions__row--full {
+  .position-actions__row--full {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .mobile-position-actions .el-tag,
-  .mobile-position-actions .el-button,
+  .position-actions .el-tag,
+  .position-actions .el-button,
   .mobile-order-card > .el-button {
     min-height: 36px;
   }
 
-  .mobile-position-actions .el-button {
+  .position-actions .el-button {
     width: 100%;
     min-width: 0;
     white-space: normal;
-  }
-
-  .mobile-position-actions .el-tag {
-    max-width: 100%;
-    white-space: normal;
-    line-height: 1.3;
   }
 
   .mobile-order-card {
