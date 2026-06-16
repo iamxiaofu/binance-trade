@@ -361,28 +361,32 @@ class MakerPartialClient(FakeClient):
     def __init__(self):
         super().__init__()
         self.canceled: list[tuple] = []
+        self.amount_by_order_id: dict[str, float] = {}
 
     async def fetch_order_book(self, symbol, limit=5):
         return {"bids": [[100.0, 10]], "asks": [[100.2, 10]]}
 
     async def create_order(self, symbol, side, amount, order_type="market", price=None, params=None):
         self.created.append((symbol, side, amount, order_type, price, params))
+        order_id = f"maker-{len(self.created)}"
+        self.amount_by_order_id[order_id] = float(amount)
         return {
-            "id": "maker-1",
+            "id": order_id,
             "price": price,
             "filled": 0.0,
             "status": "open",
-            "info": {"orderId": "maker-1", "clientOrderId": params["newClientOrderId"]},
+            "info": {"orderId": order_id, "clientOrderId": params["newClientOrderId"]},
         }
 
     async def fetch_order(self, symbol, order_id, params=None):
+        filled = min(0.02, self.amount_by_order_id.get(order_id, 0.02))
         return {
             "id": order_id,
             "price": 100.0,
             "average": 100.0,
-            "filled": 0.02,
+            "filled": filled,
             "status": "open",
-            "info": {"status": "PARTIALLY_FILLED", "executedQty": "0.02"},
+            "info": {"status": "PARTIALLY_FILLED", "executedQty": str(filled)},
         }
 
     async def cancel_order(self, symbol, order_id, params=None):
@@ -424,15 +428,22 @@ async def test_maker_open_accumulates_partial_fills_across_attempts(settings):
     settings.execution.maker_poll_seconds = 0.01
     settings.execution.maker_max_requotes = 4
     client = MakerPartialClient()
+    client._f = SymbolFilters(
+        tick_size=Decimal("0.1"),
+        step_size=Decimal("0.001"),
+        min_qty=Decimal("0.001"),
+        min_notional=Decimal("1"),
+    )
     ex = Executor(client, settings)
 
-    # 每次 attempt 返回 0.02 部分成交，3 次累计 0.06 >= 0.05 → filled
+    # 每次按剩余量重挂，最后一次只请求 0.01，累计正好 0.05 → filled
     res = await ex.open_position(decision=_decision(), qty=0.05, price=100.0)
 
     assert res["status"] == "filled"
-    assert res["qty"] == pytest.approx(0.06)
+    assert res["qty"] == pytest.approx(0.05)
     assert res["remaining_qty"] == pytest.approx(0.0)
-    # 3 次 attempt 后累计达到计划量，应该停止重试
+    assert [row[2] for row in client.created] == pytest.approx([0.05, 0.03, 0.01])
+    # 3 次 attempt 后累计达到计划量，应该停止重试，不能再用原始数量重挂
     assert len(client.created) == 3
 
 
@@ -450,6 +461,7 @@ async def test_maker_open_partial_cumulative_below_target_returns_partial(settin
     assert res["status"] == "partial"
     assert res["qty"] == pytest.approx(0.06)  # 3 × 0.02
     assert res["remaining_qty"] == pytest.approx(0.04)
+    assert [row[2] for row in client.created] == pytest.approx([0.10, 0.08, 0.06])
 
 
 class MakerUnfilledClient(MakerPartialClient):

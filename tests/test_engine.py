@@ -465,6 +465,10 @@ class FakeExecutor:
         self.canceled = 0
         self.opened = []
         self.closed = []
+        self.execution_config = None
+
+    def apply_execution_config(self, config):
+        self.execution_config = config
 
     async def flatten_all(self, symbols=None):
         self.flattened += 1
@@ -636,6 +640,45 @@ async def test_runtime_engine_update_is_versioned_and_applied(settings, creds, m
     assert eng._engine_version == 3
     assert '"version": 3' in result
     assert eng._store.runtime_settings["engine.version"] == "3"
+
+
+async def test_runtime_execution_update_is_versioned_and_applied(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._execution_version = 2
+    result = await eng._update_execution_settings(json.dumps({
+        "expected_version": 2,
+        "entry_mode": "MAKER_FIRST",
+        "maker_timeout_seconds": 12,
+        "maker_price_offset_bps": 2.5,
+        "maker_unfilled_action": "FALLBACK_MARKET",
+        "market_slippage_bps_per_symbol": {"BTCUSDT": 9},
+    }))
+
+    assert eng._settings.execution.entry_mode.value == "MAKER_FIRST"
+    assert eng._settings.execution.maker_timeout_seconds == pytest.approx(12)
+    assert eng._settings.execution.maker_price_offset_bps == pytest.approx(2.5)
+    assert eng._executor.execution_config is eng._settings.execution
+    assert eng._execution_version == 3
+    assert '"version": 3' in result
+    assert eng._store.runtime_settings["execution.version"] == "3"
+
+
+async def test_runtime_execution_settings_applied_on_startup(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.runtime_settings.update({
+        "execution.effective": json.dumps({
+            "entry_mode": "MAKER_ONLY",
+            "maker_timeout_seconds": 9,
+        }),
+        "execution.version": "4",
+    })
+
+    await eng._apply_runtime_settings()
+
+    assert eng._settings.execution.entry_mode.value == "MAKER_ONLY"
+    assert eng._settings.execution.maker_timeout_seconds == pytest.approx(9)
+    assert eng._execution_version == 4
+    assert eng._executor.execution_config is eng._settings.execution
 
 
 async def test_mainnet_runtime_settings_force_restart_pause(settings, creds, monkeypatch):
@@ -1618,6 +1661,28 @@ async def test_sleep_consumes_engine_update_and_wakes_strategy(settings, creds, 
 
     assert time.monotonic() - started < 0.2
     assert eng._engine_settings.cycle_interval_seconds == 90
+    assert eng._store.marked[0][0:2] == (1, "done")
+
+
+async def test_sleep_consumes_execution_update_and_wakes_strategy(settings, creds, monkeypatch):
+    monkeypatch.setattr(engine_loop, "_COMMAND_POLL_INTERVAL_SECONDS", 0.01)
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.halt_new_entries = False
+    eng._store.pending = [{
+        "id": 1,
+        "command": "UPDATE_EXECUTION_SETTINGS",
+        "arg": json.dumps({
+            "expected_version": 0,
+            "entry_mode": "MAKER_FIRST",
+        }),
+    }]
+    cycle_start = time.monotonic() - 1.0
+
+    started = time.monotonic()
+    await eng._sleep_to_next_cycle(cycle_start)
+
+    assert time.monotonic() - started < 0.2
+    assert eng._settings.execution.entry_mode.value == "MAKER_FIRST"
     assert eng._store.marked[0][0:2] == (1, "done")
 
 

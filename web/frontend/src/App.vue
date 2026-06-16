@@ -19,6 +19,7 @@ const menu = [
   { index: '/orders', title: '交易记录', icon: 'List' },
   { index: '/pnl', title: '盈亏统计', icon: 'Money' },
   { index: '/control', title: '操作面板', icon: 'SetUp' },
+  { index: '/params', title: '参数控制', icon: 'Operation' },
   { index: '/llm', title: 'LLM 配置', icon: 'Cpu' },
 ]
 

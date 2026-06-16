@@ -113,7 +113,7 @@ export const api = {
     const highRisk = new Set([
       'KILL_SWITCH', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED',
       'CLOSE_POSITION', 'CANCEL_AND_FLATTEN', 'STOP_ENGINE',
-      'UPDATE_RISK_SETTINGS', 'UPDATE_ENGINE_SETTINGS',
+      'UPDATE_RISK_SETTINGS', 'UPDATE_ENGINE_SETTINGS', 'UPDATE_EXECUTION_SETTINGS',
     ])
     const token = highRisk.has(name) ? await mainnetConfirmation(name, arg) : ''
     return req(`/api/command/${name}?${qs({ arg, confirmation_token: token })}`, { method: 'POST' })
@@ -136,6 +136,17 @@ export const api = {
     const commandPayload = JSON.stringify({ expected_version: payload.expected_version, ...payload.values })
     const confirmation_token = await mainnetConfirmation('UPDATE_ENGINE_SETTINGS', commandPayload)
     return req('/api/engine-settings/apply', {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, confirmation_token }),
+    })
+  },
+  executionSettings: () => req('/api/execution-settings'),
+  executionPreview: (payload) =>
+    req('/api/execution-settings/preview', { method: 'POST', body: JSON.stringify(payload) }),
+  executionApply: async (payload) => {
+    const commandPayload = JSON.stringify({ expected_version: payload.expected_version, ...payload.values })
+    const confirmation_token = await mainnetConfirmation('UPDATE_EXECUTION_SETTINGS', commandPayload)
+    return req('/api/execution-settings/apply', {
       method: 'POST',
       body: JSON.stringify({ ...payload, confirmation_token }),
     })

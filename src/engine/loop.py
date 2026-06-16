@@ -24,6 +24,16 @@ from src.exchange.orders import normalize_condition_order
 from src.exchange.positions import normalize_position, normalize_symbol
 from src.exchange.user_stream import BinanceUserDataStream
 from src.execution.executor import Executor, realized_pnl
+from src.execution.settings import (
+    RUNTIME_EXECUTION_KEY,
+    RUNTIME_EXECUTION_VERSION_KEY,
+    decode_execution,
+    encode_execution,
+    execution_defaults_from_settings,
+    execution_public,
+    execution_runtime_to_config,
+    validate_execution_payload,
+)
 from src.engine.settings import (
     RUNTIME_ENGINE_KEY,
     RUNTIME_ENGINE_VERSION_KEY,
@@ -118,6 +128,10 @@ class TradingEngine:
         self._engine_defaults = engine_defaults_from_settings(settings)
         self._engine_settings = self._engine_defaults.model_copy(deep=True)
         self._engine_version = 0
+        self._execution_base = settings.execution.model_copy(deep=True)
+        self._execution_defaults = execution_defaults_from_settings(settings)
+        self._execution_settings = self._execution_defaults.model_copy(deep=True)
+        self._execution_version = 0
         self._stream_halted_entries = False
         self._private_invariant_task: asyncio.Task | None = None
         self._stream_verify_task: asyncio.Task | None = None
@@ -602,7 +616,12 @@ class TradingEngine:
             if cmd.get("status") != "done":
                 continue
             name = cmd.get("command")
-            if name in ("RESUME", "RESUME_ALL_SYMBOLS", "UPDATE_ENGINE_SETTINGS"):
+            if name in (
+                "RESUME",
+                "RESUME_ALL_SYMBOLS",
+                "UPDATE_ENGINE_SETTINGS",
+                "UPDATE_EXECUTION_SETTINGS",
+            ):
                 return True
             if name == "SET_SYMBOL_ENABLED" and not self.runtime.halt_new_entries:
                 enabled = self._symbol_enabled_arg_value(cmd.get("arg", ""))
@@ -666,6 +685,8 @@ class TradingEngine:
             return await self._update_risk_settings(arg)
         if name == "UPDATE_ENGINE_SETTINGS":
             return await self._update_engine_settings(arg)
+        if name == "UPDATE_EXECUTION_SETTINGS":
+            return await self._update_execution_settings(arg)
         if name == "RESUME_ALL_SYMBOLS":
             return await self._resume_all_symbols()
         if name == "SET_SYMBOL_ENABLED":
@@ -702,6 +723,8 @@ class TradingEngine:
         raw_version = await self._store.get_runtime_setting(RUNTIME_RISK_VERSION_KEY)
         raw_engine = await self._store.get_runtime_setting(RUNTIME_ENGINE_KEY)
         raw_engine_version = await self._store.get_runtime_setting(RUNTIME_ENGINE_VERSION_KEY)
+        raw_execution = await self._store.get_runtime_setting(RUNTIME_EXECUTION_KEY)
+        raw_execution_version = await self._store.get_runtime_setting(RUNTIME_EXECUTION_VERSION_KEY)
         raw_equity_peak = await self._store.get_runtime_setting("risk.equity_peak")
         try:
             self.runtime.equity_peak = max(float(raw_equity_peak or 0.0), 0.0)
@@ -730,6 +753,29 @@ class TradingEngine:
             await self._store.set_runtime_settings({
                 RUNTIME_ENGINE_KEY: encode_engine(self._engine_settings),
                 RUNTIME_ENGINE_VERSION_KEY: str(self._engine_version),
+            })
+        try:
+            self._execution_settings = decode_execution(
+                raw_execution,
+                self._execution_defaults,
+                allowed_symbols=set(self._tracked_symbols()),
+            )
+            self._execution_version = int(raw_execution_version or 0)
+            execution_config = execution_runtime_to_config(
+                self._execution_settings, self._execution_base
+            )
+            self._settings.execution = execution_config
+            self._executor.apply_execution_config(execution_config)
+        except Exception as e:
+            self.runtime.halt_entries(f"invalid runtime execution settings: {e}")
+            logger.error("invalid runtime execution settings; keeping yaml defaults: {}", e)
+            self._execution_settings = self._execution_defaults.model_copy(deep=True)
+            self._settings.execution = self._execution_base.model_copy(deep=True)
+            self._executor.apply_execution_config(self._settings.execution)
+        if raw_execution is None:
+            await self._store.set_runtime_settings({
+                RUNTIME_EXECUTION_KEY: encode_execution(self._execution_settings),
+                RUNTIME_EXECUTION_VERSION_KEY: str(self._execution_version),
             })
         raw_paused = await self._store.get_runtime_setting("strategy.paused")
         if self._settings.is_mainnet:
@@ -807,6 +853,35 @@ class TradingEngine:
         return json.dumps({
             "version": self._engine_version,
             "effective": engine_public(updated),
+        }, sort_keys=True)
+
+    async def _update_execution_settings(self, arg: str) -> str:
+        payload = json.loads(arg or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("UPDATE_EXECUTION_SETTINGS requires a JSON object")
+        expected_version = int(payload.pop("expected_version", -1))
+        if expected_version != self._execution_version:
+            raise ValueError(
+                f"execution settings version conflict: expected {expected_version}, "
+                f"current {self._execution_version}"
+            )
+        updated = validate_execution_payload(
+            payload,
+            self._execution_settings,
+            allowed_symbols=set(self._tracked_symbols()),
+        )
+        execution_config = execution_runtime_to_config(updated, self._execution_base)
+        self._execution_settings = updated
+        self._settings.execution = execution_config
+        self._executor.apply_execution_config(execution_config)
+        self._execution_version += 1
+        await self._store.set_runtime_settings({
+            RUNTIME_EXECUTION_KEY: encode_execution(updated),
+            RUNTIME_EXECUTION_VERSION_KEY: str(self._execution_version),
+        })
+        return json.dumps({
+            "version": self._execution_version,
+            "effective": execution_public(updated),
         }, sort_keys=True)
 
     async def _set_symbol_enabled(self, arg: str) -> str:

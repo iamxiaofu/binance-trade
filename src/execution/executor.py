@@ -111,6 +111,12 @@ class Executor:
     def set_account_state(self, account_state) -> None:
         self._account_state = account_state
 
+    def apply_execution_config(self, config: ExecutionConfig) -> None:
+        """Hot-swap runtime execution settings used by subsequent orders."""
+        self._cfg = config
+        self._settings.execution = config
+        self._policy = ExecutionPolicy(config)
+
     async def _wait_private_confirmation(self, client_order_id: str) -> None:
         if not client_order_id or self._account_state is None:
             return
@@ -574,6 +580,8 @@ class Executor:
 
         last_rejected: dict | None = None
         attempts = self._cfg.maker_max_requotes + 1
+        target_qty = qty
+        last_limit_price = price
         # 累计跨 attempt 的真实成交：B2/B3 修复：避免 race 下「attempt 1
         # 已部分成交但 fetch_order 返回 -2013」导致那部分成交被后续 attempt 覆盖。
         cumulative_filled = 0.0
@@ -583,6 +591,9 @@ class Executor:
         winning_attempt: dict | None = None
         attempt_order_ids: list[str] = []
         for attempt in range(attempts):
+            remaining_target_qty = max(target_qty - cumulative_filled, 0.0)
+            if remaining_target_qty <= 1e-12:
+                break
             quote = await self._policy.maker_quote(
                 client=self._client,
                 symbol=symbol,
@@ -590,17 +601,19 @@ class Executor:
                 fallback_price=price,
                 filters=f,
             )
-            norm = normalize_order(qty=qty, price=quote.price, f=f, is_market=False)
+            norm = normalize_order(qty=remaining_target_qty, price=quote.price, f=f, is_market=False)
             if norm is None:
                 logger.warning(
                     "[{}] maker normalize below min (qty={}, price={}) -> reject",
-                    symbol, qty, quote.price,
+                    symbol, remaining_target_qty, quote.price,
                 )
+                if winning_attempt is not None and cumulative_filled > 0:
+                    break
                 return _result(
                     symbol=symbol,
                     kind="OPEN",
                     side=side,
-                    qty=qty,
+                    qty=target_qty,
                     price=quote.price,
                     notional=0.0,
                     dry_run=False,
@@ -609,12 +622,15 @@ class Executor:
                     order_type="limit",
                     execution_mode=mode.value,
                     time_in_force=self._cfg.maker_time_in_force,
-                    requested_qty=qty,
+                    requested_qty=target_qty,
                     requested_price=price,
                     limit_price=quote.price,
                 )
             q = float(norm.qty)
+            if attempt == 0 and cumulative_filled <= 0:
+                target_qty = q
             limit_price = float(norm.price or quote.price)
+            last_limit_price = limit_price
             client_order_id = self._client_order_id(symbol=symbol, kind="OPEN", side=side)
             params = {
                 "timeInForce": self._cfg.maker_time_in_force,
@@ -688,7 +704,7 @@ class Executor:
                     "liquidity": liquidity,
                 }
                 # 已达到计划量，提前收尾（不再发后续 attempt）
-                if cumulative_filled >= q - 1e-12:
+                if cumulative_filled >= target_qty - 1e-12:
                     break
                 # 否则继续下一 attempt 补足
                 continue
@@ -705,7 +721,7 @@ class Executor:
         # 收尾：若任一 attempt 有过成交，按累计成交出 partial/filled 结果
         if winning_attempt is not None and cumulative_filled > 0:
             cum_avg = (cumulative_cost / cumulative_filled) if cumulative_filled > 0 else winning_attempt["avg_px"]
-            cum_status = "filled" if cumulative_filled >= q - 1e-12 else "partial"
+            cum_status = "filled" if cumulative_filled >= target_qty - 1e-12 else "partial"
             raw = {
                 "order": winning_attempt["order"],
                 "initial_order": winning_attempt["initial_order"],
@@ -729,10 +745,10 @@ class Executor:
                 order_type="limit",
                 execution_mode=mode.value,
                 time_in_force=self._cfg.maker_time_in_force,
-                requested_qty=q,
+                requested_qty=target_qty,
                 requested_price=price,
-                limit_price=limit_price,
-                remaining_qty=max(q - cumulative_filled, 0.0),
+                limit_price=last_limit_price,
+                remaining_qty=max(target_qty - cumulative_filled, 0.0),
                 liquidity=winning_attempt["liquidity"],
                 fee=cumulative_fee,
                 fee_asset=cumulative_fee_asset,
@@ -746,7 +762,7 @@ class Executor:
         # 万一 _wait_maker_fill 的 _recover_via_my_trades 没命中（极少见：API 临时
         # 把 myTrades 也搞挂了），这里兜底再查一次。
         residual = await self._reconcile_maker_residual_fills(
-            symbol=symbol, order_ids=attempt_order_ids, fallback_price=limit_price,
+            symbol=symbol, order_ids=attempt_order_ids, fallback_price=last_limit_price,
         )
         if residual is not None and residual["filled"] > 0:
             res = _result(
@@ -757,16 +773,16 @@ class Executor:
                 price=residual["avg_price"],
                 notional=residual["cost"],
                 dry_run=False,
-                status="partial" if residual["filled"] < q - 1e-12 else "filled",
+                status="partial" if residual["filled"] < target_qty - 1e-12 else "filled",
                 order_id=str(residual["order_id"] or ""),
                 raw={"reason": "residual myTrades reconcile", "residual": residual},
                 order_type="limit",
                 execution_mode=mode.value,
                 time_in_force=self._cfg.maker_time_in_force,
-                requested_qty=q,
+                requested_qty=target_qty,
                 requested_price=price,
-                limit_price=limit_price,
-                remaining_qty=max(q - residual["filled"], 0.0),
+                limit_price=last_limit_price,
+                remaining_qty=max(target_qty - residual["filled"], 0.0),
                 liquidity="maker",
                 fee=residual["fee"],
                 fee_asset=residual["fee_asset"],
@@ -796,7 +812,7 @@ class Executor:
             order_type="limit",
             execution_mode=mode.value,
             time_in_force=self._cfg.maker_time_in_force,
-            requested_qty=qty,
+            requested_qty=target_qty,
             requested_price=price,
         )
 

@@ -37,6 +37,15 @@ from src.engine.settings import (
     engine_public,
     validate_engine_payload,
 )
+from src.execution.settings import (
+    RUNTIME_EXECUTION_KEY,
+    RUNTIME_EXECUTION_VERSION_KEY,
+    decode_execution,
+    execution_defaults_from_settings,
+    execution_fixed_public,
+    execution_public,
+    validate_execution_payload,
+)
 from src.risk.settings import (
     RUNTIME_RISK_KEY,
     RUNTIME_RISK_VERSION_KEY,
@@ -531,6 +540,13 @@ async def api_config(_: str = Depends(_check_auth)):
         await store.get_runtime_setting(RUNTIME_ENGINE_KEY), engine_defaults
     )
     engine_version = int(await store.get_runtime_setting(RUNTIME_ENGINE_VERSION_KEY) or 0)
+    execution_defaults = execution_defaults_from_settings(s)
+    effective_execution = decode_execution(
+        await store.get_runtime_setting(RUNTIME_EXECUTION_KEY),
+        execution_defaults,
+        allowed_symbols=set(symbols),
+    )
+    execution_version = int(await store.get_runtime_setting(RUNTIME_EXECUTION_VERSION_KEY) or 0)
     return {
         "mode": s.mode.value,
         "db_path": s.storage.db_path,
@@ -550,6 +566,10 @@ async def api_config(_: str = Depends(_check_auth)):
         "engine": engine_public(effective_engine),
         "engine_defaults": engine_public(engine_defaults),
         "engine_version": engine_version,
+        "execution": execution_public(effective_execution),
+        "execution_defaults": execution_public(execution_defaults),
+        "execution_fixed": execution_fixed_public(s.execution),
+        "execution_version": execution_version,
         "user_stream": await _stream_status(),
     }
 
@@ -633,12 +653,13 @@ _ALLOWED_COMMANDS = {
     "SWITCH_LLM_PROFILE",
     "UPDATE_RISK_SETTINGS",
     "UPDATE_ENGINE_SETTINGS",
+    "UPDATE_EXECUTION_SETTINGS",
 }
 
 _MAINNET_HIGH_RISK_COMMANDS = {
     "KILL_SWITCH", "RESUME", "RESUME_ALL_SYMBOLS", "SET_SYMBOL_ENABLED",
     "CLOSE_POSITION", "CANCEL_AND_FLATTEN", "STOP_ENGINE",
-    "UPDATE_RISK_SETTINGS", "UPDATE_ENGINE_SETTINGS",
+    "UPDATE_RISK_SETTINGS", "UPDATE_ENGINE_SETTINGS", "UPDATE_EXECUTION_SETTINGS",
 }
 
 
@@ -693,6 +714,12 @@ class _RiskUpdateRequest(BaseModel):
 
 
 class _EngineUpdateRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+    values: dict[str, Any]
+    confirmation_token: str = ""
+
+
+class _ExecutionUpdateRequest(BaseModel):
     expected_version: int = Field(ge=0)
     values: dict[str, Any]
     confirmation_token: str = ""
@@ -884,6 +911,103 @@ async def api_engine_settings_apply(
         "UPDATE_ENGINE_SETTINGS", arg=payload, source=f"web:{user}"
     )
     return {"queued": True, "id": cmd_id, "command": "UPDATE_ENGINE_SETTINGS"}
+
+
+async def _execution_allowed_symbols() -> set[str]:
+    rows = await _symbol_rows()
+    symbols = {str(row["symbol"]).upper() for row in rows if row.get("symbol")}
+    return symbols or set(_settings.symbols)
+
+
+def _execution_impact(after: dict[str, Any]) -> dict[str, Any]:
+    attempts = int(after["maker_max_requotes"]) + 1
+    timeout = float(after["maker_timeout_seconds"])
+    return {
+        "maker_attempts": attempts,
+        "worst_maker_wait_seconds": round(attempts * timeout, 3),
+        "fallback_market": after["maker_unfilled_action"] == "FALLBACK_MARKET",
+        "entry_mode": after["entry_mode"],
+        "market_slippage_bps": after["market_slippage_bps"],
+    }
+
+
+@app.get("/api/execution-settings")
+async def api_execution_settings(_: str = Depends(_check_auth)):
+    store = await _get_store()
+    defaults = execution_defaults_from_settings(_settings)
+    effective = decode_execution(
+        await store.get_runtime_setting(RUNTIME_EXECUTION_KEY),
+        defaults,
+        allowed_symbols=await _execution_allowed_symbols(),
+    )
+    version = int(await store.get_runtime_setting(RUNTIME_EXECUTION_VERSION_KEY) or 0)
+    return {
+        "mode": _settings.mode.value,
+        "version": version,
+        "defaults": execution_public(defaults),
+        "effective": execution_public(effective),
+        "fixed": execution_fixed_public(_settings.execution),
+    }
+
+
+@app.post("/api/execution-settings/preview")
+async def api_execution_settings_preview(
+    body: _ExecutionUpdateRequest,
+    _: str = Depends(_check_auth),
+):
+    store = await _get_store()
+    defaults = execution_defaults_from_settings(_settings)
+    allowed_symbols = await _execution_allowed_symbols()
+    current = decode_execution(
+        await store.get_runtime_setting(RUNTIME_EXECUTION_KEY),
+        defaults,
+        allowed_symbols=allowed_symbols,
+    )
+    current_version = int(await store.get_runtime_setting(RUNTIME_EXECUTION_VERSION_KEY) or 0)
+    if body.expected_version != current_version:
+        raise HTTPException(status_code=409, detail=f"version conflict: current={current_version}")
+    try:
+        updated = validate_execution_payload(
+            body.values,
+            current,
+            allowed_symbols=allowed_symbols,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    before = execution_public(current)
+    after = execution_public(updated)
+    return {
+        "mode": _settings.mode.value,
+        "version": current_version,
+        "changes": {
+            key: {"before": before[key], "after": after[key]}
+            for key in after if before[key] != after[key]
+        },
+        "effective": after,
+        "fixed": execution_fixed_public(_settings.execution),
+        "impact": _execution_impact(after),
+    }
+
+
+@app.post("/api/execution-settings/apply")
+async def api_execution_settings_apply(
+    body: _ExecutionUpdateRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    user: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    payload = json.dumps(
+        {"expected_version": body.expected_version, **body.values},
+        sort_keys=True, separators=(",", ":"),
+    )
+    _consume_confirmation(body.confirmation_token, "UPDATE_EXECUTION_SETTINGS", payload)
+    store = await _get_store()
+    cmd_id = await store.enqueue_command(
+        "UPDATE_EXECUTION_SETTINGS", arg=payload, source=f"web:{user}"
+    )
+    return {"queued": True, "id": cmd_id, "command": "UPDATE_EXECUTION_SETTINGS"}
 
 
 # ---------- LLM profile 管理 ----------
