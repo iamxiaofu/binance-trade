@@ -156,6 +156,10 @@ def _now_iso_utc() -> str:
     return _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
 
 
+def _iso_utc_from_ms(ts_ms: int) -> str:
+    return _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime(ts_ms / 1000))
+
+
 def _direction_from_open_side(side: str) -> str:
     side = (side or "").lower()
     if side == "buy":
@@ -1705,29 +1709,81 @@ class Store:
         self,
         *,
         symbol: str,
-        triggered_kind: str,
+        triggered_kind: str = "",
         qty: float,
         price: float,
+        ts_ms: int | None = None,
+        exchange_order_id: str = "",
+        client_order_id: str = "",
+        fee: float = 0.0,
+        fee_asset: str = "",
     ) -> None:
         """标记最近一组 SL/TP 条件单：触发的一侧成交，另一侧取消。
 
-        交易所侧 SL/TP 触发后，本系统通过持仓消失检测到平仓；这里把前面挂出的
-        保护条件单状态补齐，供前端区分「成功挂出」与「触发成交」。
+        交易所侧 SL/TP 触发后，优先用私有流携带的 algo/order id 精确定位本地
+        保护单，并以交易所事件时间作为成交时间；快照差异检测仍可作为兜底。
         """
-        if triggered_kind not in ("SL", "TP"):
+        symbol = normalize_symbol(symbol)
+        triggered_kind = str(triggered_kind or "").upper()
+        exchange_order_id = str(exchange_order_id or "")
+        client_order_id = str(client_order_id or "")
+        if triggered_kind not in ("SL", "TP") and not (exchange_order_id or client_order_id):
             return
+        event_ts_ms = int(ts_ms or 0)
         async with self._sessionmaker() as session:
-            rows = (
-                await session.execute(
+            target: OrderRow | None = None
+            if exchange_order_id or client_order_id:
+                id_conditions = []
+                if exchange_order_id:
+                    id_conditions.append(OrderRow.exchange_order_id == exchange_order_id)
+                if client_order_id:
+                    id_conditions.append(OrderRow.client_order_id == client_order_id)
+                stmt = (
                     select(OrderRow)
                     .where(OrderRow.symbol == symbol)
                     .where(OrderRow.client_kind.in_(("SL", "TP")))
                     .where(OrderRow.dry_run.is_(False))
-                    .where(OrderRow.status.in_(("placed", "open", "filled")))
-                    .order_by(OrderRow.id.desc())
-                    .limit(2)
+                    .where(or_(*id_conditions))
                 )
-            ).scalars().all()
+                if triggered_kind in ("SL", "TP"):
+                    stmt = stmt.where(OrderRow.client_kind == triggered_kind)
+                target = (
+                    await session.execute(stmt.order_by(OrderRow.id.desc()).limit(1))
+                ).scalar_one_or_none()
+                if target is not None and target.client_kind in ("SL", "TP"):
+                    triggered_kind = target.client_kind
+            if triggered_kind not in ("SL", "TP"):
+                return
+
+            if target is not None:
+                rows: list[OrderRow] = [target]
+                pair_stmt = (
+                    select(OrderRow)
+                    .where(OrderRow.symbol == symbol)
+                    .where(OrderRow.client_kind.in_(("SL", "TP")))
+                    .where(OrderRow.client_kind != triggered_kind)
+                    .where(OrderRow.dry_run.is_(False))
+                    .where(OrderRow.status.in_(("placed", "open", "filled")))
+                    .where(OrderRow.id != target.id)
+                    .order_by(OrderRow.id.desc())
+                    .limit(4)
+                )
+                if target.trade_id:
+                    pair_stmt = pair_stmt.where(OrderRow.trade_id == target.trade_id)
+                pair_rows = (await session.execute(pair_stmt)).scalars().all()
+                rows.extend(pair_rows[:1])
+            else:
+                rows = (
+                    await session.execute(
+                        select(OrderRow)
+                        .where(OrderRow.symbol == symbol)
+                        .where(OrderRow.client_kind.in_(("SL", "TP")))
+                        .where(OrderRow.dry_run.is_(False))
+                        .where(OrderRow.status.in_(("placed", "open", "filled")))
+                        .order_by(OrderRow.id.desc())
+                        .limit(2)
+                    )
+                ).scalars().all()
             for row in rows:
                 try:
                     raw = json.loads(row.raw_json or "{}")
@@ -1737,12 +1793,29 @@ class Store:
                     raw = {}
                 if row.client_kind == triggered_kind:
                     row.status = "filled"
+                    if event_ts_ms > 0:
+                        row.ts_ms = event_ts_ms
+                        row.created_at = _iso_utc_from_ms(event_ts_ms)
                     if qty > 0:
                         row.qty = qty
+                        row.filled_qty = qty
+                        row.remaining_qty = 0.0
+                    if price > 0:
+                        row.avg_price = price
+                    if fee:
+                        row.fee = fee
+                    if fee_asset:
+                        row.fee_asset = fee_asset
                     raw["trigger_price"] = row.price
                     raw["filled_price"] = price
                     raw["filled_qty"] = qty
+                    if event_ts_ms > 0:
+                        raw["filled_at_ms"] = event_ts_ms
                     raw["condition_exit_kind"] = triggered_kind
+                    if exchange_order_id:
+                        raw["trigger_exchange_order_id"] = exchange_order_id
+                    if client_order_id:
+                        raw["trigger_client_order_id"] = client_order_id
                     try:
                         row.raw_json = json.dumps(raw, default=str)[:8000]
                     except Exception:

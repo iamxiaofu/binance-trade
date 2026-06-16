@@ -500,7 +500,14 @@ async def test_mark_condition_exit_closes_group_with_filled_price(store):
         "id": "tp", "raw": {}, "trade_id": opened["trade_id"],
     })
 
-    await store.mark_condition_exit(symbol="BTCUSDT", triggered_kind="TP", qty=1.0, price=109.5)
+    filled_ts_ms = 1_781_594_103_083
+    await store.mark_condition_exit(
+        symbol="BTCUSDT",
+        triggered_kind="TP",
+        qty=1.0,
+        price=109.5,
+        ts_ms=filled_ts_ms,
+    )
 
     sm = async_sessionmaker(store._engine, expire_on_commit=False)
     async with sm() as session:
@@ -511,8 +518,11 @@ async def test_mark_condition_exit_closes_group_with_filled_price(store):
     assert trade.status == "closed"
     assert trade.exit_reason == "TP"
     assert trade.exit_price == pytest.approx(109.5)
+    assert trade.closed_at_ms == filled_ts_ms
+    assert trade.closed_at == "2026-06-16 07:15:03"
     assert trade.realized_pnl == pytest.approx(9.5)
     assert by_kind["TP"].realized_pnl == pytest.approx(9.5)
+    assert by_kind["TP"].ts_ms == filled_ts_ms
     assert by_kind["SL"].status == "canceled"
 
 
@@ -683,7 +693,13 @@ async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):
         "order_type": "TAKE_PROFIT_MARKET", "qty": 0.01, "price": 95.0,
         "notional": 0.95, "dry_run": False, "status": "placed", "id": "tp", "raw": {},
     })
-    await store.mark_condition_exit(symbol="BTCUSDT", triggered_kind="TP", qty=0.01, price=94.5)
+    await store.mark_condition_exit(
+        symbol="BTCUSDT",
+        triggered_kind="TP",
+        qty=0.01,
+        price=94.5,
+        ts_ms=1_781_594_103_083,
+    )
     sm = async_sessionmaker(store._engine, expire_on_commit=False)
     async with sm() as session:
         rows = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
@@ -693,7 +709,56 @@ async def test_mark_condition_exit_marks_triggered_and_cancels_other(store):
     raw = json.loads(by_kind["TP"].raw_json)
     assert raw["trigger_price"] == pytest.approx(95.0)
     assert raw["filled_price"] == pytest.approx(94.5)
+    assert raw["filled_at_ms"] == 1_781_594_103_083
     assert by_kind["SL"].status == "canceled"
+
+
+async def test_mark_condition_exit_locates_triggered_algo_order(store):
+    opened = await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 0.01, "price": 100.0,
+        "notional": 1.0, "dry_run": False, "status": "filled",
+        "id": "open", "raw": {}, "leverage": 2,
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "SL", "side": "sell",
+        "order_type": "STOP_MARKET", "qty": 0.01, "price": 101.0,
+        "notional": 1.01, "dry_run": False, "status": "placed",
+        "id": "2000001132311409", "client_order_id": "bt-sl",
+        "raw": {}, "trade_id": opened["trade_id"],
+    })
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "TP", "side": "sell",
+        "order_type": "TAKE_PROFIT_MARKET", "qty": 0.01, "price": 110.0,
+        "notional": 1.1, "dry_run": False, "status": "placed",
+        "id": "2000001132311412", "client_order_id": "bt-tp",
+        "raw": {}, "trade_id": opened["trade_id"],
+    })
+
+    await store.mark_condition_exit(
+        symbol="BTCUSDT",
+        qty=0.01,
+        price=101.5,
+        ts_ms=1_781_594_103_083,
+        exchange_order_id="2000001132311409",
+        client_order_id="bt-sl",
+        fee=0.0001,
+        fee_asset="USDT",
+    )
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        trade = (await session.execute(select(TradeRow))).scalar_one()
+        rows = (await session.execute(select(OrderRow).order_by(OrderRow.id))).scalars().all()
+    by_kind = {r.client_kind: r for r in rows}
+
+    assert trade.status == "closed"
+    assert trade.exit_reason == "SL"
+    assert trade.closed_at_ms == 1_781_594_103_083
+    assert by_kind["SL"].status == "filled"
+    assert by_kind["SL"].avg_price == pytest.approx(101.5)
+    assert by_kind["SL"].fee == pytest.approx(0.0001)
+    assert by_kind["TP"].status == "canceled"
 
 
 async def test_latest_protection_templates_returns_latest_sl_tp(store):

@@ -268,6 +268,7 @@ class TradingEngine:
         await self._account.drain()
         if event.event_type == "ORDER_TRADE_UPDATE":
             order = event.payload.get("o") or {}
+            await self._mark_condition_exit_from_order_update(event, order)
             client_id = str(order.get("c") or "")
             status = str(order.get("X") or "").upper()
             symbol = normalize_symbol(order.get("s"))
@@ -318,6 +319,46 @@ class TradingEngine:
                     self._enforce_exchange_invariants("private_event"),
                     name="private-event-invariant-check",
                 )
+
+    async def _mark_condition_exit_from_order_update(self, event, order: dict) -> None:
+        """Persist authoritative Binance private-stream timestamps for SL/TP exits."""
+        status = str(order.get("X") or "").upper()
+        exec_type = str(order.get("x") or "").upper()
+        strategy_type = str(order.get("st") or "").upper()
+        algo_id = str(order.get("si") or "")
+        if status != "FILLED":
+            return
+        if exec_type and exec_type not in ("TRADE", "CALCULATED"):
+            return
+        if strategy_type != "ALGO_CONDITION" and not algo_id:
+            return
+        symbol = normalize_symbol(order.get("s"))
+        if not symbol:
+            return
+        qty = (
+            self._safe_float(order.get("z"))
+            or self._safe_float(order.get("l"))
+            or self._safe_float(order.get("q"))
+        )
+        price = (
+            self._safe_float(order.get("ap"))
+            or self._safe_float(order.get("L"))
+            or self._safe_float(order.get("p"))
+        )
+        if qty <= 0 or price <= 0:
+            return
+        ts_ms = int(event.transaction_time_ms or event.event_time_ms or time.time() * 1000)
+        await self._store.mark_condition_exit(
+            symbol=symbol,
+            triggered_kind="",
+            qty=qty,
+            price=price,
+            ts_ms=ts_ms,
+            exchange_order_id=algo_id,
+            client_order_id=str(order.get("c") or ""),
+            fee=self._safe_float(order.get("n")),
+            fee_asset=str(order.get("N") or ""),
+        )
 
     async def _handle_account_config_update(self, event) -> None:
         """Classify Binance account-config events instead of pausing on expected leverage updates."""
@@ -3747,6 +3788,7 @@ class TradingEngine:
                     "triggered_kind": kind,
                     "qty": qty,
                     "price": exit_px,
+                    "ts_ms": int(time.time() * 1000),
                 })
             logger.info("[{}] external close detected, est. pnl={:.2f} day_pnl={:.2f}",
                         symbol, pnl, self.runtime.day_realized_pnl)

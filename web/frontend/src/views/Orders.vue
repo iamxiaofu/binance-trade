@@ -7,7 +7,6 @@ import {
   utc8InputToMs,
   decisionLabel,
   executionModeLabel,
-  exitReasonLabel,
   liquidityLabel,
   orderActionLabel,
   orderKindTag,
@@ -16,6 +15,7 @@ import {
   orderTypeLabel,
   rejectCodeLabel,
   sideLabel,
+  tradeExitReasonLabel,
   tradeDirectionLabel,
   tradeDirectionTag,
   tradeStatusLabel,
@@ -64,7 +64,7 @@ const statusOptions = [
 const exitReasonOptions = [
   { label: '策略平仓', value: 'CLOSE' },
   { label: '止盈成交', value: 'TP' },
-  { label: '止损成交', value: 'SL' },
+  { label: '止损/移动止损', value: 'SL' },
   { label: '保护平仓', value: 'EMERGENCY' },
   { label: '熔断平仓', value: 'CIRCUIT' },
   { label: '未知退出', value: 'UNKNOWN' },
@@ -403,7 +403,7 @@ onUnmounted(() => {
             </template>
           </el-table-column>
           <el-table-column label="退出原因" min-width="110">
-            <template #default="{ row }">{{ row.status === 'closed' ? exitReasonLabel(row.exit_reason) : '—' }}</template>
+            <template #default="{ row }">{{ row.status === 'closed' ? tradeExitReasonLabel(row) : '—' }}</template>
           </el-table-column>
         </el-table>
         <div style="display:flex; justify-content:flex-end; margin-top:12px">

@@ -197,6 +197,30 @@ export function exitReasonLabel(reason) {
   }[reason] || reason || '—'
 }
 
+export function tradeExitReasonLabel(row) {
+  if (!row) return '—'
+  const reason = row.exit_reason
+  if (reason !== 'SL') return exitReasonLabel(reason)
+  const direction = String(row.direction || '').toLowerCase()
+  const entry = Number(row.entry_price || 0)
+  const exit = Number(row.exit_price || 0)
+  const netPnl = Number(row.net_realized_pnl ?? row.realized_pnl ?? 0)
+  const totalFee = Math.abs(Number(row.total_fee || 0))
+  const entryNotional = Math.abs(Number(row.entry_notional || 0))
+  const tolerance = Math.max(totalFee, entryNotional * 0.0005, 0.01)
+  const favorableExit = (
+    (direction === 'long' && exit >= entry) ||
+    (direction === 'short' && exit <= entry)
+  )
+  if (entry > 0 && exit > 0 && favorableExit && netPnl > tolerance) {
+    return '移动止损成交'
+  }
+  if (entry > 0 && exit > 0 && favorableExit && netPnl >= -tolerance) {
+    return '保本止盈'
+  }
+  return exitReasonLabel(reason)
+}
+
 export function rejectCodeLabel(code) {
   return {
     LOW_CONFIDENCE: '置信度不足',

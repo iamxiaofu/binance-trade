@@ -1374,6 +1374,7 @@ async def test_losing_close_drives_daily_loss(settings, creds, monkeypatch):
 async def test_external_close_detected_in_snapshot(settings, creds, monkeypatch):
     """SL/TP 在交易所侧触发 → 持仓消失 → _snapshot 差异检测补记盈亏。"""
     eng = _engine(settings, creds, monkeypatch)
+    monkeypatch.setattr(engine_loop.time, "time", lambda: 1781594103.083)
     prev = {"BTCUSDT": {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
                         "entryPrice": 100.0, "markPrice": 95.0}}
     # 本周期交易所已无持仓
@@ -1385,6 +1386,41 @@ async def test_external_close_detected_in_snapshot(settings, creds, monkeypatch)
         "triggered_kind": "SL",
         "qty": 1.0,
         "price": 95.0,
+        "ts_ms": 1_781_594_103_083,
+    }]
+
+
+async def test_private_condition_order_update_marks_exact_exit(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    event = SimpleNamespace(
+        event_time_ms=1_781_594_103_000,
+        transaction_time_ms=1_781_594_103_083,
+    )
+    order = {
+        "s": "BTCUSDT",
+        "X": "FILLED",
+        "x": "TRADE",
+        "st": "ALGO_CONDITION",
+        "si": 2000001132311409,
+        "c": "bt-10a2abb7fa7a6c5aac9350",
+        "z": "0.001",
+        "ap": "66278.3",
+        "n": "0.03313915",
+        "N": "USDT",
+    }
+
+    await eng._mark_condition_exit_from_order_update(event, order)
+
+    assert eng._store.condition_exits == [{
+        "symbol": "BTCUSDT",
+        "triggered_kind": "",
+        "qty": 0.001,
+        "price": 66278.3,
+        "ts_ms": 1_781_594_103_083,
+        "exchange_order_id": "2000001132311409",
+        "client_order_id": "bt-10a2abb7fa7a6c5aac9350",
+        "fee": 0.03313915,
+        "fee_asset": "USDT",
     }]
 
 
