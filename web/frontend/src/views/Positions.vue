@@ -99,15 +99,19 @@ function margin(row) {
   return Number(row.isolated_margin || row.initial_margin || 0)
 }
 
-function realtimeMark(row) {
+function realtimePrice(row) {
   const tick = marketTicks.value[row.symbol]
-  const mark = Number(tick?.mark || tick?.last || 0)
-  return Number.isFinite(mark) && mark > 0 ? mark : null
+  const mark = Number(tick?.mark || 0)
+  if (Number.isFinite(mark) && mark > 0) return { price: mark, kind: 'mark' }
+  const last = Number(tick?.last || 0)
+  if (Number.isFinite(last) && last > 0) return { price: last, kind: 'last' }
+  return null
 }
 
 function applyRealtimeMark(row) {
-  const mark = realtimeMark(row)
-  if (mark == null) return row
+  const realtime = realtimePrice(row)
+  if (realtime == null) return row
+  const mark = realtime.price
   const qty = Number(row.contracts || 0)
   const entry = Number(row.entry_price || 0)
   const side = row.side
@@ -128,8 +132,15 @@ function applyRealtimeMark(row) {
     unrealized_pnl: pnl,
     roi_pct: initialMargin > 0 ? (pnl / initialMargin) * 100 : row.roi_pct,
     market_realtime: true,
+    market_price_kind: realtime.kind,
     market_ts_ms: marketTicks.value[row.symbol]?.ts || 0,
   }
+}
+
+function marketPriceLabel(row) {
+  if (row.market_price_kind === 'mark') return '标记实时'
+  if (row.market_price_kind === 'last') return '最新价'
+  return '实时'
 }
 
 function estimatedClosePnl(row) {
@@ -175,13 +186,14 @@ function connectMarketSocket(symbol) {
     try {
       const msg = JSON.parse(ev.data)
       if (msg.type !== 'ticker') return
-      const mark = Number(msg.mark || msg.last || 0)
-      if (!Number.isFinite(mark) || mark <= 0) return
+      const mark = Number(msg.mark || 0)
+      const last = Number(msg.last || 0)
+      if ((!Number.isFinite(mark) || mark <= 0) && (!Number.isFinite(last) || last <= 0)) return
       marketTicks.value = {
         ...marketTicks.value,
         [symbol]: {
-          mark,
-          last: Number(msg.last || mark),
+          mark: Number.isFinite(mark) && mark > 0 ? mark : null,
+          last: Number.isFinite(last) && last > 0 ? last : null,
           ts: Number(msg.ts || Date.now()),
         },
       }
@@ -535,7 +547,9 @@ async function cancelConditionOrder(order) {
               <span>标记价</span>
               <strong class="mono mark-value">
                 {{ fmt(row.mark_price, 2) }}
-                <el-tag v-if="row.market_realtime" type="success" size="small">实时</el-tag>
+                <el-tag v-if="row.market_realtime" type="success" size="small">
+                  {{ marketPriceLabel(row) }}
+                </el-tag>
               </strong>
             </div>
             <div><span>名义价值</span><strong class="mono">{{ fmt(row.notional, 2) }}</strong></div>
@@ -619,7 +633,9 @@ async function cancelConditionOrder(order) {
           <template #default="{ row }">
             <span class="mono mark-value">
               {{ fmt(row.mark_price, 2) }}
-              <el-tag v-if="row.market_realtime" type="success" size="small">实时</el-tag>
+              <el-tag v-if="row.market_realtime" type="success" size="small">
+                {{ marketPriceLabel(row) }}
+              </el-tag>
             </span>
           </template>
         </el-table-column>

@@ -34,14 +34,18 @@
 - testnet 页面：`/ws/testnet/market`
 - mainnet 页面：`/ws/mainnet/market`
 
-收到 ticker 后，前端用实时标记价覆盖展示字段：
+收到 ticker 后，前端优先用实时 `mark` 覆盖展示字段；如果该条行情没有 `mark`，则退回使用
+实时 `last` 作为页面估算价：
 
 - `mark_price`
 - `notional`
 - `unrealized_pnl`
 - `roi_pct`
 
-标记价旁展示 `实时` 标签，表示该行价格和盈亏已用最新行情覆盖。
+价格旁会展示来源标签：
+
+- `标记实时`：使用 ticker 的 `mark`。
+- `最新价`：ticker 未提供 `mark`，使用 `last` 作为实时估算价。
 
 ### 连接生命周期
 
@@ -62,6 +66,9 @@
 - REST 账户快照返回的 `liquidationPrice` 是更可信来源。
 
 因此强平价的实时性等于后端 REST 账户快照刷新频率，不等于行情 ticker 频率。
+
+当行情流只提供 `last` 时，持仓页实时盈亏和 ROI 是按最新成交价估算，不等同于交易所保证金页的
+标记价盈亏。页面通过 `最新价` 标签明确区分这一点。
 
 ## 验证
 
