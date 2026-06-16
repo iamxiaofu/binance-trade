@@ -1,7 +1,7 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, onUnmounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { api } from '../api'
+import { api, getEnvironment, wsPath } from '../api'
 import { useLiveStore } from '../stores/live'
 import { orderStatusLabel, utc8DateTime, utc8Time } from '../labels'
 
@@ -35,8 +35,25 @@ const syncedAtText = computed(() => {
   const ts = live.summary?.positions_synced_at_ms
   return utc8Time(ts)
 })
-const isExchangeLive = computed(() => positionsSource.value === 'exchange')
-const hasMissingProtection = computed(() => positions.value.some((p) =>
+const positionSourceLabel = computed(() => {
+  if (positionsSource.value === 'exchange') return '交易所实时'
+  if (positionsSource.value === 'account_projection') return '账户投影实时'
+  return '本地快照'
+})
+const positionSourceTagType = computed(() => {
+  if (positionsSource.value === 'db_snapshot') return 'warning'
+  return 'success'
+})
+const marketTicks = ref({})
+const marketSockets = new Map()
+const marketConnected = ref({})
+const hasRealtimeMarket = computed(() => Object.values(marketConnected.value).some(Boolean))
+const marketSyncedAtText = computed(() => {
+  const times = Object.values(marketTicks.value).map((tick) => Number(tick?.ts || 0)).filter((ts) => ts > 0)
+  return utc8Time(times.length ? Math.max(...times) : null)
+})
+const displayPositions = computed(() => positions.value.map(applyRealtimeMark))
+const hasMissingProtection = computed(() => displayPositions.value.some((p) =>
   p.protection?.missing_sl || p.protection?.missing_tp
 ))
 // B5：暴露 symbol_enabled 表与「持仓 + 币种已禁用」集合。
@@ -82,6 +99,39 @@ function margin(row) {
   return Number(row.isolated_margin || row.initial_margin || 0)
 }
 
+function realtimeMark(row) {
+  const tick = marketTicks.value[row.symbol]
+  const mark = Number(tick?.mark || tick?.last || 0)
+  return Number.isFinite(mark) && mark > 0 ? mark : null
+}
+
+function applyRealtimeMark(row) {
+  const mark = realtimeMark(row)
+  if (mark == null) return row
+  const qty = Number(row.contracts || 0)
+  const entry = Number(row.entry_price || 0)
+  const side = row.side
+  const pnl = (
+    Number.isFinite(qty) && Number.isFinite(entry) && entry > 0
+      ? side === 'long'
+        ? (mark - entry) * qty
+        : side === 'short'
+          ? (entry - mark) * qty
+          : Number(row.unrealized_pnl || 0)
+      : Number(row.unrealized_pnl || 0)
+  )
+  const initialMargin = Number(row.initial_margin || 0)
+  return {
+    ...row,
+    mark_price: mark,
+    notional: Math.abs(qty * mark),
+    unrealized_pnl: pnl,
+    roi_pct: initialMargin > 0 ? (pnl / initialMargin) * 100 : row.roi_pct,
+    market_realtime: true,
+    market_ts_ms: marketTicks.value[row.symbol]?.ts || 0,
+  }
+}
+
 function estimatedClosePnl(row) {
   const qty = Number(row.contracts || 0)
   const entry = Number(row.entry_price || 0)
@@ -91,6 +141,99 @@ function estimatedClosePnl(row) {
   if (row.side === 'short') return (entry - mark) * qty
   return 0
 }
+
+function closeMarketSocket(symbol) {
+  const ws = marketSockets.get(symbol)
+  if (!ws) return
+  ws.onclose = null
+  ws.onerror = null
+  ws.onmessage = null
+  try { ws.close() } catch (_) { /* ignore */ }
+  marketSockets.delete(symbol)
+  const next = { ...marketConnected.value }
+  delete next[symbol]
+  marketConnected.value = next
+}
+
+function closeAllMarketSockets() {
+  for (const symbol of Array.from(marketSockets.keys())) closeMarketSocket(symbol)
+}
+
+function connectMarketSocket(symbol) {
+  if (!symbol || marketSockets.has(symbol) || document.hidden) return
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const environment = getEnvironment()
+  let ws
+  try {
+    ws = new WebSocket(`${proto}://${location.host}${wsPath(`/market?symbol=${encodeURIComponent(symbol)}&source=${environment}`)}`)
+  } catch (_) { return }
+  marketSockets.set(symbol, ws)
+  ws.onopen = () => {
+    marketConnected.value = { ...marketConnected.value, [symbol]: true }
+  }
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data)
+      if (msg.type !== 'ticker') return
+      const mark = Number(msg.mark || msg.last || 0)
+      if (!Number.isFinite(mark) || mark <= 0) return
+      marketTicks.value = {
+        ...marketTicks.value,
+        [symbol]: {
+          mark,
+          last: Number(msg.last || mark),
+          ts: Number(msg.ts || Date.now()),
+        },
+      }
+    } catch (_) { /* ignore */ }
+  }
+  ws.onclose = () => {
+    marketSockets.delete(symbol)
+    const next = { ...marketConnected.value }
+    delete next[symbol]
+    marketConnected.value = next
+  }
+  ws.onerror = () => { try { ws.close() } catch (_) { /* ignore */ } }
+}
+
+function syncMarketSockets() {
+  const symbols = new Set(positions.value.map((row) => row.symbol).filter(Boolean))
+  for (const symbol of Array.from(marketSockets.keys())) {
+    if (!symbols.has(symbol)) closeMarketSocket(symbol)
+  }
+  for (const symbol of symbols) {
+    connectMarketSocket(symbol)
+  }
+}
+
+function onEnvironmentChange() {
+  closeAllMarketSockets()
+  marketTicks.value = {}
+  syncMarketSockets()
+}
+
+function onVisibilityChange() {
+  if (document.hidden) {
+    closeAllMarketSockets()
+    return
+  }
+  syncMarketSockets()
+}
+
+watch(
+  () => positions.value.map((row) => row.symbol).sort().join(','),
+  syncMarketSockets,
+  { immediate: true },
+)
+
+window.addEventListener('binance-trade-environment-change', onEnvironmentChange)
+document.addEventListener('visibilitychange', onVisibilityChange)
+
+onUnmounted(() => {
+  window.removeEventListener('binance-trade-environment-change', onEnvironmentChange)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  closeAllMarketSockets()
+})
 
 function protection(row, kind) {
   return kind === 'SL' ? row.protection?.sl : row.protection?.tp
@@ -289,12 +432,13 @@ async function cancelConditionOrder(order) {
     <el-card shadow="never">
       <template #header>
         <div class="positions-header">
-          <span>当前持仓（{{ positions.length }}）</span>
+          <span>当前持仓（{{ displayPositions.length }}）</span>
           <span class="positions-meta">
-            <el-tag :type="isExchangeLive ? 'success' : 'warning'" size="small" effect="dark">
-              {{ isExchangeLive ? '交易所实时' : '本地快照' }}
+            <el-tag :type="positionSourceTagType" size="small" effect="dark">
+              {{ positionSourceLabel }}
             </el-tag>
-            <span>同步于 {{ syncedAtText }}</span>
+            <span>账户同步于 {{ syncedAtText }}</span>
+            <span v-if="hasRealtimeMarket">行情更新于 {{ marketSyncedAtText }}</span>
           </span>
         </div>
       </template>
@@ -345,9 +489,9 @@ async function cancelConditionOrder(order) {
           </span>
         </template>
       </el-alert>
-      <div v-if="positions.length" class="mobile-position-list mobile-only">
+      <div v-if="displayPositions.length" class="mobile-position-list mobile-only">
         <article
-          v-for="row in positions"
+          v-for="row in displayPositions"
           :key="row.symbol"
           class="mobile-position-card"
           :class="[`side-${row.side || 'flat'}`, { 'needs-attention': needsRepair(row) || isSymbolDisabled(row.symbol) }]"
@@ -387,7 +531,13 @@ async function cancelConditionOrder(order) {
             <div><span>持仓数量</span><strong class="mono">{{ fmt(row.contracts) }}</strong></div>
             <div><span>保证金</span><strong class="mono">{{ fmt(margin(row), 2) }}</strong></div>
             <div><span>开仓价</span><strong class="mono">{{ fmt(row.entry_price, 2) }}</strong></div>
-            <div><span>标记价</span><strong class="mono">{{ fmt(row.mark_price, 2) }}</strong></div>
+            <div>
+              <span>标记价</span>
+              <strong class="mono mark-value">
+                {{ fmt(row.mark_price, 2) }}
+                <el-tag v-if="row.market_realtime" type="success" size="small">实时</el-tag>
+              </strong>
+            </div>
             <div><span>名义价值</span><strong class="mono">{{ fmt(row.notional, 2) }}</strong></div>
             <div><span>强平价格</span><strong class="mono">{{ fmt(row.liquidation_price, 2) }}</strong></div>
           </div>
@@ -447,7 +597,7 @@ async function cancelConditionOrder(order) {
       </div>
       <el-empty v-else class="mobile-only" description="当前无持仓" :image-size="70" />
 
-      <el-table class="desktop-only" :data="positions" stripe empty-text="当前无持仓">
+      <el-table class="desktop-only" :data="displayPositions" stripe empty-text="当前无持仓">
         <el-table-column prop="symbol" label="标的" width="120" />
         <el-table-column label="方向" width="90">
           <template #default="{ row }">
@@ -466,7 +616,12 @@ async function cancelConditionOrder(order) {
           <template #default="{ row }"><span class="mono">{{ fmt(row.entry_price, 2) }}</span></template>
         </el-table-column>
         <el-table-column label="标记价" width="120">
-          <template #default="{ row }"><span class="mono">{{ fmt(row.mark_price, 2) }}</span></template>
+          <template #default="{ row }">
+            <span class="mono mark-value">
+              {{ fmt(row.mark_price, 2) }}
+              <el-tag v-if="row.market_realtime" type="success" size="small">实时</el-tag>
+            </span>
+          </template>
         </el-table-column>
         <el-table-column label="杠杆" width="80">
           <template #default="{ row }">{{ Number(row.leverage) > 0 ? `${row.leverage}x` : '—' }}</template>
@@ -863,6 +1018,14 @@ async function cancelConditionOrder(order) {
 .open-orders-card {
   margin-top: 16px;
 }
+
+.mark-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
 .condition-orders-section {
   margin-top: 16px;
 }
