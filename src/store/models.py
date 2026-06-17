@@ -49,6 +49,7 @@ class DecisionRow(Base):
     # 审计：完整输入上下文 JSON（便于复盘）
     context_json: Mapped[str] = mapped_column(Text, default="")
     # LLM 审计：真实 prompt、请求载荷、原始回传（不包含 API key）
+    llm_system_prompt: Mapped[str] = mapped_column(Text, default="")
     llm_prompt: Mapped[str] = mapped_column(Text, default="")
     llm_request_json: Mapped[str] = mapped_column(Text, default="")
     llm_response_json: Mapped[str] = mapped_column(Text, default="")
@@ -303,6 +304,24 @@ class LLMProfileRow(Base):
     # fallback 链：priority 升序优先；fallback_enabled 决定备源是否入链。
     priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
     fallback_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+
+
+class LLMPromptVersionRow(Base):
+    """运行期可热替换的 Prompt 附加策略指令版本。
+
+    只保存可由前端编辑的附加指令；系统硬规则和 user prompt 市场数据模板仍由代码控制。
+    同一时刻 ``is_active`` 只能有 1 个，由 Store 写事务保证。
+    """
+    __tablename__ = "llm_prompt_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    name: Mapped[str] = mapped_column(String(80), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="web")
     created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
     updated_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
 

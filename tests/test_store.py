@@ -22,6 +22,7 @@ from src.store.models import (
     PositionClaimRow,
     PositionSnapshotRow,
     RejectRow,
+    LLMPromptVersionRow,
     LivePositionRow,
     RuntimeSettingRow,
     SymbolRow,
@@ -130,6 +131,7 @@ async def test_log_actual_decision_with_context(store):
         symbol="BTCUSDT",
         decision=d,
         ref_price=100.0,
+        llm_system_prompt="system prompt",
         llm_prompt="prompt",
         llm_request_json='{"request": true}',
         llm_response_json='{"response": true}',
@@ -141,10 +143,39 @@ async def test_log_actual_decision_with_context(store):
     assert row.action == "OPEN_LONG"
     assert row.leverage == 3
     assert row.skipped is False
+    assert row.llm_system_prompt == "system prompt"
     assert row.llm_prompt == "prompt"
     assert "request" in row.llm_request_json
     assert "response" in row.llm_response_json
     assert "last_price" in row.feature_snapshot_json
+
+
+async def test_llm_prompt_versions(store):
+    assert await store.get_active_llm_prompt_version() is None
+    first = await store.create_llm_prompt_version(
+        name="trend",
+        content="偏趋势交易",
+        source="test",
+        activate=True,
+    )
+    assert first["version"] == 1
+    assert first["is_active"] is True
+    assert first["content"] == "偏趋势交易"
+    second = await store.create_llm_prompt_version(
+        name="flat",
+        content="震荡少交易",
+        source="test",
+        activate=True,
+    )
+    active = await store.get_active_llm_prompt_version()
+    assert active["id"] == second["id"]
+    assert active["version"] == 2
+    versions = await store.list_llm_prompt_versions()
+    assert [v["version"] for v in versions[:2]] == [2, 1]
+    await store.activate_llm_prompt_version(first["id"])
+    active = await store.get_active_llm_prompt_version()
+    assert active["id"] == first["id"]
+    assert await _count(store, LLMPromptVersionRow) == 2
 
 
 async def test_latest_decision_snapshot(store):

@@ -651,6 +651,7 @@ _ALLOWED_COMMANDS = {
     "CANCEL_AND_FLATTEN",
     "STOP_ENGINE",
     "SWITCH_LLM_PROFILE",
+    "RELOAD_LLM_PROMPT",
     "UPDATE_RISK_SETTINGS",
     "UPDATE_ENGINE_SETTINGS",
     "UPDATE_EXECUTION_SETTINGS",
@@ -660,6 +661,7 @@ _MAINNET_HIGH_RISK_COMMANDS = {
     "KILL_SWITCH", "RESUME", "RESUME_ALL_SYMBOLS", "SET_SYMBOL_ENABLED",
     "CLOSE_POSITION", "CANCEL_AND_FLATTEN", "STOP_ENGINE",
     "UPDATE_RISK_SETTINGS", "UPDATE_ENGINE_SETTINGS", "UPDATE_EXECUTION_SETTINGS",
+    "RELOAD_LLM_PROMPT",
 }
 
 
@@ -1008,6 +1010,85 @@ async def api_execution_settings_apply(
         "UPDATE_EXECUTION_SETTINGS", arg=payload, source=f"web:{user}"
     )
     return {"queued": True, "id": cmd_id, "command": "UPDATE_EXECUTION_SETTINGS"}
+
+
+# ---------- LLM Prompt 管理 ----------
+from src.llm.prompt import build_system_prompt  # noqa: E402
+
+
+class _LLMPromptApplyRequest(BaseModel):
+    name: str = Field(default="", max_length=80)
+    content: str = Field(default="", max_length=20000)
+    confirmation_token: str = ""
+
+
+class _LLMPromptPreviewRequest(BaseModel):
+    content: str = Field(default="", max_length=20000)
+
+
+def _prompt_engine_status(rt: dict[str, str]) -> dict[str, Any]:
+    try:
+        version = int(rt.get("llm.prompt_version", "0") or "0")
+    except (TypeError, ValueError):
+        version = 0
+    return {
+        "version": version,
+        "name": rt.get("llm.prompt_name", ""),
+        "source": rt.get("llm.prompt_source", ""),
+    }
+
+
+@app.get("/api/llm/prompt")
+async def api_llm_prompt(_: str = Depends(_check_auth)):
+    store = await _get_store()
+    active = await store.get_active_llm_prompt_version()
+    versions = await store.list_llm_prompt_versions()
+    rt = await store.runtime_settings()
+    return {
+        "mode": _settings.mode.value,
+        "active": active,
+        "versions": versions,
+        "engine": _prompt_engine_status(rt),
+        "effective_system_prompt": build_system_prompt((active or {}).get("content", "")),
+    }
+
+
+@app.post("/api/llm/prompt/preview")
+async def api_llm_prompt_preview(body: _LLMPromptPreviewRequest, _: str = Depends(_check_auth)):
+    return {"effective_system_prompt": build_system_prompt(body.content)}
+
+
+@app.post("/api/llm/prompt/apply")
+async def api_llm_prompt_apply(
+    body: _LLMPromptApplyRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    user: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    payload = json.dumps(
+        {"name": body.name, "content": body.content},
+        sort_keys=True, separators=(",", ":"),
+    )
+    _consume_confirmation(body.confirmation_token, "UPDATE_LLM_PROMPT", payload)
+    store = await _get_store()
+    version = await store.create_llm_prompt_version(
+        name=body.name,
+        content=body.content,
+        source=f"web:{user}",
+        activate=True,
+    )
+    cmd_id = await store.enqueue_command(
+        "RELOAD_LLM_PROMPT", arg=str(version["id"]), source=f"web:{user}"
+    )
+    return {
+        "queued": True,
+        "id": cmd_id,
+        "command": "RELOAD_LLM_PROMPT",
+        "active": version,
+        "note": "engine 将在当前 LLM 调用结束后热加载新 Prompt",
+    }
 
 
 # ---------- LLM profile 管理 ----------

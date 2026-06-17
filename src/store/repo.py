@@ -41,6 +41,7 @@ from src.store.models import (
     ExchangeStateDriftRow,
     ExchangeStreamSessionRow,
     LiveBalanceRow,
+    LLMPromptVersionRow,
     LivePositionRow,
     LiveOrderRow,
 )
@@ -100,6 +101,7 @@ _SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("last_filter_sync_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
 )
 _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("llm_system_prompt", "TEXT NOT NULL DEFAULT ''"),
     ("llm_prompt", "TEXT NOT NULL DEFAULT ''"),
     ("llm_request_json", "TEXT NOT NULL DEFAULT ''"),
     ("llm_response_json", "TEXT NOT NULL DEFAULT ''"),
@@ -123,6 +125,15 @@ _LLM_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("priority", "INTEGER NOT NULL DEFAULT 100"),
     ("fallback_enabled", "INTEGER NOT NULL DEFAULT 0"),
 )
+_LLM_PROMPT_VERSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("version", "INTEGER NOT NULL DEFAULT 1"),
+    ("name", "VARCHAR(80) NOT NULL DEFAULT ''"),
+    ("content", "TEXT NOT NULL DEFAULT ''"),
+    ("is_active", "INTEGER NOT NULL DEFAULT 0"),
+    ("source", "VARCHAR(32) NOT NULL DEFAULT 'web'"),
+    ("created_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("updated_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
+)
 _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_decisions_ts_id ON decisions(ts_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_decisions_symbol_ts_id ON decisions(symbol, ts_ms DESC, id DESC)",
@@ -130,6 +141,7 @@ _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_trades_symbol_opened_id ON trades(symbol, opened_at_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_trades_status_opened_id ON trades(status, opened_at_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_orders_trade_ts_id ON orders(trade_id, ts_ms ASC, id ASC)",
+    "CREATE INDEX IF NOT EXISTS ix_llm_prompt_versions_version ON llm_prompt_versions(version DESC)",
 )
 
 _FILLED_ORDER_STATUSES = {"filled", "partial"}
@@ -400,6 +412,13 @@ class Store:
         for name, ddl in _LLM_PROFILE_COLUMNS:
             if llm_profile_existing and name not in llm_profile_existing:
                 await conn.execute(text(f"ALTER TABLE llm_profiles ADD COLUMN {name} {ddl}"))
+        llm_prompt_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(llm_prompt_versions)"))).fetchall()
+        }
+        for name, ddl in _LLM_PROMPT_VERSION_COLUMNS:
+            if llm_prompt_existing and name not in llm_prompt_existing:
+                await conn.execute(text(f"ALTER TABLE llm_prompt_versions ADD COLUMN {name} {ddl}"))
         for table_name in ("position_snapshots", "live_positions"):
             position_existing = {
                 row[1]
@@ -1132,6 +1151,7 @@ class Store:
         skipped: bool = False,
         skip_reason: str = "",
         ref_price: float = 0.0,
+        llm_system_prompt: str = "",
         llm_prompt: str = "",
         llm_request_json: str = "",
         llm_response_json: str = "",
@@ -1160,6 +1180,7 @@ class Store:
                 row.context_json = ctx.model_dump_json()
             except Exception:  # 落库失败不能影响主流程
                 row.context_json = ""
+        row.llm_system_prompt = llm_system_prompt
         row.llm_prompt = llm_prompt
         row.llm_request_json = llm_request_json
         row.llm_response_json = llm_response_json
@@ -2239,6 +2260,101 @@ class Store:
         async with self._sessionmaker() as session:
             rows = (await session.execute(select(RuntimeSettingRow))).scalars().all()
             return {row.key: row.value for row in rows}
+
+
+    # ---------- LLM Prompt 附加指令版本 ----------
+    @staticmethod
+    def _prompt_version_public(r: LLMPromptVersionRow) -> dict[str, Any]:
+        return {
+            "id": r.id,
+            "version": r.version,
+            "name": r.name,
+            "content": r.content or "",
+            "is_active": bool(r.is_active),
+            "source": r.source or "",
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }
+
+    async def list_llm_prompt_versions(self, limit: int = 20) -> list[dict[str, Any]]:
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(
+                select(LLMPromptVersionRow)
+                .order_by(LLMPromptVersionRow.version.desc(), LLMPromptVersionRow.id.desc())
+                .limit(max(1, min(int(limit or 20), 100)))
+            )).scalars().all()
+            return [self._prompt_version_public(r) for r in rows]
+
+    async def get_active_llm_prompt_version(self) -> dict[str, Any] | None:
+        async with self._sessionmaker() as session:
+            row = (await session.execute(
+                select(LLMPromptVersionRow)
+                .where(LLMPromptVersionRow.is_active == True)  # noqa: E712
+                .order_by(LLMPromptVersionRow.version.desc(), LLMPromptVersionRow.id.desc())
+            )).scalars().first()
+            if row is None:
+                return None
+            return self._prompt_version_public(row)
+
+    async def create_llm_prompt_version(
+        self,
+        *,
+        name: str,
+        content: str,
+        source: str = "web",
+        activate: bool = True,
+    ) -> dict[str, Any]:
+        now = _now_iso_utc()
+        cleaned_name = (name or "").strip()[:80] or "runtime prompt"
+        cleaned_content = (content or "").strip()
+        async with self._sessionmaker() as session:
+            latest = (await session.execute(
+                select(LLMPromptVersionRow)
+                .order_by(LLMPromptVersionRow.version.desc(), LLMPromptVersionRow.id.desc())
+                .limit(1)
+            )).scalars().first()
+            next_version = int(latest.version if latest is not None else 0) + 1
+            if activate:
+                active_rows = (await session.execute(
+                    select(LLMPromptVersionRow)
+                    .where(LLMPromptVersionRow.is_active == True)  # noqa: E712
+                )).scalars().all()
+                for row in active_rows:
+                    row.is_active = False
+                    row.updated_at = now
+            row = LLMPromptVersionRow(
+                version=next_version,
+                name=cleaned_name,
+                content=cleaned_content,
+                is_active=activate,
+                source=(source or "web")[:32],
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return self._prompt_version_public(row)
+
+    async def activate_llm_prompt_version(self, prompt_id: int) -> dict[str, Any]:
+        now = _now_iso_utc()
+        async with self._sessionmaker() as session:
+            target = await session.get(LLMPromptVersionRow, int(prompt_id))
+            if target is None:
+                raise ValueError(f"llm prompt version not found: {prompt_id!r}")
+            active_rows = (await session.execute(
+                select(LLMPromptVersionRow)
+                .where(LLMPromptVersionRow.is_active == True)  # noqa: E712
+            )).scalars().all()
+            for row in active_rows:
+                if row.id != target.id:
+                    row.is_active = False
+                    row.updated_at = now
+            target.is_active = True
+            target.updated_at = now
+            await session.commit()
+            await session.refresh(target)
+            return self._prompt_version_public(target)
 
 
     # ---------- LLM profile 持久化 ----------

@@ -58,6 +58,7 @@ async def db(tmp_path):
         ),
         ctx=ctx,
         ref_price=3000.0,
+        llm_system_prompt="stored system prompt",
         llm_prompt="stored prompt",
         llm_request_json='{"request": true}',
         llm_response_json='{"response": true}',
@@ -124,6 +125,7 @@ async def test_decision_detail_includes_llm_trace_and_data_items(db):
     detail = status.decision_detail(db, 3)
     assert detail is not None
     assert detail["llm_trace_available"] is True
+    assert detail["llm_system_prompt"] == "stored system prompt"
     assert detail["llm_user_prompt"] == "stored prompt"
     assert "request" in detail["llm_request_effective_json"]
     fields = {item["field"] for item in detail["llm_data_items"]}

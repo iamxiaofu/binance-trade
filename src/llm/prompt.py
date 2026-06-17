@@ -58,6 +58,22 @@ SYSTEM_PROMPT = """\
 """
 
 
+def build_system_prompt(addendum: str | None = None) -> str:
+    """返回最终发给 LLM 的 system prompt。
+
+    ``addendum`` 是运行期可由前端编辑的附加策略指令。固定系统硬规则始终保留，
+    附加指令只能补充偏好，不能替代风控纪律或输出 schema。
+    """
+    extra = (addendum or "").strip()
+    if not extra:
+        return SYSTEM_PROMPT
+    return (
+        f"{SYSTEM_PROMPT.rstrip()}\n\n"
+        "运行期附加策略指令（不得覆盖以上硬性约束；如冲突，以上硬性约束优先）：\n"
+        f"{extra}\n"
+    )
+
+
 def _fmt_sentiment(s) -> str:
     if s is None:
         return ""

@@ -20,7 +20,7 @@ from typing import Any
 from loguru import logger
 
 from src.config.schema import LLMConfig
-from src.llm.prompt import SYSTEM_PROMPT, build_user_prompt
+from src.llm.prompt import build_system_prompt, build_user_prompt
 from src.llm.providers import build_provider
 from src.llm.providers._schema import _TOOL_NAME  # noqa: F401  (向后兼容导出)
 from src.llm.schema import MarketContext, TradeDecision
@@ -32,6 +32,7 @@ class LLMTrace:
 
     user_prompt: str
     request_json: str
+    system_prompt: str = ""
     response_json: str = ""
     # 调用耗时(毫秒)。包含所有 attempt 累计。0 表示未采集。
     latency_ms: int = 0
@@ -128,6 +129,7 @@ class LLMClient:
             api_key=api_key,
             timeout=self._cfg.timeout,
         )
+        self._prompt_addendum = ""
 
     @classmethod
     def from_profile(
@@ -147,7 +149,11 @@ class LLMClient:
             api_key=api_key,
             timeout=obj._cfg.timeout,
         )
+        obj._prompt_addendum = str(profile.get("prompt_addendum") or "")
         return obj
+
+    def set_prompt_addendum(self, addendum: str) -> None:
+        self._prompt_addendum = addendum or ""
 
     async def decide(self, ctx: MarketContext) -> TradeDecision:
         """对单个 symbol 做决策。任何失败都降级为 HOLD。"""
@@ -162,12 +168,14 @@ class LLMClient:
             prompt_kline_count=self._cfg.prompt_kline_count,
             micro_kline_count=self._cfg.micro_kline_lookback,
         )
+        system_prompt = build_system_prompt(self._prompt_addendum)
         request_payload = self._provider.request_payload(
-            system=SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=self._cfg.max_tokens
+            system=system_prompt, user_prompt=user_prompt, max_tokens=self._cfg.max_tokens
         )
         trace = LLMTrace(
             user_prompt=user_prompt,
             request_json=_dump_json(request_payload),
+            system_prompt=system_prompt,
         )
         last_err = "unknown"
         attempts: list[dict[str, Any]] = []
@@ -177,7 +185,7 @@ class LLMClient:
             try:
                 resp = await asyncio.wait_for(
                     self._provider.create(
-                        system=SYSTEM_PROMPT, user_prompt=user_prompt,
+                        system=system_prompt, user_prompt=user_prompt,
                         max_tokens=self._cfg.max_tokens,
                     ),
                     timeout=self._cfg.timeout,

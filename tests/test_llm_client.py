@@ -122,9 +122,11 @@ def test_decide_with_trace_records_request_and_response():
     payload = {**_GOOD, "confidence": 0.4, "reason": "mixed"}
     client = _client_with(_FakeProvider(payload=payload))
     client._cfg = _cfg(max_retries=0)
+    client.set_prompt_addendum("仅在趋势明确时开仓")
     decision, trace = asyncio.run(client.decide_with_trace(_ctx()))
     assert decision.action is Action.HOLD
     assert "标的: BTCUSDT" in trace.user_prompt
+    assert "仅在趋势明确时开仓" in trace.system_prompt
     assert '"messages"' in trace.request_json
     assert '"final_decision"' in trace.response_json
 

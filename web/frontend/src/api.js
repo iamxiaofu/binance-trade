@@ -114,6 +114,7 @@ export const api = {
       'KILL_SWITCH', 'RESUME', 'RESUME_ALL_SYMBOLS', 'SET_SYMBOL_ENABLED',
       'CLOSE_POSITION', 'CANCEL_AND_FLATTEN', 'STOP_ENGINE',
       'UPDATE_RISK_SETTINGS', 'UPDATE_ENGINE_SETTINGS', 'UPDATE_EXECUTION_SETTINGS',
+      'UPDATE_LLM_PROMPT', 'RELOAD_LLM_PROMPT',
     ])
     const token = highRisk.has(name) ? await mainnetConfirmation(name, arg) : ''
     return req(`/api/command/${name}?${qs({ arg, confirmation_token: token })}`, { method: 'POST' })
@@ -167,4 +168,15 @@ export const api = {
     req(`/api/llm/profiles/${encodeURIComponent(name)}/test`, { method: 'POST' }),
   llmActivate: (name) =>
     req(`/api/llm/profiles/${encodeURIComponent(name)}/activate`, { method: 'POST' }),
+  llmPrompt: () => req('/api/llm/prompt'),
+  llmPromptPreview: (payload) =>
+    req('/api/llm/prompt/preview', { method: 'POST', body: JSON.stringify(payload) }),
+  llmPromptApply: async (payload) => {
+    const commandPayload = JSON.stringify({ name: payload.name || '', content: payload.content || '' })
+    const confirmation_token = await mainnetConfirmation('UPDATE_LLM_PROMPT', commandPayload)
+    return req('/api/llm/prompt/apply', {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, confirmation_token }),
+    })
+  },
 }

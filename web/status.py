@@ -767,7 +767,7 @@ def decision_detail(db_path: str, decision_id: int) -> dict | None:
     row = rows[0]
     ctx = _context_from_json(row.get("context_json") or "")
     user_prompt = row.get("llm_prompt") or (build_user_prompt(ctx) if ctx else "")
-    row["llm_system_prompt"] = SYSTEM_PROMPT
+    row["llm_system_prompt"] = row.get("llm_system_prompt") or SYSTEM_PROMPT
     row["llm_user_prompt"] = user_prompt
     row["llm_request_effective_json"] = (
         row.get("llm_request_json") or _reconstructed_request_json(user_prompt)

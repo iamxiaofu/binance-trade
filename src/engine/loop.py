@@ -102,6 +102,8 @@ class TradingEngine:
         # 感知"热替换是否真的发生了"。
         self._llm_version = 0
         self._llm_profile_name = ""
+        self._llm_prompt_version = 0
+        self._llm_prompt_name = ""
         self._store = Store(settings.storage.db_path)
         self.runtime = RuntimeState()
         self._account = AccountStateCoordinator(
@@ -702,6 +704,8 @@ class TradingEngine:
             return "trading engine stopped; positions/orders untouched"
         if name == "SWITCH_LLM_PROFILE":
             return await self._switch_llm_profile(arg)
+        if name == "RELOAD_LLM_PROMPT":
+            return await self._reload_llm_prompt()
         if name == "REPAIR_SL_TP":
             return await self._repair_sl_tp(arg)
         if name == "CANCEL_OPEN_ORDER":
@@ -2669,6 +2673,7 @@ class TradingEngine:
             ctx=ctx,
             skipped=False,
             ref_price=snap.last_price,
+            llm_system_prompt=getattr(llm_trace, "system_prompt", ""),
             llm_prompt=llm_trace.user_prompt,
             llm_request_json=llm_trace.request_json,
             llm_response_json=llm_trace.response_json,
@@ -4007,15 +4012,23 @@ class TradingEngine:
         from src.llm.client import LLMClient
         from src.llm.failover import LLMFailoverClient
         profiles = await self._store.get_enabled_llm_profiles()
+        prompt = await self._store.get_active_llm_prompt_version()
+        prompt_addendum = (prompt or {}).get("content", "")
+        prompt_version = int((prompt or {}).get("version") or 0)
+        prompt_name = str((prompt or {}).get("name") or "")
         chain: list[tuple[str, LLMClient]] = []
         for prof in profiles:
             api_key = await self._store.get_llm_profile_secret(prof["name"])
             if not api_key:
                 logger.warning("llm profile {} has no api_key, skip in chain", prof["name"])
                 continue
-            chain.append((prof["name"], LLMClient.from_profile(prof, self._settings.llm, api_key)))
+            client = LLMClient.from_profile(prof, self._settings.llm, api_key)
+            client.set_prompt_addendum(prompt_addendum)
+            chain.append((prof["name"], client))
         if not chain:
             raise RuntimeError("no usable llm profile (missing api_key)")
+        self._llm_prompt_version = prompt_version
+        self._llm_prompt_name = prompt_name
         return LLMFailoverClient(chain)
 
     async def _apply_llm_chain(self, source: str) -> None:
@@ -4044,6 +4057,9 @@ class TradingEngine:
                 "llm.active_version": str(self._llm_version),
                 "llm.active_source": source,
                 "llm.chain": ",".join(chain_names),
+                "llm.prompt_version": str(self._llm_prompt_version),
+                "llm.prompt_name": self._llm_prompt_name,
+                "llm.prompt_source": source,
             })
         except Exception as e:  # noqa: BLE001
             logger.warning("failed to persist LLM active runtime settings: {}", e)
@@ -4052,7 +4068,11 @@ class TradingEngine:
             await self._store.log_audit(
                 symbol="__LLM_SWITCH__",
                 action="LLM_SWITCH",
-                reason=f"profile: {name} chain={chain_names} (source={source})",
+                reason=(
+                    f"profile: {name} chain={chain_names} "
+                    f"prompt=v{self._llm_prompt_version}:{self._llm_prompt_name} "
+                    f"(source={source})"
+                ),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("failed to log LLM switch audit: {}", e)
@@ -4083,3 +4103,10 @@ class TradingEngine:
                     logger.warning("llm profile rollback failed: {}", roll_e)
             raise
         return f"llm profile switched: {name} (version={self._llm_version})"
+
+    async def _reload_llm_prompt(self) -> str:
+        await self._apply_llm_chain(source="prompt")
+        return (
+            f"llm prompt reloaded: v{self._llm_prompt_version} "
+            f"{self._llm_prompt_name!r} (llm version={self._llm_version})"
+        )

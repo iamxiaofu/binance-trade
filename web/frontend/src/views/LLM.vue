@@ -13,6 +13,15 @@ const status = ref({
   engine: { active_name: '', active_version: 0, active_source: '', chain: '' },
 })
 const profiles = ref([])
+const promptStatus = ref({
+  active: null,
+  versions: [],
+  engine: { version: 0, name: '', source: '' },
+  effective_system_prompt: '',
+})
+const promptForm = ref({ name: '', content: '' })
+const promptPreview = ref('')
+const promptLoading = ref(false)
 const showDialog = ref(false)
 const editing = ref(null)  // null = 新增；否则为原 profile
 const form = ref(emptyForm())
@@ -44,19 +53,66 @@ const engineChain = computed(() => status.value?.engine?.chain || '—')
 const engineSynced = computed(
   () => engineActiveName.value !== '—' && engineActiveName.value === activeName.value,
 )
+const promptActive = computed(() => promptStatus.value?.active || null)
+const promptEngine = computed(() => promptStatus.value?.engine || { version: 0, name: '', source: '' })
+const promptSynced = computed(() => {
+  const activeVersion = Number(promptActive.value?.version || 0)
+  return Number(promptEngine.value.version || 0) === activeVersion
+})
 
 async function refresh() {
   loading.value = true
   try {
-    const [st, pr] = await Promise.all([api.llmStatus(), api.llmProfiles()])
+    const [st, pr, prompt] = await Promise.all([api.llmStatus(), api.llmProfiles(), api.llmPrompt()])
     // 用整体赋值即可，ref 默认值已经给出"乐观默认"，不会瞬时变 null。
     status.value = st
     profiles.value = pr.items || []
+    promptStatus.value = prompt
+    promptForm.value = {
+      name: prompt.active?.name || '',
+      content: prompt.active?.content || '',
+    }
+    promptPreview.value = prompt.effective_system_prompt || ''
     firstLoaded.value = true
   } catch (e) {
     ElMessage.error(`加载失败: ${e.message}`)
   } finally {
     loading.value = false
+  }
+}
+
+async function previewPrompt() {
+  promptLoading.value = true
+  try {
+    const r = await api.llmPromptPreview({ content: promptForm.value.content || '' })
+    promptPreview.value = r.effective_system_prompt || ''
+  } catch (e) {
+    ElMessage.error(`预览失败: ${e.message}`)
+  } finally {
+    promptLoading.value = false
+  }
+}
+
+async function applyPrompt() {
+  try {
+    await ElMessageBox.confirm(
+      'Prompt 附加指令会影响后续 LLM 交易决策。保存后当前 LLM 调用不会被打断，下一次决策开始生效。',
+      '应用 Prompt',
+      { confirmButtonText: '保存并热加载', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch (_) { return }
+  promptLoading.value = true
+  try {
+    await api.llmPromptApply({
+      name: promptForm.value.name || '',
+      content: promptForm.value.content || '',
+    })
+    ElMessage.success('Prompt 已保存，engine 将热加载')
+    setTimeout(refresh, 500)
+  } catch (e) {
+    ElMessage.error(`应用失败: ${e.message}`)
+  } finally {
+    promptLoading.value = false
   }
 }
 
@@ -174,9 +230,10 @@ onMounted(() => {
   refresh()
   // 切换命令入队后 1.5s 起轮询 /api/llm/status，捕获 engine 热替换完成的 version 变化
   pollTimer.value = setInterval(() => {
-    api.llmStatus().then((s) => {
+    Promise.all([api.llmStatus(), api.llmPrompt()]).then(([s, prompt]) => {
       // 局部覆盖，不整体替换，避免 computed 中间态
       status.value = { ...status.value, ...s }
+      promptStatus.value = { ...promptStatus.value, ...prompt }
     }).catch(() => {})
   }, 2000)
 })
@@ -212,6 +269,52 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
         </el-card>
       </el-col>
     </el-row>
+
+    <el-card shadow="never" class="prompt-card">
+      <template #header>
+        <div class="table-header">
+          <span>Prompt 控制</span>
+          <div class="prompt-status">
+            <el-tag :type="promptSynced ? 'success' : 'warning'" size="small" effect="plain">
+              {{ promptSynced ? 'engine 已同步' : 'engine 热加载中' }}
+            </el-tag>
+            <span>DB v{{ promptActive?.version || 0 }} {{ promptActive?.name || '默认空附加指令' }}</span>
+            <span>Engine v{{ promptEngine.version || 0 }} {{ promptEngine.name || '默认空附加指令' }}</span>
+          </div>
+        </div>
+      </template>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom:12px"
+        title="这里只能编辑附加策略指令；系统硬性风控纪律和市场数据模板仍由代码固定。附加指令如与硬规则冲突，硬规则优先。"
+      />
+      <el-form label-width="110px">
+        <el-form-item label="版本名称">
+          <el-input v-model="promptForm.name" placeholder="例如 趋势优先 / 震荡少交易 / 保守日内" maxlength="80" show-word-limit />
+        </el-form-item>
+        <el-form-item label="附加指令">
+          <el-input
+            v-model="promptForm.content"
+            type="textarea"
+            :rows="8"
+            maxlength="20000"
+            show-word-limit
+            placeholder="例如：震荡区间内降低开仓频率；只有多周期方向一致且成交量放大时才提高 confidence。"
+          />
+        </el-form-item>
+        <el-form-item>
+          <el-button :loading="promptLoading" @click="previewPrompt">预览最终 System Prompt</el-button>
+          <el-button type="primary" :loading="promptLoading" @click="applyPrompt">保存并热加载</el-button>
+        </el-form-item>
+      </el-form>
+      <el-collapse v-if="promptPreview">
+        <el-collapse-item title="最终 System Prompt 预览">
+          <pre class="prompt-preview">{{ promptPreview }}</pre>
+        </el-collapse-item>
+      </el-collapse>
+    </el-card>
 
     <el-card shadow="never" class="table-card">
       <template #header>
@@ -358,6 +461,22 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
 .status-row .stat-hint { font-size: 12px; color: var(--el-text-color-placeholder); margin-top: 2px; }
 .table-card { margin-top: 4px; }
 .table-header { display: flex; justify-content: space-between; align-items: center; }
+.prompt-card { margin-top: 4px; }
+.prompt-status {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.prompt-preview {
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
 .test-ok { color: #67c23a; font-size: 12px; margin-left: 8px; }
 .test-fail { color: #f56c6c; font-size: 12px; margin-left: 8px; }
 code { background: rgba(127,127,127,0.1); padding: 0 4px; border-radius: 3px; }
