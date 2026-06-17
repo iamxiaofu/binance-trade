@@ -37,24 +37,37 @@ async function submit() {
 
 <template>
   <div class="login-page">
+    <div class="login-grid-bg" aria-hidden="true"></div>
+    <div class="login-orb login-orb-primary" aria-hidden="true"></div>
+    <div class="login-orb login-orb-secondary" aria-hidden="true"></div>
+
     <section class="login-hero">
       <div class="login-brand">
-        <div class="login-logo">BT</div>
+        <div class="login-logo">GQ</div>
         <div>
-          <h1>Binance-trade</h1>
-          <p>合约交易控制台</p>
+          <h1>Genius Quant AI</h1>
+          <p>AI-Driven Crypto Futures Trading System</p>
         </div>
       </div>
       <div class="login-copy">
-        <h2>登录后管理 testnet 与 mainnet</h2>
-        <p>使用统一账号登录，系统会同时为两个环境建立安全会话；主网高风险操作仍保留 MAINNET 二次确认。</p>
+        <div class="login-eyebrow">Large Model Quant Platform</div>
+        <h2>大模型量化交易平台</h2>
+        <p>融合 LLM、Private User Stream、Multi-Timeframe Signals、Dynamic Risk Control 与 Maker-first Execution。</p>
+        <div class="tech-tags">
+          <span>LLM Strategy Engine</span>
+          <span>Binance Private Stream</span>
+          <span>Multi-Timeframe Signals</span>
+          <span>Dynamic Risk Control</span>
+          <span>Maker-first Execution</span>
+          <span>Real-time Position Guard</span>
+        </div>
       </div>
     </section>
 
     <el-card class="login-card" shadow="always">
       <template #header>
         <div class="login-card-header">
-          <span>账户登录</span>
+          <span>进入交易中枢</span>
           <el-tag type="warning" effect="dark">SESSION</el-tag>
         </div>
       </template>
@@ -89,7 +102,7 @@ async function submit() {
           :loading="loading"
           @click="submit"
         >
-          登录控制台
+          进入控制台
         </el-button>
       </el-form>
 
@@ -98,7 +111,7 @@ async function submit() {
         type="info"
         :closable="false"
         show-icon
-        title="登录状态由 HttpOnly Cookie 保存，前端不会保存密码或 token。"
+        title="HttpOnly Session Cookie · No token stored in frontend"
       />
       <div v-if="authState.checked && !authState.authenticated" class="login-status">
         当前未登录或登录已过期
@@ -109,21 +122,58 @@ async function submit() {
 
 <style scoped>
 .login-page {
+  position: relative;
   min-height: 100vh;
   min-height: 100dvh;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 420px;
   gap: 48px;
   align-items: center;
+  overflow: hidden;
   padding: 48px clamp(20px, 7vw, 96px);
   background:
-    radial-gradient(circle at 12% 20%, rgba(64, 158, 255, 0.20), transparent 30%),
-    radial-gradient(circle at 82% 78%, rgba(245, 108, 108, 0.18), transparent 28%),
+    linear-gradient(135deg, rgba(5, 10, 26, 0.98), rgba(13, 20, 45, 0.96) 48%, rgba(6, 11, 30, 0.99)),
     var(--bt-bg);
-  color: var(--bt-text);
+  color: #e5eefc;
+}
+
+.login-grid-bg {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(96, 165, 250, 0.10) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(96, 165, 250, 0.10) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: radial-gradient(circle at 35% 42%, black, transparent 72%);
+  opacity: 0.45;
+}
+
+.login-orb {
+  position: absolute;
+  width: 520px;
+  height: 520px;
+  pointer-events: none;
+  border-radius: 999px;
+  filter: blur(16px);
+  opacity: 0.45;
+}
+
+.login-orb-primary {
+  left: -180px;
+  top: -140px;
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.65), transparent 68%);
+}
+
+.login-orb-secondary {
+  right: -150px;
+  bottom: -180px;
+  background: radial-gradient(circle, rgba(245, 158, 11, 0.42), transparent 70%);
 }
 
 .login-hero {
+  position: relative;
+  z-index: 1;
   max-width: 620px;
 }
 
@@ -139,12 +189,15 @@ async function submit() {
   height: 58px;
   display: grid;
   place-items: center;
-  border-radius: 18px;
-  color: #111827;
-  background: linear-gradient(135deg, #facc15, #f59e0b);
+  border: 1px solid rgba(250, 204, 21, 0.42);
+  border-radius: 20px;
+  color: #fef3c7;
+  background: linear-gradient(135deg, rgba(250, 204, 21, 0.20), rgba(59, 130, 246, 0.16));
   font-weight: 800;
   letter-spacing: 0.04em;
-  box-shadow: 0 18px 45px rgba(245, 158, 11, 0.30);
+  box-shadow:
+    0 0 40px rgba(250, 204, 21, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
 
 .login-brand h1,
@@ -154,18 +207,39 @@ async function submit() {
 
 .login-brand h1 {
   font-size: 32px;
+  letter-spacing: -0.03em;
 }
 
 .login-brand p,
 .login-copy p {
   margin: 8px 0 0;
-  color: var(--bt-muted);
+  color: rgba(203, 213, 225, 0.78);
+}
+
+.login-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 16px;
+  padding: 7px 12px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 999px;
+  color: #93c5fd;
+  background: rgba(15, 23, 42, 0.55);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 .login-copy h2 {
   max-width: 560px;
-  font-size: clamp(30px, 5vw, 54px);
+  font-size: clamp(38px, 6vw, 72px);
   line-height: 1.05;
+  letter-spacing: -0.07em;
+  background: linear-gradient(135deg, #f8fafc 12%, #93c5fd 52%, #facc15);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 .login-copy p {
@@ -174,12 +248,41 @@ async function submit() {
   line-height: 1.8;
 }
 
+.tech-tags {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 28px;
+  max-width: 620px;
+}
+
+.tech-tags span {
+  padding: 11px 13px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 14px;
+  color: rgba(226, 232, 240, 0.92);
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.72), rgba(30, 41, 59, 0.42));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  font-size: 13px;
+}
+
 .login-card {
+  position: relative;
+  z-index: 1;
   width: 100%;
-  border-color: color-mix(in srgb, var(--bt-border) 70%, transparent);
-  background: color-mix(in srgb, var(--bt-card) 92%, transparent);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.84), rgba(15, 23, 42, 0.68)),
+    rgba(15, 23, 42, 0.78);
+  box-shadow:
+    0 24px 80px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  --el-card-bg-color: transparent;
+  --el-card-border-color: transparent;
+  color: #e5eefc;
 }
 
 .login-card-header {
@@ -193,6 +296,11 @@ async function submit() {
 .login-submit {
   width: 100%;
   margin-top: 4px;
+  border: 0;
+  color: #07111f;
+  background: linear-gradient(135deg, #93c5fd, #facc15);
+  font-weight: 700;
+  box-shadow: 0 16px 34px rgba(59, 130, 246, 0.25);
 }
 
 .login-note {
@@ -202,7 +310,7 @@ async function submit() {
 .login-status {
   margin-top: 12px;
   font-size: 13px;
-  color: var(--bt-muted);
+  color: rgba(203, 213, 225, 0.72);
 }
 
 @media (max-width: 860px) {
@@ -218,6 +326,10 @@ async function submit() {
 
   .login-copy h2 {
     font-size: 30px;
+  }
+
+  .tech-tags {
+    grid-template-columns: 1fr;
   }
 }
 </style>
