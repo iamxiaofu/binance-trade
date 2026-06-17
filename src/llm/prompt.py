@@ -221,10 +221,24 @@ def _position_block(ctx: MarketContext) -> str:
     if pos.has_position:
         sl_desc = f"SL≈{pos.sl_price}" if pos.sl_price else "SL=未挂"
         tp_desc = f"TP≈{pos.tp_price}" if pos.tp_price else "TP=未挂"
+        age_desc = (
+            f"已持仓约{pos.position_age_minutes:.2f}分钟"
+            if pos.position_age_minutes is not None else "持仓时长=无本地记录"
+        )
+        bars_desc = (
+            f"约{pos.position_age_1m_bars}根1m K线"
+            if pos.position_age_1m_bars is not None else "1m K线数=无本地记录"
+        )
+        if pos.minutes_since_last_sltp_adjust is not None:
+            sltp_desc = f"距上次接受SL调整约{pos.minutes_since_last_sltp_adjust:.2f}分钟"
+        else:
+            sltp_desc = "上次接受SL调整=无记录"
         return (
             f"持仓: {pos.side} 数量={pos.size} 开仓价={pos.entry_price} "
             f"未实现盈亏={pos.unrealized_pnl_pct}% 当前杠杆={pos.current_leverage}x  "
-            f"当前保护单: {sl_desc} / {tp_desc}"
+            f"当前保护单: {sl_desc} / {tp_desc}\n"
+            f"持仓时间: {age_desc}（{bars_desc}）；{sltp_desc}；"
+            f"当前主动CLOSE连续确认计数={pos.close_confirm_count}"
         )
     return "持仓: 无（空仓）"
 

@@ -51,7 +51,7 @@ from src.engine.settings import (
 )
 from src.features.builder import build_context, build_position_snapshot
 from src.llm.client import LLMClient
-from src.llm.schema import Action, MarketContext, TradeDecision
+from src.llm.schema import Action, MarketContext, PositionSnapshot, TradeDecision
 from src.notify.telegram import Event, Notifier
 from src.risk.manager import RejectCode, RiskContext, Verdict, validate
 from src.risk.settings import (
@@ -2568,6 +2568,30 @@ class TradingEngine:
             return True
         return rt.halt_new_entries
 
+    async def _enrich_position_timing(self, symbol: str, position: PositionSnapshot) -> None:
+        """Add local lifecycle timing to the LLM-only position snapshot."""
+        now_ms = int(time.time() * 1000)
+        trade = await self._store.latest_open_trade_summary(symbol)
+        if trade:
+            opened_at_ms = int(trade.get("opened_at_ms") or 0)
+            if opened_at_ms > 0:
+                age_minutes = max(0.0, (now_ms - opened_at_ms) / 60_000.0)
+                position.opened_at_ms = opened_at_ms
+                position.position_age_minutes = round(age_minutes, 2)
+                position.position_age_1m_bars = int(age_minutes)
+
+        sltp_state = self._last_sltp_adjust.get(symbol)
+        if sltp_state and sltp_state.ts_ms > 0:
+            position.last_sltp_adjust_at_ms = int(sltp_state.ts_ms)
+            position.minutes_since_last_sltp_adjust = round(
+                max(0.0, (now_ms - sltp_state.ts_ms) / 60_000.0),
+                2,
+            )
+
+        close_state = self._close_confirmations.get(symbol)
+        if close_state:
+            position.close_confirm_count = int(close_state.count or 0)
+
     async def _process_symbol(self, symbol: str) -> None:
         snap = self._market.snapshot(symbol)
         if not self._symbol_enabled.get(symbol, True):
@@ -2579,6 +2603,7 @@ class TradingEngine:
             return
         position = build_position_snapshot(self.runtime.positions.get(symbol))
         if position.has_position:
+            await self._enrich_position_timing(symbol, position)
             try:
                 active_orders = await self._active_protection_orders(symbol)
                 for order in active_orders:

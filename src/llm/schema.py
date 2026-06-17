@@ -113,6 +113,12 @@ class PositionSnapshot(BaseModel):
     current_leverage: int | None = None
     sl_price: float | None = None   # 当前交易所挂单的止损触发价（无则 None）
     tp_price: float | None = None   # 当前交易所挂单的止盈触发价（无则 None）
+    opened_at_ms: int | None = None
+    position_age_minutes: float | None = None
+    position_age_1m_bars: int | None = None
+    last_sltp_adjust_at_ms: int | None = None
+    minutes_since_last_sltp_adjust: float | None = None
+    close_confirm_count: int = 0
 
 
 class MarketContext(BaseModel):

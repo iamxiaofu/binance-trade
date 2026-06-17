@@ -107,6 +107,49 @@ def test_prompt_includes_risk_reason_discipline():
     assert "风险换算: entry_ref=..." in prompt
 
 
+def test_position_block_includes_timing_for_llm_discipline():
+    klines = _klines(100)
+    ctx = MarketContext(
+        symbol="ETHUSDT",
+        timestamp=klines[-1][0],
+        last_price=3200.0,
+        mark_price=3201.0,
+        funding_rate=0.0,
+        change_24h_pct=0.0,
+        recent_klines=klines,
+        indicators=IndicatorSnapshot(**compute_snapshot(klines)),
+        position=PositionSnapshot(
+            has_position=True,
+            side="LONG",
+            entry_price=3180.0,
+            size=0.1,
+            unrealized_pnl_pct=0.5,
+            current_leverage=3,
+            sl_price=3140.0,
+            tp_price=3300.0,
+            opened_at_ms=klines[-8][0],
+            position_age_minutes=7.5,
+            position_age_1m_bars=7,
+            last_sltp_adjust_at_ms=klines[-4][0],
+            minutes_since_last_sltp_adjust=3.25,
+            close_confirm_count=2,
+        ),
+        available_margin=1000.0,
+        max_leverage_allowed=5,
+        account_equity=1000.0,
+        max_order_margin_abs=200.0,
+        max_loss_per_trade_abs=60.0,
+    )
+
+    prompt = build_user_prompt(ctx, kline_interval="5m", prompt_kline_count=48)
+
+    assert "最近48根K线（5m级别）" in prompt
+    assert "已持仓约7.50分钟" in prompt
+    assert "约7根1m K线" in prompt
+    assert "距上次接受SL调整约3.25分钟" in prompt
+    assert "当前主动CLOSE连续确认计数=2" in prompt
+
+
 def test_full_template_rendering_uses_whitelisted_context():
     klines = _klines(30)
     ctx = MarketContext(
