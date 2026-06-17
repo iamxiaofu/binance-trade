@@ -56,7 +56,16 @@ const engineSnapshotFields = [
   { key: 'micro_return_5m_trigger_pct', label: '1m 微观 5m return 触发 (%)', min: 0, max: 100, step: 0.05 },
   { key: 'micro_range_5m_trigger_pct', label: '1m 微观 5m range 触发 (%)', min: 0, max: 100, step: 0.05 },
 ]
-const engineFields = [...engineCadenceFields, ...engineTriggerFields, ...engineSnapshotFields]
+const engineProtectionFields = [
+  { key: 'close_confirm_min_1m_bars', label: '主动平仓最少持仓 1m K线', min: 0, max: 60, step: 1 },
+  { key: 'close_confirm_min_count', label: '主动平仓连续确认次数', min: 1, max: 10, step: 1 },
+  { key: 'close_block_loss_atr_multiple', label: '小浮亏阻止平仓 ATR倍数', min: 0, max: 10, step: 0.1 },
+  { key: 'close_confirm_window_seconds', label: '平仓确认有效窗口（秒）', min: 60, max: 86400, step: 60 },
+  { key: 'sltp_adjust_min_seconds', label: '同仓位 SL 调整最小间隔（秒）', min: 0, max: 86400, step: 60 },
+  { key: 'sltp_adjust_min_atr_multiple', label: 'SL 最小改善 ATR倍数', min: 0, max: 10, step: 0.1 },
+  { key: 'breakeven_fee_slippage_buffer_pct', label: '保本SL手续费滑点缓冲 (%)', min: 0, max: 5, step: 0.01 },
+]
+const engineFields = [...engineCadenceFields, ...engineTriggerFields, ...engineSnapshotFields, ...engineProtectionFields]
 const engineFieldHelp = {
   cycle_interval_seconds: 'Engine 主循环多久运行一次。每轮刷新行情、检查风控、判断是否调用 LLM；上一轮 LLM 未结束时不会并发启动下一轮。',
   review_flat_seconds: '空仓且没有显著行情变化时，距离上次 LLM 决策超过该秒数后强制复查。',
@@ -77,6 +86,13 @@ const engineFieldHelp = {
   volume_zscore_trigger: '成交量 z-score 上穿该阈值会触发 LLM，也用于高波动判断。',
   micro_return_5m_trigger_pct: '1m 微观数据最近 5 分钟 return 的绝对值阈值。',
   micro_range_5m_trigger_pct: '1m 微观数据最近 5 分钟价格区间百分比阈值。',
+  close_confirm_min_1m_bars: '主动策略平仓前，持仓至少经历多少根 1m K线。用于过滤刚开仓后的微观反向噪音。',
+  close_confirm_min_count: 'LLM 连续输出 CLOSE 达到该次数后，才允许主动策略平仓。交易所 SL/TP、熔断、紧急平仓不受该限制。',
+  close_block_loss_atr_multiple: '浮亏小于该 ATR 倍数时，禁止因为 1m 反向噪音主动 CLOSE。设置 1 表示浮亏未超过 1 ATR 不主动平仓。',
+  close_confirm_window_seconds: '连续 CLOSE 确认的有效时间窗口。超过窗口未再次确认，会重新计数。',
+  sltp_adjust_min_seconds: '同一仓位两次接受 LLM 调整 SL 的最小间隔。用于避免频繁撤挂保护单。',
+  sltp_adjust_min_atr_multiple: '新 SL 相比旧 SL 至少改善多少 ATR 才允许替换，改善方向：多单 SL 上移、空单 SL 下移。',
+  breakeven_fee_slippage_buffer_pct: 'SL 移到保本或盈利侧时，必须额外覆盖手续费和滑点缓冲。0.15 表示 entry 外侧 0.15%。',
 }
 
 const executionModeField = {
@@ -418,6 +434,22 @@ onMounted(() => {
               <template #label><span class="param-label">{{ field.label }}<el-tooltip :content="engineFieldHelp[field.key]" placement="top" effect="dark" :trigger="tooltipTrigger" popper-class="param-tooltip" :show-after="200"><span class="param-help">?</span></el-tooltip></span></template>
               <el-switch v-if="field.type === 'bool'" v-model="engineForm[field.key]" />
               <el-input-number v-else v-model="engineForm[field.key]" :min="field.min" :max="field.max" :step="field.step" style="width:100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-divider content-position="left">主动平仓与 SL 调整保护</el-divider>
+        <el-alert
+          type="warning"
+          :closable="false"
+          style="margin-bottom:12px"
+          title="这些是执行前硬规则：限制 LLM 因短周期噪音主动平仓，并限制同仓位频繁移动 SL。交易所止损止盈、熔断和紧急保护不受主动平仓确认次数限制。"
+        />
+        <el-row :gutter="16">
+          <el-col v-for="field in engineProtectionFields" :key="field.key" :span="12">
+            <el-form-item>
+              <template #label><span class="param-label">{{ field.label }}<el-tooltip :content="engineFieldHelp[field.key]" placement="top" effect="dark" :trigger="tooltipTrigger" popper-class="param-tooltip" :show-after="200"><span class="param-help">?</span></el-tooltip></span></template>
+              <el-input-number v-model="engineForm[field.key]" :min="field.min" :max="field.max" :step="field.step" style="width:100%" />
             </el-form-item>
           </el-col>
         </el-row>

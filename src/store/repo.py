@@ -2015,6 +2015,31 @@ class Store:
                 qty += max(float(row.qty_opened or 0.0) - float(row.qty_closed or 0.0), 0.0)
             return qty
 
+    async def latest_open_trade_summary(self, symbol: str) -> dict[str, Any] | None:
+        """Return the latest local open trade lifecycle for execution guards."""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(TradeRow)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                    .order_by(TradeRow.opened_at_ms.desc(), TradeRow.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "symbol": row.symbol,
+                "direction": row.direction,
+                "opened_at_ms": int(row.opened_at_ms or 0),
+                "entry_price": float(row.entry_price or 0.0),
+                "qty_opened": float(row.qty_opened or 0.0),
+                "qty_closed": float(row.qty_closed or 0.0),
+            }
+
     async def reconcile_symbol_flat(
         self,
         symbol: str,

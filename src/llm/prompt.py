@@ -60,6 +60,14 @@ SYSTEM_PROMPT = """\
     方向不满足时必须重新计算后再提交。
 11. 如果 reason 中的百分比、触发价或损益估算与结构化字段不一致，必须修正 reason 后再提交。
 12. 只依据提供的数据判断，不臆造未提供的信息。
+13. 主动 CLOSE 是高摩擦动作，只能在结构明显破坏时使用：
+    - 持仓未满 5 根 1m K 线，不要因为 1m 反向波动提交 CLOSE。
+    - 浮亏未超过约 1 ATR 时，不要因为 1m 反向波动提交 CLOSE，应优先 HOLD 或合理 ADJUST_SLTP。
+    - 主动 CLOSE 需要连续证据支持；单次噪音、影线或微小回撤不足以平仓。
+14. ADJUST_SLTP 应避免频繁改价：
+    - 同一仓位移动 SL 至少间隔约 15 分钟。
+    - 新 SL 必须比旧 SL 有明显改善，至少约 0.4 ATR。
+    - 保本/锁利 SL 必须覆盖手续费与滑点缓冲，不能把 SL 刚好放在 entry 附近。
 
 风格：专业、客观、基于证据。有把握的机会要敢于参与，不确定时也不勉强。追求长期正期望，而非频繁交易。
 """
@@ -104,6 +112,9 @@ DEFAULT_USER_PROMPT_TEMPLATE = """\
 
 主周期结构化趋势特征（百分比字段单位均为 %，由完整K线窗口计算）:
 {trend_feature_block}
+
+主周期结构与执行纪律:
+{structure_block}
 
 多周期指标(共振参考):
 {higher_timeframes_block}
@@ -197,7 +208,10 @@ def _fmt_higher_tf(tfs) -> str:
     for t in tfs:
         lines.append(
             f"  [{t.timeframe}] 趋势={t.trend} EMA12={t.ema_fast:.2f} EMA26={t.ema_slow:.2f} "
-            f"RSI={t.rsi:.1f} MACD={t.macd:.2f}/{t.macd_signal:.2f}"
+            f"RSI={t.rsi:.1f} MACD={t.macd:.2f}/{t.macd_signal:.2f} "
+            f"ADX={t.adx:.1f} ATR%={t.atr_pct:.3f} "
+            f"Swing高/低={t.swing_high:.4f}/{t.swing_low:.4f} "
+            f"区间位置={t.range_position_pct:.3f} 突破状态={t.breakout_state}"
         )
     return "\n".join(lines)
 
@@ -237,6 +251,8 @@ def user_prompt_variables(
   RSI(14)={ind.rsi:.2f}
   MACD={ind.macd:.4f}  Signal={ind.macd_signal:.4f}  Hist={ind.macd_hist:.4f}
   ATR(14)={ind.atr:.4f}  ATR%={ind.atr_pct:.4f}
+  ADX(14)={ind.adx_14:.2f}  +DI={ind.plus_di_14:.2f}  -DI={ind.minus_di_14:.2f}
+  VWAP={ind.vwap:.4f}  价格相对VWAP={ind.price_vs_vwap_pct:.4f}  VWAP斜率12根={ind.vwap_slope_pct:.4f}
   Boll中轨={ind.boll_mid:.4f}  上轨={ind.boll_upper:.4f}  下轨={ind.boll_lower:.4f}
   成交量={ind.volume:.2f}  20均量={ind.volume_ma:.2f}  量比={ind.volume_ratio}（>1放量）"""
     trend_feature_block = f"""\
@@ -249,9 +265,18 @@ def user_prompt_variables(
   MACD柱变化: Δ3={ind.macd_hist_delta_3:.4f}  Δ6={ind.macd_hist_delta_6:.4f}
   RSI变化: Δ3={ind.rsi_delta_3:.2f}  Δ6={ind.rsi_delta_6:.2f}
   波动/位置: ATR%Δ6={ind.atr_pct_delta_6:.4f}
-  Boll%B={ind.boll_percent_b:.4f}  Boll带宽={ind.boll_bandwidth_pct:.4f}
+  ATR分位96={ind.atr_pct_percentile_96:.2f}  Boll%B={ind.boll_percent_b:.4f}
+  Boll带宽={ind.boll_bandwidth_pct:.4f}  Boll带宽分位96={ind.boll_bandwidth_percentile_96:.2f}
   最新K线振幅={ind.last_range_pct:.4f}  实体={ind.last_body_pct:.4f}
+  上影线={ind.upper_wick_pct:.4f}  下影线={ind.lower_wick_pct:.4f}  实体/全振幅={ind.body_to_range:.4f}
+  连续上涨K数={ind.consecutive_up_count}  连续下跌K数={ind.consecutive_down_count}
   量能变化: 量比Δ3={ind.volume_ratio_delta_3:.4f}  20量Z={ind.volume_zscore_20:.4f}"""
+    structure_block = f"""\
+  最近48根Swing高={ind.swing_high:.4f}  Swing低={ind.swing_low:.4f}
+  距Swing高={ind.dist_to_swing_high_pct:.4f}%  距Swing低={ind.dist_to_swing_low_pct:.4f}%
+  区间位置={ind.range_position_pct:.4f}（0接近低点，1接近高点）  突破状态={ind.breakout_state}
+  CLOSE纪律: 持仓未满5根1m、浮亏未超过约1 ATR、或只有单次1m反向噪音时，优先 HOLD/ADJUST_SLTP，不主动 CLOSE。
+  SL纪律: 同仓位移动SL约15分钟最多一次；新SL至少改善0.4 ATR；保本/锁利必须覆盖手续费与滑点。"""
     return {
         "symbol": ctx.symbol,
         "timestamp": ctx.timestamp,
@@ -275,6 +300,7 @@ def user_prompt_variables(
         "sentiment_block": _fmt_sentiment(ctx.sentiment),
         "indicator_block": indicator_block,
         "trend_feature_block": trend_feature_block,
+        "structure_block": structure_block,
         "higher_timeframes_block": _fmt_higher_tf(ctx.higher_timeframes),
         "recent_count": len(recent),
         "recent_klines_json": recent_json,

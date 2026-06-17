@@ -16,6 +16,12 @@ import time
 from loguru import logger
 
 from src.config.schema import Credentials, ExecutionMode, Settings
+from src.engine.decision_guards import (
+    CloseConfirmationState,
+    SltpAdjustState,
+    evaluate_close_guard,
+    evaluate_sltp_adjust_guard,
+)
 from src.exchange.client import ExchangeClient
 from src.exchange.events import rest_snapshot_event
 from src.exchange.filters import normalize_order, round_price
@@ -123,6 +129,8 @@ class TradingEngine:
         self._state_sync_lock = asyncio.Lock()
         self._just_adopted: dict[str, bool] = {}  # B4: 标记本周期刚接管的 symbol
         self._recent_explicit_closes: dict[str, float] = {}
+        self._close_confirmations: dict[str, CloseConfirmationState] = {}
+        self._last_sltp_adjust: dict[str, SltpAdjustState] = {}
         self._reconcile_task: asyncio.Task | None = None
         self._cycle_leader_snapshot: FeatureSnapshot | None = None
         self._risk_defaults = settings.risk.model_copy(deep=True)
@@ -2686,6 +2694,8 @@ class TradingEngine:
 
         # CLOSE 优先处理（不受开仓限额约束）
         if decision.action == Action.CLOSE:
+            if not await self._allow_strategy_close(decision, ctx):
+                return
             await self._handle_close(symbol)
             return
         if decision.action == Action.HOLD:
@@ -2903,6 +2913,50 @@ class TradingEngine:
             if float(p.get("contracts") or 0.0) != 0
         }
 
+    async def _allow_strategy_close(self, decision: TradeDecision, ctx: MarketContext) -> bool:
+        """Hard gate for LLM-requested active CLOSE decisions."""
+        symbol = decision.symbol
+        raw = self.runtime.positions.get(symbol)
+        if not raw:
+            return True
+        trade = await self._store.latest_open_trade_summary(symbol)
+        if not trade:
+            return True
+        side = str(raw.get("side") or "").lower()
+        entry = float(raw.get("entryPrice") or raw.get("entry_price") or trade.get("entry_price") or 0.0)
+        mark = await self._current_mark_price(symbol, raw)
+        now_ms = int(time.time() * 1000)
+        settings = self._engine_settings
+        result = evaluate_close_guard(
+            state=self._close_confirmations.get(symbol),
+            trade_id=int(trade["id"]),
+            opened_at_ms=int(trade["opened_at_ms"] or 0),
+            now_ms=now_ms,
+            side=side,
+            entry_price=entry,
+            mark_price=mark,
+            atr=float(ctx.indicators.atr or 0.0),
+            min_age_seconds=int(settings.close_confirm_min_1m_bars) * 60,
+            min_confirmations=int(settings.close_confirm_min_count),
+            loss_atr_multiple=float(settings.close_block_loss_atr_multiple),
+            confirmation_window_seconds=int(settings.close_confirm_window_seconds),
+        )
+        self._close_confirmations[symbol] = result.state
+        if result.allowed:
+            self._close_confirmations.pop(symbol, None)
+            return True
+        await self._store.log_audit(
+            symbol=symbol,
+            action="CLOSE_BLOCKED",
+            reason=(
+                f"LLM CLOSE blocked by strategy guard: {result.reason}; "
+                f"trade_id={trade['id']} entry={entry:.8g} mark={mark:.8g} "
+                f"atr={float(ctx.indicators.atr or 0.0):.8g}"
+            ),
+        )
+        logger.warning("[{}] LLM CLOSE blocked: {}", symbol, result.reason)
+        return False
+
     async def _handle_close(self, symbol: str) -> None:
         raw = self.runtime.positions.get(symbol)
         if not raw:
@@ -2943,6 +2997,8 @@ class TradingEngine:
                 return
             # 已显式平仓：从运行态移除，避免 _snapshot 的差异检测重复计账
             self.runtime.positions.pop(symbol, None)
+            self._close_confirmations.pop(symbol, None)
+            self._last_sltp_adjust.pop(symbol, None)
             remaining = await self._cancel_symbol_condition_orders(
                 symbol, reason="explicit_close"
             )
@@ -2977,6 +3033,17 @@ class TradingEngine:
         is_long = side == "long"
         filters = self._client.filters(symbol)
         equity = await self._current_equity()
+        trade = await self._store.latest_open_trade_summary(symbol)
+        trade_id = int((trade or {}).get("id") or 0)
+        old_orders = await self._active_protection_orders(symbol)
+        old_sl = next(
+            (
+                float(order.get("trigger_price") or order.get("price") or 0.0)
+                for order in old_orders
+                if order.get("kind") == "SL"
+            ),
+            0.0,
+        )
 
         # 用标记价作为基准计算新触发价
         specs: list[tuple[str, str, float]] = []
@@ -3004,9 +3071,35 @@ class TradingEngine:
         if not specs:
             logger.warning("[{}] ADJUST_SLTP: 全部触发价校验失败 {}", symbol, rejected)
             return
+        new_sl = next((trigger for kind, _otype, trigger in specs if kind == "SL"), 0.0)
+        guard = evaluate_sltp_adjust_guard(
+            state=self._last_sltp_adjust.get(symbol),
+            trade_id=trade_id,
+            now_ms=int(time.time() * 1000),
+            side=side,
+            entry_price=entry,
+            mark_price=mark,
+            old_sl=old_sl,
+            new_sl=new_sl,
+            atr=float(ctx.indicators.atr or 0.0),
+            min_interval_seconds=int(self._engine_settings.sltp_adjust_min_seconds),
+            min_improve_atr_multiple=float(self._engine_settings.sltp_adjust_min_atr_multiple),
+            breakeven_buffer_pct=float(self._engine_settings.breakeven_fee_slippage_buffer_pct),
+        )
+        if not guard.allowed:
+            await self._store.log_audit(
+                symbol=symbol,
+                action="SLTP_BLOCKED",
+                reason=(
+                    f"LLM ADJUST_SLTP blocked by strategy guard: {guard.reason}; "
+                    f"trade_id={trade_id} side={side} entry={entry:.8g} mark={mark:.8g} "
+                    f"old_sl={old_sl:.8g} new_sl={new_sl:.8g} atr={float(ctx.indicators.atr or 0.0):.8g}"
+                ),
+            )
+            logger.warning("[{}] ADJUST_SLTP blocked: {}", symbol, guard.reason)
+            return
 
         # 先放置并确认新保护单，再逐个撤销被替换的旧单，避免出现裸仓窗口。
-        old_orders = await self._active_protection_orders(symbol)
         results = await self._executor.place_protection_orders(
             symbol=symbol, pos_side=side, qty=qty, specs=specs,
         )
@@ -3047,6 +3140,12 @@ class TradingEngine:
         if remaining:
             details = ", ".join(self._condition_order_label(o) for o in remaining)
             logger.warning("[{}] ADJUST_SLTP: replaced old conditions remain: {}", symbol, details)
+        if new_sl > 0:
+            self._last_sltp_adjust[symbol] = SltpAdjustState(
+                trade_id=trade_id,
+                ts_ms=int(time.time() * 1000),
+                sl_price=new_sl,
+            )
 
     def _validate_adjust_trigger(
         self,

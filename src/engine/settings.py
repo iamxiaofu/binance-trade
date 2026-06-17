@@ -32,6 +32,13 @@ ENGINE_FIELDS: tuple[str, ...] = (
     "review_position_seconds",
     "review_near_exit_seconds",
     "review_high_vol_seconds",
+    "close_confirm_min_1m_bars",
+    "close_confirm_min_count",
+    "close_block_loss_atr_multiple",
+    "close_confirm_window_seconds",
+    "sltp_adjust_min_seconds",
+    "sltp_adjust_min_atr_multiple",
+    "breakeven_fee_slippage_buffer_pct",
 )
 
 
@@ -57,6 +64,13 @@ class EngineRuntimeSettings(BaseModel):
     review_position_seconds: int = Field(ge=30, le=86400)
     review_near_exit_seconds: int = Field(ge=30, le=86400)
     review_high_vol_seconds: int = Field(ge=30, le=86400)
+    close_confirm_min_1m_bars: int = Field(default=5, ge=0, le=60)
+    close_confirm_min_count: int = Field(default=3, ge=1, le=10)
+    close_block_loss_atr_multiple: float = Field(default=1.0, ge=0, le=10)
+    close_confirm_window_seconds: int = Field(default=900, ge=60, le=86400)
+    sltp_adjust_min_seconds: int = Field(default=900, ge=0, le=86400)
+    sltp_adjust_min_atr_multiple: float = Field(default=0.4, ge=0, le=10)
+    breakeven_fee_slippage_buffer_pct: float = Field(default=0.15, ge=0, le=5)
 
 
 def _seconds_from_minutes(value: int) -> int:
@@ -85,6 +99,13 @@ def engine_defaults_from_settings(settings: Settings) -> EngineRuntimeSettings:
         review_position_seconds=_seconds_from_minutes(throttle.review_position_minutes),
         review_near_exit_seconds=_seconds_from_minutes(throttle.review_near_exit_minutes),
         review_high_vol_seconds=_seconds_from_minutes(throttle.review_high_vol_minutes),
+        close_confirm_min_1m_bars=5,
+        close_confirm_min_count=3,
+        close_block_loss_atr_multiple=1.0,
+        close_confirm_window_seconds=900,
+        sltp_adjust_min_seconds=900,
+        sltp_adjust_min_atr_multiple=0.4,
+        breakeven_fee_slippage_buffer_pct=0.15,
     )
 
 

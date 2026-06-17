@@ -63,9 +63,9 @@ llm:
   timeout: 30                 # 秒，超时降级 HOLD
   max_tokens: 1024
   max_retries: 2
-  kline_lookback: 100         # 喂给 LLM 的 K 线根数
+  kline_lookback: 120         # 主周期指标计算 K 线根数
   kline_interval: 5m          # 主分析 K 线周期
-  prompt_kline_count: 20      # Prompt 保留的主周期原始 K 线根数：5m × 20
+  prompt_kline_count: 48      # Prompt 保留的主周期原始 K 线根数：5m × 48
   micro_kline_interval: 1m    # Prompt 微观 K 线周期，用于最近入场节奏
   micro_kline_lookback: 30    # Prompt 微观 K 线根数：1m × 30
   higher_timeframes: [15m, 1h, 4h, 1d]  # 多周期共振：只发送计算后的指标

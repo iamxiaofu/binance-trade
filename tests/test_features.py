@@ -41,7 +41,7 @@ def test_rsi_oscillating_mid_range():
 
 def test_compute_snapshot_keys_and_finite():
     snap = compute_snapshot(_klines(100))
-    expected = {
+    expected_core = {
         "ema_fast", "ema_slow", "rsi", "macd",
         "macd_signal", "atr", "boll_upper", "boll_lower",
         "volume", "volume_ma", "volume_ratio",
@@ -55,10 +55,25 @@ def test_compute_snapshot_keys_and_finite():
         "last_range_pct", "last_body_pct", "volume_ratio_delta_3",
         "volume_zscore_20",
     }
-    assert set(snap) == expected
+    expected_structure = {
+        "adx_14", "plus_di_14", "minus_di_14",
+        "vwap", "price_vs_vwap_pct", "vwap_slope_pct",
+        "swing_high", "swing_low", "dist_to_swing_high_pct",
+        "dist_to_swing_low_pct", "range_position_pct", "breakout_state",
+        "atr_pct_percentile_96", "boll_bandwidth_percentile_96",
+        "upper_wick_pct", "lower_wick_pct", "body_to_range",
+        "consecutive_up_count", "consecutive_down_count",
+    }
+    assert expected_core | expected_structure <= set(snap)
     for k, v in snap.items():
         if k == "trend_direction":
             assert v in {"up", "down", "flat"}
+            continue
+        if k == "breakout_state":
+            assert v in {
+                "inside_range", "breakout_up", "breakout_down",
+                "failed_breakout_up", "failed_breakout_down",
+            }
             continue
         assert np.isfinite(v), f"{k} not finite"
 
@@ -108,7 +123,7 @@ def test_enriched_features_constant_market_are_neutral_and_finite():
     assert snap["boll_bandwidth_pct"] == 0.0
     assert snap["volume_zscore_20"] == 0.0
     for k, v in snap.items():
-        if k == "trend_direction":
+        if k in {"trend_direction", "breakout_state"}:
             continue
         assert np.isfinite(v), f"{k} not finite"
 
@@ -118,6 +133,11 @@ def test_timeframe_brief_uptrend():
     assert brief["timeframe"] == "1h"
     assert brief["trend"] == "up"
     assert brief["ema_fast"] > brief["ema_slow"]
+    assert brief["swing_high"] > brief["swing_low"]
+    assert brief["breakout_state"] in {
+        "inside_range", "breakout_up", "breakout_down",
+        "failed_breakout_up", "failed_breakout_down",
+    }
 
 
 def test_timeframe_brief_downtrend():

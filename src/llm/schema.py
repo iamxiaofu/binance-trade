@@ -48,13 +48,32 @@ class IndicatorSnapshot(BaseModel):
     rsi_delta_6: float = 0.0
     atr_pct: float = 0.0             # ATR / close * 100，跨标的可比
     atr_pct_delta_6: float = 0.0
+    atr_pct_percentile_96: float = 0.0
     boll_mid: float = 0.0
     boll_percent_b: float = 0.5      # close 在布林带内的位置，0=下轨，1=上轨
     boll_bandwidth_pct: float = 0.0  # (上轨-下轨)/中轨 * 100
+    boll_bandwidth_percentile_96: float = 0.0
     last_range_pct: float = 0.0      # 最新 K 线 high-low / close * 100
     last_body_pct: float = 0.0       # 最新 K 线 close-open / open * 100，有方向
+    upper_wick_pct: float = 0.0
+    lower_wick_pct: float = 0.0
+    body_to_range: float = 0.0
+    consecutive_up_count: int = 0
+    consecutive_down_count: int = 0
     volume_ratio_delta_3: float = 0.0
     volume_zscore_20: float = 0.0
+    adx_14: float = 0.0
+    plus_di_14: float = 0.0
+    minus_di_14: float = 0.0
+    vwap: float = 0.0
+    price_vs_vwap_pct: float = 0.0
+    vwap_slope_pct: float = 0.0
+    swing_high: float = 0.0
+    swing_low: float = 0.0
+    dist_to_swing_high_pct: float = 0.0
+    dist_to_swing_low_pct: float = 0.0
+    range_position_pct: float = 0.5
+    breakout_state: str = "inside_range"
 
 
 class TimeframeIndicators(BaseModel):
@@ -66,6 +85,14 @@ class TimeframeIndicators(BaseModel):
     macd: float
     macd_signal: float
     trend: str                       # "up" | "down" | "flat"，由 EMA 关系给出的快捷判断
+    swing_high: float = 0.0
+    swing_low: float = 0.0
+    dist_to_swing_high_pct: float = 0.0
+    dist_to_swing_low_pct: float = 0.0
+    range_position_pct: float = 0.5
+    adx: float = 0.0
+    atr_pct: float = 0.0
+    breakout_state: str = "inside_range"
 
 
 class MarketSentiment(BaseModel):
