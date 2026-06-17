@@ -22,6 +22,8 @@ const promptStatus = ref({
 const promptForm = ref({ name: '', content: '' })
 const promptPreview = ref('')
 const promptLoading = ref(false)
+const promptDirty = ref(false)
+const promptSelectedId = ref(null)
 const showDialog = ref(false)
 const editing = ref(null)  // null = 新增；否则为原 profile
 const form = ref(emptyForm())
@@ -55,10 +57,25 @@ const engineSynced = computed(
 )
 const promptActive = computed(() => promptStatus.value?.active || null)
 const promptEngine = computed(() => promptStatus.value?.engine || { version: 0, name: '', source: '' })
+const promptVersions = computed(() => promptStatus.value?.versions || [])
 const promptSynced = computed(() => {
   const activeVersion = Number(promptActive.value?.version || 0)
   return Number(promptEngine.value.version || 0) === activeVersion
 })
+
+function hydratePromptForm(prompt, { force = false } = {}) {
+  if (promptDirty.value && !force) return
+  promptForm.value = {
+    name: prompt?.name || '',
+    content: prompt?.content || '',
+  }
+  promptSelectedId.value = prompt?.id || null
+  promptDirty.value = false
+}
+
+function markPromptDirty() {
+  promptDirty.value = true
+}
 
 async function refresh() {
   loading.value = true
@@ -68,11 +85,8 @@ async function refresh() {
     status.value = st
     profiles.value = pr.items || []
     promptStatus.value = prompt
-    promptForm.value = {
-      name: prompt.active?.name || '',
-      content: prompt.active?.content || '',
-    }
-    promptPreview.value = prompt.effective_system_prompt || ''
+    hydratePromptForm(prompt.active)
+    if (!promptDirty.value) promptPreview.value = prompt.effective_system_prompt || ''
     firstLoaded.value = true
   } catch (e) {
     ElMessage.error(`加载失败: ${e.message}`)
@@ -93,12 +107,43 @@ async function previewPrompt() {
   }
 }
 
+async function previewPromptVersion(v) {
+  promptLoading.value = true
+  try {
+    const r = await api.llmPromptPreview({ content: v.content || '' })
+    promptPreview.value = r.effective_system_prompt || ''
+  } catch (e) {
+    ElMessage.error(`预览失败: ${e.message}`)
+  } finally {
+    promptLoading.value = false
+  }
+}
+
+async function loadPromptVersion(v) {
+  if (promptDirty.value) {
+    try {
+      await ElMessageBox.confirm(
+        '当前编辑区有未保存内容，加载历史版本会覆盖编辑区但不会删除任何已保存版本。',
+        '加载 Prompt 版本',
+        { confirmButtonText: '加载', cancelButtonText: '取消', type: 'warning' },
+      )
+    } catch (_) { return }
+  }
+  hydratePromptForm(v, { force: true })
+  await previewPromptVersion(v)
+}
+
+function resetPromptEditor() {
+  hydratePromptForm(promptActive.value, { force: true })
+  promptPreview.value = promptStatus.value?.effective_system_prompt || ''
+}
+
 async function applyPrompt() {
   try {
     await ElMessageBox.confirm(
-      'Prompt 附加指令会影响后续 LLM 交易决策。保存后当前 LLM 调用不会被打断，下一次决策开始生效。',
+      'Prompt 附加指令会影响后续 LLM 交易决策。保存会创建新版本并激活；旧版本保留，可从历史版本回切。',
       '应用 Prompt',
-      { confirmButtonText: '保存并热加载', cancelButtonText: '取消', type: 'warning' },
+      { confirmButtonText: '保存为新版本并热加载', cancelButtonText: '取消', type: 'warning' },
     )
   } catch (_) { return }
   promptLoading.value = true
@@ -108,9 +153,32 @@ async function applyPrompt() {
       content: promptForm.value.content || '',
     })
     ElMessage.success('Prompt 已保存，engine 将热加载')
+    promptDirty.value = false
     setTimeout(refresh, 500)
   } catch (e) {
     ElMessage.error(`应用失败: ${e.message}`)
+  } finally {
+    promptLoading.value = false
+  }
+}
+
+async function activatePromptVersion(v) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `即将回切到 Prompt v${v.version}「${v.name || '未命名'}」。此操作会影响后续 LLM 交易决策，请输入 "v${v.version}" 确认。`,
+      '回切 Prompt 版本',
+      { inputPlaceholder: `v${v.version}`, confirmButtonText: '回切并热加载', cancelButtonText: '取消', type: 'warning' },
+    )
+    if (value !== `v${v.version}`) return ElMessage.warning('确认词不匹配，已取消')
+  } catch (_) { return }
+  promptLoading.value = true
+  try {
+    await api.llmPromptActivate(v)
+    ElMessage.success(`已回切到 Prompt v${v.version}，engine 将热加载`)
+    promptDirty.value = false
+    setTimeout(refresh, 500)
+  } catch (e) {
+    ElMessage.error(`回切失败: ${e.message}`)
   } finally {
     promptLoading.value = false
   }
@@ -234,6 +302,7 @@ onMounted(() => {
       // 局部覆盖，不整体替换，避免 computed 中间态
       status.value = { ...status.value, ...s }
       promptStatus.value = { ...promptStatus.value, ...prompt }
+      if (!promptDirty.value) promptPreview.value = prompt.effective_system_prompt || promptPreview.value
     }).catch(() => {})
   }, 2000)
 })
@@ -292,7 +361,13 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
       />
       <el-form label-width="110px">
         <el-form-item label="版本名称">
-          <el-input v-model="promptForm.name" placeholder="例如 趋势优先 / 震荡少交易 / 保守日内" maxlength="80" show-word-limit />
+          <el-input
+            v-model="promptForm.name"
+            placeholder="例如 趋势优先 / 震荡少交易 / 保守日内"
+            maxlength="80"
+            show-word-limit
+            @input="markPromptDirty"
+          />
         </el-form-item>
         <el-form-item label="附加指令">
           <el-input
@@ -302,11 +377,17 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
             maxlength="20000"
             show-word-limit
             placeholder="例如：震荡区间内降低开仓频率；只有多周期方向一致且成交量放大时才提高 confidence。"
+            @input="markPromptDirty"
           />
+          <div class="prompt-editor-meta">
+            编辑来源：{{ promptSelectedId ? `版本 ID ${promptSelectedId}` : '默认空附加指令' }}
+            <el-tag v-if="promptDirty" size="small" type="warning" effect="plain">未保存</el-tag>
+          </div>
         </el-form-item>
         <el-form-item>
           <el-button :loading="promptLoading" @click="previewPrompt">预览最终 System Prompt</el-button>
-          <el-button type="primary" :loading="promptLoading" @click="applyPrompt">保存并热加载</el-button>
+          <el-button type="primary" :loading="promptLoading" @click="applyPrompt">保存为新版本并热加载</el-button>
+          <el-button :disabled="!promptDirty" @click="resetPromptEditor">重置为当前 active</el-button>
         </el-form-item>
       </el-form>
       <el-collapse v-if="promptPreview">
@@ -314,6 +395,47 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
           <pre class="prompt-preview">{{ promptPreview }}</pre>
         </el-collapse-item>
       </el-collapse>
+      <el-divider content-position="left">历史版本</el-divider>
+      <el-table :data="promptVersions" v-loading="promptLoading" stripe class="prompt-version-table">
+        <el-table-column prop="version" label="版本" width="80">
+          <template #default="{ row }">v{{ row.version }}</template>
+        </el-table-column>
+        <el-table-column prop="name" label="名称" min-width="140">
+          <template #default="{ row }">{{ row.name || '未命名' }}</template>
+        </el-table-column>
+        <el-table-column label="状态" min-width="150">
+          <template #default="{ row }">
+            <el-tag v-if="row.is_active" type="success" size="small">DB active</el-tag>
+            <el-tag
+              v-if="Number(row.version) === Number(promptEngine.version || 0)"
+              type="primary"
+              size="small"
+              effect="plain"
+              class="tag-gap"
+            >engine</el-tag>
+            <span v-if="!row.is_active && Number(row.version) !== Number(promptEngine.version || 0)">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="source" label="来源" min-width="110" />
+        <el-table-column prop="updated_at" label="更新时间 UTC" min-width="160" />
+        <el-table-column label="内容摘要" min-width="220">
+          <template #default="{ row }">
+            <span class="prompt-snippet" :title="row.content">{{ row.content || '空附加指令' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" min-width="250">
+          <template #default="{ row }">
+            <el-button size="small" @click="loadPromptVersion(row)">加载到编辑器</el-button>
+            <el-button size="small" @click="previewPromptVersion(row)">预览</el-button>
+            <el-button
+              size="small"
+              type="warning"
+              :disabled="row.is_active"
+              @click="activatePromptVersion(row)"
+            >回切并热加载</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
     </el-card>
 
     <el-card shadow="never" class="table-card">
@@ -477,6 +599,24 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
   word-break: break-word;
   margin: 0;
 }
+.prompt-editor-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.prompt-version-table { margin-top: 4px; }
+.prompt-snippet {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.tag-gap { margin-left: 6px; }
 .test-ok { color: #67c23a; font-size: 12px; margin-left: 8px; }
 .test-fail { color: #f56c6c; font-size: 12px; margin-left: 8px; }
 code { background: rgba(127,127,127,0.1); padding: 0 4px; border-radius: 3px; }
@@ -486,6 +626,9 @@ code { background: rgba(127,127,127,0.1); padding: 0 4px; border-radius: 3px; }
     align-items: flex-start;
     flex-wrap: wrap;
     gap: 8px;
+  }
+  .prompt-version-table {
+    overflow-x: auto;
   }
 }
 </style>

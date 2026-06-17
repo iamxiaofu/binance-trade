@@ -1026,6 +1026,10 @@ class _LLMPromptPreviewRequest(BaseModel):
     content: str = Field(default="", max_length=20000)
 
 
+class _LLMPromptActivateRequest(BaseModel):
+    confirmation_token: str = ""
+
+
 def _prompt_engine_status(rt: dict[str, str]) -> dict[str, Any]:
     try:
         version = int(rt.get("llm.prompt_version", "0") or "0")
@@ -1056,6 +1060,38 @@ async def api_llm_prompt(_: str = Depends(_check_auth)):
 @app.post("/api/llm/prompt/preview")
 async def api_llm_prompt_preview(body: _LLMPromptPreviewRequest, _: str = Depends(_check_auth)):
     return {"effective_system_prompt": build_system_prompt(body.content)}
+
+
+@app.post("/api/llm/prompt/{prompt_id}/activate")
+async def api_llm_prompt_activate(
+    prompt_id: int,
+    body: _LLMPromptActivateRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    user: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    store = await _get_store()
+    existing = await store.get_llm_prompt_version(prompt_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="llm prompt version not found")
+    payload = json.dumps(
+        {"id": int(existing["id"]), "version": int(existing["version"])},
+        sort_keys=True, separators=(",", ":"),
+    )
+    _consume_confirmation(body.confirmation_token, "ACTIVATE_LLM_PROMPT", payload)
+    version = await store.activate_llm_prompt_version(prompt_id)
+    cmd_id = await store.enqueue_command(
+        "RELOAD_LLM_PROMPT", arg=str(version["id"]), source=f"web:{user}"
+    )
+    return {
+        "queued": True,
+        "id": cmd_id,
+        "command": "RELOAD_LLM_PROMPT",
+        "active": version,
+        "note": "engine 将在当前 LLM 调用结束后热加载所选 Prompt 版本",
+    }
 
 
 @app.post("/api/llm/prompt/apply")

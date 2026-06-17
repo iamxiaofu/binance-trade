@@ -179,4 +179,13 @@ export const api = {
       body: JSON.stringify({ ...payload, confirmation_token }),
     })
   },
+  llmPromptActivate: async (version) => {
+    const id = Number(version?.id || 0)
+    const commandPayload = JSON.stringify({ id, version: Number(version?.version || 0) })
+    const confirmation_token = await mainnetConfirmation('ACTIVATE_LLM_PROMPT', commandPayload)
+    return req(`/api/llm/prompt/${encodeURIComponent(id)}/activate`, {
+      method: 'POST',
+      body: JSON.stringify({ confirmation_token }),
+    })
+  },
 }

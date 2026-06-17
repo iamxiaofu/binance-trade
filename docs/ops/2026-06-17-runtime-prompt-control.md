@@ -28,13 +28,29 @@ User Prompt 市场数据模板仍由 `build_user_prompt()` 生成，不开放动
   - `GET /api/llm/prompt`
   - `POST /api/llm/prompt/preview`
   - `POST /api/llm/prompt/apply`
+  - `POST /api/llm/prompt/{id}/activate`
 - `POST /api/llm/prompt/apply` 会：
   - 创建并激活新 Prompt 版本。
   - 写入 `RELOAD_LLM_PROMPT` 命令队列。
   - mainnet 环境要求 `UPDATE_LLM_PROMPT` 确认令牌。
+- `POST /api/llm/prompt/{id}/activate` 会：
+  - 按历史版本 ID 回切 active Prompt，不创建新版本、不覆盖历史内容。
+  - 写入 `RELOAD_LLM_PROMPT` 命令队列。
+  - mainnet 环境要求 `ACTIVATE_LLM_PROMPT` 确认令牌，确认 payload 为 `{id, version}`。
 - Engine 消费 `RELOAD_LLM_PROMPT` 后重建 LLM fallback chain。
 - `LLMClient` 调用 provider 时使用 `build_system_prompt(addendum)`。
-- LLM 配置页新增 Prompt 控制面板，支持编辑、预览、保存并热加载。
+- LLM 配置页新增 Prompt 控制面板，支持编辑、预览、保存新版本并热加载、加载历史版本到编辑器、
+  回切历史版本并热加载。
+
+## 前端交互
+
+- 进入页面后，编辑区自动填充当前 DB active Prompt，不需要手工复制完整内容。
+- 保存按钮语义为“保存为新版本并热加载”，不会覆盖已有版本。
+- 历史版本表展示 vN、名称、来源、更新时间、DB active 状态和 engine 生效状态。
+- “加载到编辑器”只覆盖当前编辑区，不改变 DB active，也不影响 engine。
+- “回切并热加载”会激活所选历史版本，并通知 engine 下一次 LLM 决策使用该版本。
+- 轮询刷新不会覆盖正在编辑但尚未保存的内容；未保存状态会显示在编辑区下方。
+- 当前不提供删除版本功能，避免误删生产决策审计材料。
 
 ## 生效语义
 

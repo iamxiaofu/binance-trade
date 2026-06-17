@@ -2296,6 +2296,13 @@ class Store:
                 return None
             return self._prompt_version_public(row)
 
+    async def get_llm_prompt_version(self, prompt_id: int) -> dict[str, Any] | None:
+        async with self._sessionmaker() as session:
+            row = await session.get(LLMPromptVersionRow, int(prompt_id))
+            if row is None:
+                return None
+            return self._prompt_version_public(row)
+
     async def create_llm_prompt_version(
         self,
         *,

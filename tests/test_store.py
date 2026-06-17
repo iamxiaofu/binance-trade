@@ -161,6 +161,8 @@ async def test_llm_prompt_versions(store):
     assert first["version"] == 1
     assert first["is_active"] is True
     assert first["content"] == "偏趋势交易"
+    assert await store.get_llm_prompt_version(first["id"]) == first
+    assert await store.get_llm_prompt_version(999999) is None
     second = await store.create_llm_prompt_version(
         name="flat",
         content="震荡少交易",
@@ -175,6 +177,7 @@ async def test_llm_prompt_versions(store):
     await store.activate_llm_prompt_version(first["id"])
     active = await store.get_active_llm_prompt_version()
     assert active["id"] == first["id"]
+    assert active["version"] == 1
     assert await _count(store, LLMPromptVersionRow) == 2
 
 
