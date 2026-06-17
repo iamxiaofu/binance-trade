@@ -20,7 +20,7 @@ from typing import Any
 from loguru import logger
 
 from src.config.schema import LLMConfig
-from src.llm.prompt import build_system_prompt, build_user_prompt
+from src.llm.prompt import render_prompts
 from src.llm.providers import build_provider
 from src.llm.providers._schema import _TOOL_NAME  # noqa: F401  (向后兼容导出)
 from src.llm.schema import MarketContext, TradeDecision
@@ -130,6 +130,7 @@ class LLMClient:
             timeout=self._cfg.timeout,
         )
         self._prompt_addendum = ""
+        self._prompt_version: dict[str, Any] | None = None
 
     @classmethod
     def from_profile(
@@ -150,10 +151,16 @@ class LLMClient:
             timeout=obj._cfg.timeout,
         )
         obj._prompt_addendum = str(profile.get("prompt_addendum") or "")
+        obj._prompt_version = None
         return obj
 
     def set_prompt_addendum(self, addendum: str) -> None:
         self._prompt_addendum = addendum or ""
+        self._prompt_version = {"render_mode": "legacy_append", "content": self._prompt_addendum}
+
+    def set_prompt_version(self, prompt_version: dict[str, Any] | None) -> None:
+        self._prompt_version = prompt_version or None
+        self._prompt_addendum = str((prompt_version or {}).get("content") or "")
 
     async def decide(self, ctx: MarketContext) -> TradeDecision:
         """对单个 symbol 做决策。任何失败都降级为 HOLD。"""
@@ -162,13 +169,13 @@ class LLMClient:
 
     async def decide_with_trace(self, ctx: MarketContext) -> tuple[TradeDecision, LLMTrace]:
         """对单个 symbol 做决策，并返回完整审计 trace。"""
-        user_prompt = build_user_prompt(
-            ctx,
+        system_prompt, user_prompt, prompt_warnings = render_prompts(
+            ctx=ctx,
+            prompt_version=self._prompt_version,
             kline_interval=self._cfg.kline_interval,
             prompt_kline_count=self._cfg.prompt_kline_count,
             micro_kline_count=self._cfg.micro_kline_lookback,
         )
-        system_prompt = build_system_prompt(self._prompt_addendum)
         request_payload = self._provider.request_payload(
             system=system_prompt, user_prompt=user_prompt, max_tokens=self._cfg.max_tokens
         )
@@ -176,6 +183,7 @@ class LLMClient:
             user_prompt=user_prompt,
             request_json=_dump_json(request_payload),
             system_prompt=system_prompt,
+            error="; ".join(prompt_warnings)[:200] if prompt_warnings else "",
         )
         last_err = "unknown"
         attempts: list[dict[str, Any]] = []

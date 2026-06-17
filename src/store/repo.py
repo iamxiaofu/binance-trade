@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.exchange.positions import normalize_position, normalize_symbol
+from src.llm.prompt import RENDER_MODE_LEGACY_APPEND, TEMPLATE_SCHEMA_VERSION
 from src.llm.schema import DECISION_REASON_MAX_LENGTH, MarketContext, TradeDecision
 from src.risk.manager import Verdict
 from src.state.runtime import RuntimeState
@@ -129,6 +130,11 @@ _LLM_PROMPT_VERSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("version", "INTEGER NOT NULL DEFAULT 1"),
     ("name", "VARCHAR(80) NOT NULL DEFAULT ''"),
     ("content", "TEXT NOT NULL DEFAULT ''"),
+    ("render_mode", "VARCHAR(24) NOT NULL DEFAULT 'legacy_append'"),
+    ("system_prompt_template", "TEXT NOT NULL DEFAULT ''"),
+    ("user_prompt_template", "TEXT NOT NULL DEFAULT ''"),
+    ("template_schema_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("notes", "TEXT NOT NULL DEFAULT ''"),
     ("is_active", "INTEGER NOT NULL DEFAULT 0"),
     ("source", "VARCHAR(32) NOT NULL DEFAULT 'web'"),
     ("created_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
@@ -2261,6 +2267,19 @@ class Store:
             rows = (await session.execute(select(RuntimeSettingRow))).scalars().all()
             return {row.key: row.value for row in rows}
 
+    async def latest_decision_context_json(self, symbol: str) -> str:
+        """Return the latest stored MarketContext JSON for prompt preview/dry-run."""
+        sym = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            row = (await session.execute(
+                select(DecisionRow)
+                .where(DecisionRow.symbol == sym)
+                .where(DecisionRow.context_json != "")
+                .order_by(DecisionRow.ts_ms.desc(), DecisionRow.id.desc())
+                .limit(1)
+            )).scalars().first()
+            return row.context_json if row is not None else ""
+
 
     # ---------- LLM Prompt 附加指令版本 ----------
     @staticmethod
@@ -2270,6 +2289,11 @@ class Store:
             "version": r.version,
             "name": r.name,
             "content": r.content or "",
+            "render_mode": r.render_mode or RENDER_MODE_LEGACY_APPEND,
+            "system_prompt_template": r.system_prompt_template or "",
+            "user_prompt_template": r.user_prompt_template or "",
+            "template_schema_version": int(r.template_schema_version or TEMPLATE_SCHEMA_VERSION),
+            "notes": r.notes or "",
             "is_active": bool(r.is_active),
             "source": r.source or "",
             "created_at": r.created_at,
@@ -2308,12 +2332,17 @@ class Store:
         *,
         name: str,
         content: str,
+        render_mode: str = RENDER_MODE_LEGACY_APPEND,
+        system_prompt_template: str = "",
+        user_prompt_template: str = "",
+        notes: str = "",
         source: str = "web",
         activate: bool = True,
     ) -> dict[str, Any]:
         now = _now_iso_utc()
         cleaned_name = (name or "").strip()[:80] or "runtime prompt"
         cleaned_content = (content or "").strip()
+        cleaned_mode = (render_mode or RENDER_MODE_LEGACY_APPEND).strip()[:24]
         async with self._sessionmaker() as session:
             latest = (await session.execute(
                 select(LLMPromptVersionRow)
@@ -2333,6 +2362,11 @@ class Store:
                 version=next_version,
                 name=cleaned_name,
                 content=cleaned_content,
+                render_mode=cleaned_mode,
+                system_prompt_template=(system_prompt_template or "").strip(),
+                user_prompt_template=(user_prompt_template or "").strip(),
+                template_schema_version=TEMPLATE_SCHEMA_VERSION,
+                notes=(notes or "").strip(),
                 is_active=activate,
                 source=(source or "web")[:32],
                 created_at=now,

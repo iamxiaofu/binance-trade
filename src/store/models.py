@@ -309,9 +309,9 @@ class LLMProfileRow(Base):
 
 
 class LLMPromptVersionRow(Base):
-    """运行期可热替换的 Prompt 附加策略指令版本。
+    """运行期可热替换的 Prompt 模板版本。
 
-    只保存可由前端编辑的附加指令；系统硬规则和 user prompt 市场数据模板仍由代码控制。
+    旧版本只保存 ``content`` 作为附加指令；新版本可保存完整 System/User 模板。
     同一时刻 ``is_active`` 只能有 1 个，由 Store 写事务保证。
     """
     __tablename__ = "llm_prompt_versions"
@@ -320,6 +320,11 @@ class LLMPromptVersionRow(Base):
     version: Mapped[int] = mapped_column(Integer, default=1, index=True)
     name: Mapped[str] = mapped_column(String(80), default="")
     content: Mapped[str] = mapped_column(Text, default="")
+    render_mode: Mapped[str] = mapped_column(String(24), default="legacy_append")
+    system_prompt_template: Mapped[str] = mapped_column(Text, default="")
+    user_prompt_template: Mapped[str] = mapped_column(Text, default="")
+    template_schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    notes: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     source: Mapped[str] = mapped_column(String(32), default="web")
     created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)

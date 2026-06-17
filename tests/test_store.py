@@ -179,6 +179,21 @@ async def test_llm_prompt_versions(store):
     assert active["id"] == first["id"]
     assert active["version"] == 1
     assert await _count(store, LLMPromptVersionRow) == 2
+    full = await store.create_llm_prompt_version(
+        name="full",
+        content="",
+        render_mode="full_template",
+        system_prompt_template="system {x}",
+        user_prompt_template="user {symbol}",
+        notes="完整模板测试",
+        source="test",
+        activate=True,
+    )
+    assert full["version"] == 3
+    assert full["render_mode"] == "full_template"
+    assert full["system_prompt_template"] == "system {x}"
+    assert full["user_prompt_template"] == "user {symbol}"
+    assert full["notes"] == "完整模板测试"
 
 
 async def test_latest_decision_snapshot(store):

@@ -1013,17 +1013,37 @@ async def api_execution_settings_apply(
 
 
 # ---------- LLM Prompt 管理 ----------
-from src.llm.prompt import build_system_prompt  # noqa: E402
+from src.llm.prompt import (  # noqa: E402
+    DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+    DEFAULT_USER_PROMPT_TEMPLATE,
+    RENDER_MODE_FULL_TEMPLATE,
+    RENDER_MODE_LEGACY_APPEND,
+    build_system_prompt,
+    render_prompts,
+)
+from src.llm.schema import IndicatorSnapshot, MarketContext, PositionSnapshot  # noqa: E402
 
 
 class _LLMPromptApplyRequest(BaseModel):
     name: str = Field(default="", max_length=80)
     content: str = Field(default="", max_length=20000)
+    render_mode: str = Field(default=RENDER_MODE_LEGACY_APPEND, max_length=24)
+    system_prompt_template: str = Field(default="", max_length=60000)
+    user_prompt_template: str = Field(default="", max_length=60000)
+    notes: str = Field(default="", max_length=20000)
     confirmation_token: str = ""
 
 
 class _LLMPromptPreviewRequest(BaseModel):
     content: str = Field(default="", max_length=20000)
+    render_mode: str = Field(default=RENDER_MODE_LEGACY_APPEND, max_length=24)
+    system_prompt_template: str = Field(default="", max_length=60000)
+    user_prompt_template: str = Field(default="", max_length=60000)
+    symbol: str = Field(default="BTCUSDT", max_length=20)
+
+
+class _LLMPromptValidateRequest(_LLMPromptPreviewRequest):
+    symbols: list[str] = Field(default_factory=list, max_length=8)
 
 
 class _LLMPromptActivateRequest(BaseModel):
@@ -1042,24 +1062,220 @@ def _prompt_engine_status(rt: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def _default_full_prompt_version() -> dict[str, Any]:
+    return {
+        "id": None,
+        "version": 0,
+        "name": "代码默认完整 Prompt",
+        "content": "",
+        "render_mode": RENDER_MODE_FULL_TEMPLATE,
+        "system_prompt_template": DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+        "user_prompt_template": DEFAULT_USER_PROMPT_TEMPLATE,
+        "template_schema_version": 1,
+        "notes": "未保存的默认模板；保存后会成为 v1。",
+        "is_active": False,
+        "source": "code",
+        "created_at": "",
+        "updated_at": "",
+    }
+
+
+def _sample_market_context(symbol: str = "BTCUSDT") -> MarketContext:
+    sym = normalize_symbol(symbol)
+    klines = []
+    base = 65000.0 if sym == "BTCUSDT" else 3000.0
+    ts0 = int(time.time() * 1000) - 25 * 300_000
+    for i in range(25):
+        close = base + i * 3.0
+        klines.append([ts0 + i * 300_000, close - 5, close + 10, close - 12, close, 100 + i])
+    return MarketContext(
+        symbol=sym,
+        timestamp=klines[-1][0],
+        last_price=klines[-1][4],
+        mark_price=klines[-1][4],
+        funding_rate=0.0,
+        change_24h_pct=0.0,
+        recent_klines=klines,
+        indicators=IndicatorSnapshot(
+            ema_fast=klines[-1][4] * 0.999,
+            ema_slow=klines[-1][4] * 0.998,
+            rsi=55.0,
+            macd=0.1,
+            macd_signal=0.05,
+            atr=10.0,
+            boll_upper=klines[-1][4] * 1.01,
+            boll_lower=klines[-1][4] * 0.99,
+        ),
+        position=PositionSnapshot(),
+        available_margin=1000.0,
+        max_leverage_allowed=5,
+        account_equity=1000.0,
+        max_order_margin_abs=200.0,
+        max_order_margin_pct=0.2,
+        max_loss_per_trade_abs=60.0,
+    )
+
+
+async def _prompt_context(store: Store, symbol: str) -> tuple[MarketContext, str]:
+    raw = await store.latest_decision_context_json(symbol)
+    if raw:
+        try:
+            return MarketContext.model_validate_json(raw), "latest_decision"
+        except Exception as e:  # noqa: BLE001
+            logger.warning("invalid latest context json for {}: {}", symbol, e)
+    return _sample_market_context(symbol), "sample"
+
+
+def _prompt_version_from_request(body: _LLMPromptPreviewRequest) -> dict[str, Any]:
+    mode = (body.render_mode or RENDER_MODE_LEGACY_APPEND).strip()
+    if mode == RENDER_MODE_FULL_TEMPLATE:
+        return {
+            "render_mode": RENDER_MODE_FULL_TEMPLATE,
+            "system_prompt_template": body.system_prompt_template or DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+            "user_prompt_template": body.user_prompt_template or DEFAULT_USER_PROMPT_TEMPLATE,
+            "content": body.content or "",
+        }
+    return {"render_mode": RENDER_MODE_LEGACY_APPEND, "content": body.content or ""}
+
+
 @app.get("/api/llm/prompt")
 async def api_llm_prompt(_: str = Depends(_check_auth)):
     store = await _get_store()
     active = await store.get_active_llm_prompt_version()
     versions = await store.list_llm_prompt_versions()
     rt = await store.runtime_settings()
+    effective_active = active or _default_full_prompt_version()
     return {
         "mode": _settings.mode.value,
-        "active": active,
+        "active": effective_active,
         "versions": versions,
         "engine": _prompt_engine_status(rt),
-        "effective_system_prompt": build_system_prompt((active or {}).get("content", "")),
+        "default_system_prompt_template": DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+        "default_user_prompt_template": DEFAULT_USER_PROMPT_TEMPLATE,
+        "effective_system_prompt": (
+            build_system_prompt((active or {}).get("content", ""))
+            if (active or {}).get("render_mode") != RENDER_MODE_FULL_TEMPLATE
+            else (active or {}).get("system_prompt_template", DEFAULT_SYSTEM_PROMPT_TEMPLATE)
+        ),
     }
 
 
 @app.post("/api/llm/prompt/preview")
 async def api_llm_prompt_preview(body: _LLMPromptPreviewRequest, _: str = Depends(_check_auth)):
-    return {"effective_system_prompt": build_system_prompt(body.content)}
+    store = await _get_store()
+    ctx, context_source = await _prompt_context(store, body.symbol)
+    system_prompt, user_prompt, warnings = render_prompts(
+        ctx=ctx,
+        prompt_version=_prompt_version_from_request(body),
+        kline_interval=_settings.llm.kline_interval,
+        prompt_kline_count=_settings.llm.prompt_kline_count,
+        micro_kline_count=_settings.llm.micro_kline_lookback,
+    )
+    return {
+        "effective_system_prompt": system_prompt,
+        "effective_user_prompt": user_prompt,
+        "warnings": warnings,
+        "context_source": context_source,
+        "symbol": ctx.symbol,
+    }
+
+
+@app.post("/api/llm/prompt/validate")
+async def api_llm_prompt_validate(
+    body: _LLMPromptValidateRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    _: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    store = await _get_store()
+    prof = await store.get_active_llm_profile()
+    if prof is None:
+        raise HTTPException(status_code=409, detail="no active llm profile")
+    api_key = await store.get_llm_profile_secret(prof["name"])
+    if not api_key:
+        raise HTTPException(status_code=409, detail=f"active profile {prof['name']} has no api_key")
+    from src.llm.providers import build_provider  # noqa: E402
+
+    provider = build_provider(
+        prof["provider"],
+        model=prof["model"],
+        base_url=(prof.get("base_url") or None),
+        api_key=api_key,
+        timeout=min(float(prof.get("timeout") or 60), 60.0),
+    )
+    symbols = [normalize_symbol(s) for s in (body.symbols or [body.symbol]) if s]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="symbols required")
+    allowed = set(await _registered_symbols())
+    results: list[dict[str, Any]] = []
+    prompt_version = _prompt_version_from_request(body)
+    max_tokens = min(int(prof.get("max_tokens") or 1024), 4096)
+    try:
+        for symbol in symbols:
+            if symbol not in allowed:
+                results.append({"symbol": symbol, "ok": False, "error": "symbol not registered"})
+                continue
+            ctx, context_source = await _prompt_context(store, symbol)
+            system_prompt, user_prompt, warnings = render_prompts(
+                ctx=ctx,
+                prompt_version=prompt_version,
+                kline_interval=_settings.llm.kline_interval,
+                prompt_kline_count=_settings.llm.prompt_kline_count,
+                micro_kline_count=_settings.llm.micro_kline_lookback,
+            )
+            t0 = time.monotonic()
+            try:
+                resp = await provider.create(
+                    system=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=max_tokens,
+                )
+                decision = provider.parse(resp, symbol)
+                latency = int((time.monotonic() - t0) * 1000)
+                if decision is None:
+                    results.append({
+                        "symbol": symbol,
+                        "ok": False,
+                        "context_source": context_source,
+                        "latency_ms": latency,
+                        "warnings": warnings,
+                        "error": "LLM response did not match TradeDecision schema/tool result",
+                    })
+                    continue
+                if decision.symbol != symbol:
+                    results.append({
+                        "symbol": symbol,
+                        "ok": False,
+                        "context_source": context_source,
+                        "latency_ms": latency,
+                        "warnings": warnings,
+                        "error": f"LLM response symbol mismatch: {decision.symbol}",
+                    })
+                    continue
+                results.append({
+                    "symbol": symbol,
+                    "ok": True,
+                    "context_source": context_source,
+                    "latency_ms": latency,
+                    "warnings": warnings,
+                    "decision": decision.model_dump(mode="json"),
+                })
+            except Exception as e:  # noqa: BLE001
+                results.append({
+                    "symbol": symbol,
+                    "ok": False,
+                    "context_source": context_source,
+                    "warnings": warnings,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+    finally:
+        try:
+            await provider.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"profile": prof["name"], "model": prof["model"], "results": results}
 
 
 @app.post("/api/llm/prompt/{prompt_id}/activate")
@@ -1104,7 +1320,14 @@ async def api_llm_prompt_apply(
     _require_environment(expected_environment)
     _check_mainnet_origin(request)
     payload = json.dumps(
-        {"name": body.name, "content": body.content},
+        {
+            "name": body.name,
+            "content": body.content,
+            "render_mode": body.render_mode,
+            "system_prompt_template": body.system_prompt_template,
+            "user_prompt_template": body.user_prompt_template,
+            "notes": body.notes,
+        },
         sort_keys=True, separators=(",", ":"),
     )
     _consume_confirmation(body.confirmation_token, "UPDATE_LLM_PROMPT", payload)
@@ -1112,6 +1335,10 @@ async def api_llm_prompt_apply(
     version = await store.create_llm_prompt_version(
         name=body.name,
         content=body.content,
+        render_mode=body.render_mode,
+        system_prompt_template=body.system_prompt_template,
+        user_prompt_template=body.user_prompt_template,
+        notes=body.notes,
         source=f"web:{user}",
         activate=True,
     )

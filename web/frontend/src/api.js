@@ -172,13 +172,22 @@ export const api = {
   llmPromptPreview: (payload) =>
     req('/api/llm/prompt/preview', { method: 'POST', body: JSON.stringify(payload) }),
   llmPromptApply: async (payload) => {
-    const commandPayload = JSON.stringify({ name: payload.name || '', content: payload.content || '' })
+    const commandPayload = JSON.stringify({
+      name: payload.name || '',
+      content: payload.content || '',
+      render_mode: payload.render_mode || 'legacy_append',
+      system_prompt_template: payload.system_prompt_template || '',
+      user_prompt_template: payload.user_prompt_template || '',
+      notes: payload.notes || '',
+    })
     const confirmation_token = await mainnetConfirmation('UPDATE_LLM_PROMPT', commandPayload)
     return req('/api/llm/prompt/apply', {
       method: 'POST',
       body: JSON.stringify({ ...payload, confirmation_token }),
     })
   },
+  llmPromptValidate: (payload) =>
+    req('/api/llm/prompt/validate', { method: 'POST', body: JSON.stringify(payload) }),
   llmPromptActivate: async (version) => {
     const id = Number(version?.id || 0)
     const commandPayload = JSON.stringify({ id, version: Number(version?.version || 0) })

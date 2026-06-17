@@ -19,11 +19,25 @@ const promptStatus = ref({
   engine: { version: 0, name: '', source: '' },
   effective_system_prompt: '',
 })
-const promptForm = ref({ name: '', content: '' })
+const promptForm = ref({
+  name: '',
+  content: '',
+  render_mode: 'full_template',
+  system_prompt_template: '',
+  user_prompt_template: '',
+  notes: '',
+})
 const promptPreview = ref('')
+const promptUserPreview = ref('')
+const promptPreviewWarnings = ref([])
+const promptPreviewContext = ref('')
 const promptLoading = ref(false)
 const promptDirty = ref(false)
 const promptSelectedId = ref(null)
+const promptValidateSymbols = ref(['BTCUSDT'])
+const promptValidateResults = ref([])
+const promptContentDialog = ref(false)
+const promptViewingVersion = ref(null)
 const showDialog = ref(false)
 const editing = ref(null)  // null = 新增；否则为原 profile
 const form = ref(emptyForm())
@@ -68,6 +82,10 @@ function hydratePromptForm(prompt, { force = false } = {}) {
   promptForm.value = {
     name: prompt?.name || '',
     content: prompt?.content || '',
+    render_mode: prompt?.render_mode || 'full_template',
+    system_prompt_template: prompt?.system_prompt_template || promptStatus.value?.default_system_prompt_template || '',
+    user_prompt_template: prompt?.user_prompt_template || promptStatus.value?.default_user_prompt_template || '',
+    notes: prompt?.notes || '',
   }
   promptSelectedId.value = prompt?.id || null
   promptDirty.value = false
@@ -87,6 +105,7 @@ async function refresh() {
     promptStatus.value = prompt
     hydratePromptForm(prompt.active)
     if (!promptDirty.value) promptPreview.value = prompt.effective_system_prompt || ''
+    if (!promptDirty.value) promptUserPreview.value = ''
     firstLoaded.value = true
   } catch (e) {
     ElMessage.error(`加载失败: ${e.message}`)
@@ -95,11 +114,38 @@ async function refresh() {
   }
 }
 
+function promptPayload(extra = {}) {
+  return {
+    name: promptForm.value.name || '',
+    content: promptForm.value.content || '',
+    render_mode: promptForm.value.render_mode || 'legacy_append',
+    system_prompt_template: promptForm.value.system_prompt_template || '',
+    user_prompt_template: promptForm.value.user_prompt_template || '',
+    notes: promptForm.value.notes || '',
+    symbol: promptValidateSymbols.value[0] || 'BTCUSDT',
+    ...extra,
+  }
+}
+
+function versionPayload(v, extra = {}) {
+  return {
+    content: v.content || '',
+    render_mode: v.render_mode || 'legacy_append',
+    system_prompt_template: v.system_prompt_template || '',
+    user_prompt_template: v.user_prompt_template || '',
+    symbol: promptValidateSymbols.value[0] || 'BTCUSDT',
+    ...extra,
+  }
+}
+
 async function previewPrompt() {
   promptLoading.value = true
   try {
-    const r = await api.llmPromptPreview({ content: promptForm.value.content || '' })
+    const r = await api.llmPromptPreview(promptPayload())
     promptPreview.value = r.effective_system_prompt || ''
+    promptUserPreview.value = r.effective_user_prompt || ''
+    promptPreviewWarnings.value = r.warnings || []
+    promptPreviewContext.value = `${r.symbol || ''} · ${r.context_source || ''}`
   } catch (e) {
     ElMessage.error(`预览失败: ${e.message}`)
   } finally {
@@ -110,8 +156,11 @@ async function previewPrompt() {
 async function previewPromptVersion(v) {
   promptLoading.value = true
   try {
-    const r = await api.llmPromptPreview({ content: v.content || '' })
+    const r = await api.llmPromptPreview(versionPayload(v))
     promptPreview.value = r.effective_system_prompt || ''
+    promptUserPreview.value = r.effective_user_prompt || ''
+    promptPreviewWarnings.value = r.warnings || []
+    promptPreviewContext.value = `${r.symbol || ''} · ${r.context_source || ''}`
   } catch (e) {
     ElMessage.error(`预览失败: ${e.message}`)
   } finally {
@@ -136,6 +185,9 @@ async function loadPromptVersion(v) {
 function resetPromptEditor() {
   hydratePromptForm(promptActive.value, { force: true })
   promptPreview.value = promptStatus.value?.effective_system_prompt || ''
+  promptUserPreview.value = ''
+  promptPreviewWarnings.value = []
+  promptValidateResults.value = []
 }
 
 async function applyPrompt() {
@@ -148,10 +200,7 @@ async function applyPrompt() {
   } catch (_) { return }
   promptLoading.value = true
   try {
-    await api.llmPromptApply({
-      name: promptForm.value.name || '',
-      content: promptForm.value.content || '',
-    })
+    await api.llmPromptApply(promptPayload())
     ElMessage.success('Prompt 已保存，engine 将热加载')
     promptDirty.value = false
     setTimeout(refresh, 500)
@@ -160,6 +209,33 @@ async function applyPrompt() {
   } finally {
     promptLoading.value = false
   }
+}
+
+async function validatePromptWithLLM() {
+  if (!promptValidateSymbols.value.length) {
+    return ElMessage.warning('请至少选择一个币种')
+  }
+  promptLoading.value = true
+  promptValidateResults.value = []
+  try {
+    const r = await api.llmPromptValidate(promptPayload({ symbols: promptValidateSymbols.value }))
+    promptValidateResults.value = r.results || []
+    const failed = promptValidateResults.value.filter((x) => !x.ok).length
+    if (failed) {
+      ElMessage.warning(`LLM 校验完成，${failed} 个币种未通过`)
+    } else {
+      ElMessage.success('LLM 校验通过；未写入决策、未下单')
+    }
+  } catch (e) {
+    ElMessage.error(`LLM 校验失败: ${e.message}`)
+  } finally {
+    promptLoading.value = false
+  }
+}
+
+function viewPromptVersion(v) {
+  promptViewingVersion.value = v
+  promptContentDialog.value = true
 }
 
 async function activatePromptVersion(v) {
@@ -357,7 +433,7 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
         :closable="false"
         show-icon
         style="margin-bottom:12px"
-        title="这里只能编辑附加策略指令；系统硬性风控纪律和市场数据模板仍由代码固定。附加指令如与硬规则冲突，硬规则优先。"
+        title="支持完整 System Prompt 与 User Prompt 模板在线编辑。User Prompt 使用白名单占位符渲染动态行情字段；保存会创建新版本，旧版本可回切。"
       />
       <el-form label-width="110px">
         <el-form-item label="版本名称">
@@ -369,32 +445,117 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
             @input="markPromptDirty"
           />
         </el-form-item>
-        <el-form-item label="附加指令">
+        <el-form-item label="渲染模式">
+          <el-radio-group v-model="promptForm.render_mode" @change="markPromptDirty">
+            <el-radio-button label="full_template">完整模板</el-radio-button>
+            <el-radio-button label="legacy_append">兼容附加指令</el-radio-button>
+          </el-radio-group>
+          <div class="prompt-editor-meta">
+            完整模板可编辑 System/User 两段；兼容模式只把附加指令追加到代码默认 System Prompt。
+          </div>
+        </el-form-item>
+        <template v-if="promptForm.render_mode === 'legacy_append'">
+          <el-form-item label="附加指令">
+            <el-input
+              v-model="promptForm.content"
+              type="textarea"
+              :rows="8"
+              maxlength="20000"
+              show-word-limit
+              placeholder="例如：震荡区间内降低开仓频率；只有多周期方向一致且成交量放大时才提高 confidence。"
+              @input="markPromptDirty"
+            />
+          </el-form-item>
+        </template>
+        <template v-else>
+          <el-form-item label="System模板">
+            <el-input
+              v-model="promptForm.system_prompt_template"
+              type="textarea"
+              :rows="12"
+              maxlength="60000"
+              show-word-limit
+              placeholder="完整 System Prompt 模板"
+              @input="markPromptDirty"
+            />
+          </el-form-item>
+          <el-form-item label="User模板">
+            <el-input
+              v-model="promptForm.user_prompt_template"
+              type="textarea"
+              :rows="16"
+              maxlength="60000"
+              show-word-limit
+              placeholder="可使用 {symbol}、{position_block}、{indicator_block}、{recent_klines_json} 等白名单占位符"
+              @input="markPromptDirty"
+            />
+          </el-form-item>
+        </template>
+        <el-form-item label="版本备注">
           <el-input
-            v-model="promptForm.content"
+            v-model="promptForm.notes"
             type="textarea"
-            :rows="8"
+            :rows="3"
             maxlength="20000"
             show-word-limit
-            placeholder="例如：震荡区间内降低开仓频率；只有多周期方向一致且成交量放大时才提高 confidence。"
+            placeholder="记录本版本调整意图、适用行情和回切判断。"
             @input="markPromptDirty"
           />
           <div class="prompt-editor-meta">
-            编辑来源：{{ promptSelectedId ? `版本 ID ${promptSelectedId}` : '默认空附加指令' }}
+            编辑来源：{{ promptSelectedId ? `版本 ID ${promptSelectedId}` : '代码默认模板草稿' }}
             <el-tag v-if="promptDirty" size="small" type="warning" effect="plain">未保存</el-tag>
           </div>
         </el-form-item>
+        <el-form-item label="校验币种">
+          <el-checkbox-group v-model="promptValidateSymbols">
+            <el-checkbox-button label="BTCUSDT">BTC</el-checkbox-button>
+            <el-checkbox-button label="ETHUSDT">ETH</el-checkbox-button>
+            <el-checkbox-button label="SOLUSDT">SOL</el-checkbox-button>
+            <el-checkbox-button label="BNBUSDT">BNB</el-checkbox-button>
+          </el-checkbox-group>
+          <div class="prompt-editor-meta">
+            LLM 校验会真实请求当前 active LLM profile，只验证返回 schema；不写决策、不下单。
+          </div>
+        </el-form-item>
         <el-form-item>
-          <el-button :loading="promptLoading" @click="previewPrompt">预览最终 System Prompt</el-button>
+          <el-button :loading="promptLoading" @click="previewPrompt">渲染预览</el-button>
+          <el-button :loading="promptLoading" type="warning" plain @click="validatePromptWithLLM">发送 LLM 校验</el-button>
           <el-button type="primary" :loading="promptLoading" @click="applyPrompt">保存为新版本并热加载</el-button>
           <el-button :disabled="!promptDirty" @click="resetPromptEditor">重置为当前 active</el-button>
         </el-form-item>
       </el-form>
-      <el-collapse v-if="promptPreview">
-        <el-collapse-item title="最终 System Prompt 预览">
+      <el-alert
+        v-if="promptPreviewWarnings.length"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="prompt-warning"
+        :title="`模板预览警告：${promptPreviewWarnings.join('；')}`"
+      />
+      <el-collapse v-if="promptPreview || promptUserPreview">
+        <el-collapse-item :title="`最终 System Prompt 预览 ${promptPreviewContext ? '(' + promptPreviewContext + ')' : ''}`">
           <pre class="prompt-preview">{{ promptPreview }}</pre>
         </el-collapse-item>
+        <el-collapse-item title="最终 User Prompt 预览">
+          <pre class="prompt-preview">{{ promptUserPreview }}</pre>
+        </el-collapse-item>
       </el-collapse>
+      <el-table v-if="promptValidateResults.length" :data="promptValidateResults" stripe class="prompt-validation-table">
+        <el-table-column prop="symbol" label="币种" width="100" />
+        <el-table-column label="结果" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.ok ? 'success' : 'danger'" size="small">{{ row.ok ? '通过' : '失败' }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="latency_ms" label="耗时ms" width="90" />
+        <el-table-column prop="context_source" label="上下文" width="130" />
+        <el-table-column label="返回/错误" min-width="260">
+          <template #default="{ row }">
+            <span v-if="row.ok">{{ row.decision?.action }} · confidence={{ row.decision?.confidence }}</span>
+            <span v-else class="test-fail">{{ row.error }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
       <el-divider content-position="left">历史版本</el-divider>
       <el-table :data="promptVersions" v-loading="promptLoading" stripe class="prompt-version-table">
         <el-table-column prop="version" label="版本" width="80">
@@ -402,6 +563,11 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
         </el-table-column>
         <el-table-column prop="name" label="名称" min-width="140">
           <template #default="{ row }">{{ row.name || '未命名' }}</template>
+        </el-table-column>
+        <el-table-column label="模式" width="120">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.render_mode === 'full_template' ? '完整模板' : '附加指令' }}</el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="状态" min-width="150">
           <template #default="{ row }">
@@ -420,11 +586,16 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
         <el-table-column prop="updated_at" label="更新时间 UTC" min-width="160" />
         <el-table-column label="内容摘要" min-width="220">
           <template #default="{ row }">
-            <span class="prompt-snippet" :title="row.content">{{ row.content || '空附加指令' }}</span>
+            <span class="prompt-snippet">
+              {{ row.render_mode === 'full_template'
+                ? (row.notes || row.system_prompt_template || row.user_prompt_template || '完整模板')
+                : (row.content || '空附加指令') }}
+            </span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" min-width="250">
+        <el-table-column label="操作" min-width="320">
           <template #default="{ row }">
+            <el-button size="small" @click="viewPromptVersion(row)">查看内容</el-button>
             <el-button size="small" @click="loadPromptVersion(row)">加载到编辑器</el-button>
             <el-button size="small" @click="previewPromptVersion(row)">预览</el-button>
             <el-button
@@ -437,6 +608,30 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-dialog
+      v-model="promptContentDialog"
+      :title="promptViewingVersion ? `Prompt v${promptViewingVersion.version} 内容` : 'Prompt 内容'"
+      width="80%"
+    >
+      <el-tabs v-if="promptViewingVersion">
+        <el-tab-pane label="System Template">
+          <pre class="prompt-preview">{{ promptViewingVersion.system_prompt_template || '(兼容模式：使用代码默认 System + 附加指令)' }}</pre>
+        </el-tab-pane>
+        <el-tab-pane label="User Template">
+          <pre class="prompt-preview">{{ promptViewingVersion.user_prompt_template || '(兼容模式：使用代码默认 User Prompt)' }}</pre>
+        </el-tab-pane>
+        <el-tab-pane label="Legacy Addendum">
+          <pre class="prompt-preview">{{ promptViewingVersion.content || '(空)' }}</pre>
+        </el-tab-pane>
+        <el-tab-pane label="Notes">
+          <pre class="prompt-preview">{{ promptViewingVersion.notes || '(空)' }}</pre>
+        </el-tab-pane>
+      </el-tabs>
+      <template #footer>
+        <el-button @click="promptContentDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <el-card shadow="never" class="table-card">
       <template #header>
@@ -608,6 +803,8 @@ onUnmounted(() => { if (pollTimer.value) clearInterval(pollTimer.value) })
   font-size: 12px;
 }
 .prompt-version-table { margin-top: 4px; }
+.prompt-validation-table { margin: 10px 0; }
+.prompt-warning { margin-bottom: 10px; }
 .prompt-snippet {
   display: inline-block;
   max-width: 100%;
@@ -628,6 +825,9 @@ code { background: rgba(127,127,127,0.1); padding: 0 4px; border-radius: 3px; }
     gap: 8px;
   }
   .prompt-version-table {
+    overflow-x: auto;
+  }
+  .prompt-validation-table {
     overflow-x: auto;
   }
 }

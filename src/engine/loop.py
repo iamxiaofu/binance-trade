@@ -4013,7 +4013,6 @@ class TradingEngine:
         from src.llm.failover import LLMFailoverClient
         profiles = await self._store.get_enabled_llm_profiles()
         prompt = await self._store.get_active_llm_prompt_version()
-        prompt_addendum = (prompt or {}).get("content", "")
         prompt_version = int((prompt or {}).get("version") or 0)
         prompt_name = str((prompt or {}).get("name") or "")
         chain: list[tuple[str, LLMClient]] = []
@@ -4023,7 +4022,7 @@ class TradingEngine:
                 logger.warning("llm profile {} has no api_key, skip in chain", prof["name"])
                 continue
             client = LLMClient.from_profile(prof, self._settings.llm, api_key)
-            client.set_prompt_addendum(prompt_addendum)
+            client.set_prompt_version(prompt)
             chain.append((prof["name"], client))
         if not chain:
             raise RuntimeError("no usable llm profile (missing api_key)")

@@ -4,7 +4,13 @@ from __future__ import annotations
 import numpy as np
 
 from src.features.indicators import compute_snapshot
-from src.llm.prompt import build_user_prompt
+from src.llm.prompt import (
+    DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+    RENDER_MODE_FULL_TEMPLATE,
+    build_user_prompt,
+    render_prompts,
+    render_user_prompt_template,
+)
 from src.llm.schema import IndicatorSnapshot, MarketContext, PositionSnapshot
 
 
@@ -99,3 +105,62 @@ def test_prompt_includes_risk_reason_discipline():
     assert "equity_loss_pct≈sl_loss÷账户权益×100" in prompt
     assert "R≈tp_profit÷sl_loss" in prompt
     assert "风险换算: entry_ref=..." in prompt
+
+
+def test_full_template_rendering_uses_whitelisted_context():
+    klines = _klines(30)
+    ctx = MarketContext(
+        symbol="ETHUSDT",
+        timestamp=klines[-1][0],
+        last_price=3200.0,
+        mark_price=3201.0,
+        funding_rate=0.0,
+        change_24h_pct=0.0,
+        recent_klines=klines,
+        indicators=IndicatorSnapshot(**compute_snapshot(klines)),
+        position=PositionSnapshot(),
+        available_margin=1000.0,
+        max_leverage_allowed=5,
+        account_equity=1000.0,
+        max_order_margin_abs=200.0,
+        max_order_margin_pct=0.2,
+        max_loss_per_trade_abs=60.0,
+    )
+    system, user, warnings = render_prompts(
+        ctx=ctx,
+        prompt_version={
+            "render_mode": RENDER_MODE_FULL_TEMPLATE,
+            "system_prompt_template": DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+            "user_prompt_template": (
+                "标的={symbol} last={last_price} mark={mark_price}\n"
+                "{position_block}\n指标:\n{indicator_block}"
+            ),
+        },
+        kline_interval="5m",
+    )
+    assert "submit_decision" in system
+    assert "标的=ETHUSDT" in user
+    assert "持仓: 无" in user
+    assert "EMA(12)=" in user
+    assert warnings == []
+
+
+def test_user_template_reports_unknown_placeholders():
+    klines = _klines(30)
+    ctx = MarketContext(
+        symbol="SOLUSDT",
+        timestamp=klines[-1][0],
+        last_price=150.0,
+        mark_price=150.0,
+        funding_rate=0.0,
+        change_24h_pct=0.0,
+        recent_klines=klines,
+        indicators=IndicatorSnapshot(**compute_snapshot(klines)),
+        position=PositionSnapshot(),
+        available_margin=1000.0,
+        max_leverage_allowed=5,
+    )
+    result = render_user_prompt_template("symbol={symbol} missing={unknown_x}", ctx)
+    assert "symbol=SOLUSDT" in result.text
+    assert "{unknown_x}" in result.text
+    assert "unknown_x" in result.unknown_placeholders
