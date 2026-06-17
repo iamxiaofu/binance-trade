@@ -1,8 +1,28 @@
-// 统一的后端 API 封装。Basic Auth 由浏览器在首次 401 后自动附带，
-// 因此这里不手动管理凭据；仅做 fetch + JSON 解析 + 错误处理。
+import { reactive } from 'vue'
+
+// 统一的后端 API 封装。浏览器用户走应用内登录页 + HttpOnly session cookie；
+// Basic Auth 仍由后端兼容给脚本使用。
 const JSON_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json' }
 const ENV_KEY = 'binance-trade-environment'
 let environment = localStorage.getItem(ENV_KEY) === 'mainnet' ? 'mainnet' : 'testnet'
+const AUTH_EVENT = 'binance-trade-auth-required'
+const AUTH_CHANGE_EVENT = 'binance-trade-auth-change'
+const ENVIRONMENTS = ['testnet', 'mainnet']
+
+export const authState = reactive({
+  checked: false,
+  authenticated: false,
+  username: '',
+})
+
+function setAuthState(authenticated, username = '') {
+  authState.checked = true
+  authState.authenticated = authenticated
+  authState.username = authenticated ? username : ''
+  window.dispatchEvent(new CustomEvent(AUTH_CHANGE_EVENT, {
+    detail: { authenticated: authState.authenticated, username: authState.username },
+  }))
+}
 
 export function getEnvironment() {
   return environment
@@ -19,7 +39,11 @@ export function wsPath(path = '') {
 }
 
 function environmentPath(path) {
-  if (path.startsWith('/api/')) return `/api/${environment}/${path.slice(5)}`
+  return environmentPathFor(environment, path)
+}
+
+function environmentPathFor(env, path) {
+  if (path.startsWith('/api/')) return `/api/${env}/${path.slice(5)}`
   return path
 }
 
@@ -53,24 +77,95 @@ function formatDetail(detail) {
   return String(detail)
 }
 
-async function req(path, opts = {}) {
+async function reqForEnv(env, path, opts = {}, authOptions = {}) {
   // 没 body 的 POST/PUT 不需要 Content-Type，让 fetch 不带该 header
   const hasBody = opts.body !== undefined && opts.body !== null
   const headers = {
     ...(hasBody ? JSON_HEADERS : { Accept: 'application/json' }),
-    'X-Trade-Environment': environment,
+    'X-Trade-Environment': env,
     ...(opts.headers || {}),
   }
-  const resp = await fetch(environmentPath(path), { ...opts, headers })
+  const resp = await fetch(environmentPathFor(env, path), {
+    ...opts,
+    headers,
+    credentials: 'same-origin',
+  })
   if (!resp.ok) {
     let detail = resp.statusText
     try {
       const j = await resp.json()
       detail = j.detail !== undefined ? j.detail : detail
     } catch (_) { /* ignore */ }
+    if (resp.status === 401 && !authOptions.suppressAuthError) {
+      setAuthState(false)
+      window.dispatchEvent(new CustomEvent(AUTH_EVENT, { detail: { path, env } }))
+    }
     throw new Error(`${resp.status}: ${formatDetail(detail)}`)
   }
   return resp.json()
+}
+
+async function req(path, opts = {}) {
+  return reqForEnv(environment, path, opts)
+}
+
+export async function authLogin(username, password) {
+  const body = JSON.stringify({ username, password })
+  const results = await Promise.allSettled(
+    ENVIRONMENTS.map((env) => reqForEnv(
+      env,
+      '/api/auth/login',
+      { method: 'POST', body },
+      { suppressAuthError: true },
+    ))
+  )
+  const failed = results
+    .map((result, index) => ({ result, env: ENVIRONMENTS[index] }))
+    .filter(({ result }) => result.status === 'rejected')
+  if (failed.length) {
+    await authLogout()
+    throw new Error(failed.map(({ env, result }) => `${env}: ${result.reason.message}`).join('; '))
+  }
+  const user = results.find((result) => result.status === 'fulfilled')?.value?.username || username
+  setAuthState(true, user)
+  return { authenticated: true, username: user }
+}
+
+export async function authLogout() {
+  await Promise.allSettled(
+    ENVIRONMENTS.map((env) => reqForEnv(
+      env,
+      '/api/auth/logout',
+      { method: 'POST' },
+      { suppressAuthError: true },
+    ))
+  )
+  setAuthState(false)
+}
+
+export async function authMe() {
+  const results = await Promise.allSettled(
+    ENVIRONMENTS.map((env) => reqForEnv(
+      env,
+      '/api/auth/me',
+      {},
+      { suppressAuthError: true },
+    ))
+  )
+  const ok = results.every((result) => result.status === 'fulfilled' && result.value?.authenticated)
+  if (!ok) {
+    setAuthState(false)
+    return { authenticated: false }
+  }
+  const user = results.find((result) => result.status === 'fulfilled')?.value?.username || ''
+  setAuthState(true, user)
+  return { authenticated: true, username: user }
+}
+
+export async function ensureAuthChecked(force = false) {
+  if (authState.checked && !force) return authState.authenticated
+  const result = await authMe()
+  return Boolean(result.authenticated)
 }
 
 async function mainnetConfirmation(action, payload = '') {

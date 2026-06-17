@@ -1,8 +1,10 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { authState, ensureAuthChecked } from './api'
 
 // 用 hash 路由：纯静态托管下无需服务端 rewrite，刷新不 404。
 const routes = [
   { path: '/', redirect: '/dashboard' },
+  { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
   { path: '/dashboard', name: 'dashboard', component: () => import('./views/Dashboard.vue'), meta: { title: '总览' } },
   { path: '/chart', name: 'chart', component: () => import('./views/Chart.vue'), meta: { title: 'K线图' } },
   { path: '/positions', name: 'positions', component: () => import('./views/Positions.vue'), meta: { title: '持仓' } },
@@ -14,7 +16,23 @@ const routes = [
   { path: '/llm', name: 'llm', component: () => import('./views/LLM.vue'), meta: { title: 'LLM 配置' } },
 ]
 
-export default createRouter({
+const router = createRouter({
   history: createWebHashHistory(),
   routes,
 })
+
+router.beforeEach(async (to) => {
+  const authenticated = await ensureAuthChecked()
+  if (to.meta.public) {
+    if (authenticated && to.path === '/login') {
+      return typeof to.query.redirect === 'string' ? to.query.redirect : '/dashboard'
+    }
+    return true
+  }
+  if (!authState.authenticated) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  return true
+})
+
+export default router

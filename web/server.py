@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from src.config.loader import load_config
 from src.exchange.positions import normalize_symbol
@@ -65,9 +67,12 @@ _settings, _creds = load_config(
 _DB = _settings.storage.db_path
 _WEB_USER = os.environ.get("WEB_USER", "admin")
 _WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+_SESSION_COOKIE = f"binance_trade_session_{_settings.mode.value}"
+_SESSION_TTL_SECONDS = int(os.environ.get("WEB_SESSION_TTL_SECONDS", str(7 * 24 * 3600)))
+_SESSION_SECRET = os.environ.get("WEB_SESSION_SECRET", "")
 
 app = FastAPI(title="binance-trade dashboard", docs_url=None, redoc_url=None)
-_security = HTTPBasic()
+_security = HTTPBasic(auto_error=False)
 
 # 行情数据源注册表：mainnet/testnet 双源（REST + WS），供看板行情用
 _feeds = MarketFeedRegistry()
@@ -86,34 +91,96 @@ def _ws_auth_cookie_value() -> str:
     return hashlib.sha256(f"{_WEB_USER}:{_WEB_PASSWORD}".encode()).hexdigest()
 
 
+def _session_secret() -> bytes:
+    secret = _SESSION_SECRET or f"{_settings.mode.value}:{_WEB_USER}:{_WEB_PASSWORD}"
+    return hashlib.sha256(secret.encode()).digest()
+
+
+def _session_cookie_value(username: str, expires_at: int | None = None) -> str:
+    expires = int(expires_at or (time.time() + _SESSION_TTL_SECONDS))
+    payload = f"{username}|{expires}"
+    sig = hmac.new(_session_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    import base64
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _session_user_from_cookie(value: str) -> str:
+    if not value or not _WEB_PASSWORD:
+        return ""
+    try:
+        import base64
+        username, expires_raw, sig = base64.urlsafe_b64decode(value.encode()).decode().rsplit("|", 2)
+        expires = int(expires_raw)
+    except Exception:
+        return ""
+    if expires < int(time.time()):
+        return ""
+    payload = f"{username}|{expires}"
+    expected = hmac.new(_session_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    if not secrets.compare_digest(sig, expected):
+        return ""
+    if not secrets.compare_digest(username, _WEB_USER):
+        return ""
+    return username
+
+
+def _cookie_secure() -> bool:
+    return os.environ.get("WEB_COOKIE_SECURE", "true").lower() in ("1", "true", "yes")
+
+
+def _set_auth_cookies(response: Response, username: str) -> None:
+    response.set_cookie(
+        _SESSION_COOKIE,
+        _session_cookie_value(username),
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(),
+        max_age=_SESSION_TTL_SECONDS,
+    )
+    response.set_cookie(
+        "binance_trade_ws",
+        _ws_auth_cookie_value(),
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(),
+        max_age=_SESSION_TTL_SECONDS,
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(_SESSION_COOKIE, samesite="lax", secure=_cookie_secure())
+    response.delete_cookie("binance_trade_ws", samesite="lax", secure=_cookie_secure())
+
+
+def _valid_basic(credentials: HTTPBasicCredentials | None) -> str:
+    if credentials is None:
+        return ""
+    ok_user = secrets.compare_digest(credentials.username, _WEB_USER)
+    ok_pass = secrets.compare_digest(credentials.password, _WEB_PASSWORD)
+    return credentials.username if ok_user and ok_pass else ""
+
+
 def _check_auth(
+    request: Request,
     response: Response,
-    credentials: HTTPBasicCredentials = Depends(_security),
+    credentials: HTTPBasicCredentials | None = Depends(_security),
 ) -> str:
-    """Basic Auth 校验。用 compare_digest 防时序攻击。"""
+    """Session cookie first; Basic Auth remains as a compatibility fallback."""
     if not _WEB_PASSWORD:
         # 未配置密码 → 拒绝一切访问，避免裸奔
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="WEB_PASSWORD 未配置，拒绝访问。请在 .env 设置 WEB_USER/WEB_PASSWORD。",
         )
-    ok_user = secrets.compare_digest(credentials.username, _WEB_USER)
-    ok_pass = secrets.compare_digest(credentials.password, _WEB_PASSWORD)
-    if not (ok_user and ok_pass):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="认证失败",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    response.set_cookie(
-        "binance_trade_ws",
-        _ws_auth_cookie_value(),
-        httponly=True,
-        samesite="lax",
-        secure=os.environ.get("WEB_COOKIE_SECURE", "true").lower() in ("1", "true", "yes"),
-        max_age=7 * 24 * 3600,
-    )
-    return credentials.username
+    session_user = _session_user_from_cookie(request.cookies.get(_SESSION_COOKIE, ""))
+    if session_user:
+        _set_auth_cookies(response, session_user)
+        return session_user
+    basic_user = _valid_basic(credentials)
+    if basic_user:
+        _set_auth_cookies(response, basic_user)
+        return basic_user
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="认证失败")
 
 
 async def _get_store() -> Store:
@@ -129,6 +196,42 @@ def _parse_bool_setting(raw: str | None, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+class _LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(body: _LoginRequest, response: Response):
+    if not _WEB_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WEB_PASSWORD 未配置，拒绝访问。请在 .env 设置 WEB_USER/WEB_PASSWORD。",
+        )
+    ok_user = secrets.compare_digest(body.username, _WEB_USER)
+    ok_pass = secrets.compare_digest(body.password, _WEB_PASSWORD)
+    if not (ok_user and ok_pass):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="认证失败")
+    _set_auth_cookies(response, body.username)
+    return {
+        "authenticated": True,
+        "username": body.username,
+        "mode": _settings.mode.value,
+        "expires_in": _SESSION_TTL_SECONDS,
+    }
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(response: Response):
+    _clear_auth_cookies(response)
+    return {"authenticated": False, "mode": _settings.mode.value}
+
+
+@app.get("/api/auth/me")
+async def api_auth_me(user: str = Depends(_check_auth)):
+    return {"authenticated": True, "username": user, "mode": _settings.mode.value}
 
 
 async def _effective_strategy_paused() -> tuple[bool, str]:
@@ -698,9 +801,6 @@ def _consume_confirmation(token: str, action: str, payload: str) -> None:
         raise HTTPException(status_code=403, detail="mainnet confirmation missing or expired")
     if item["hash"] != _payload_hash(action, payload):
         raise HTTPException(status_code=403, detail="mainnet confirmation payload mismatch")
-
-
-from pydantic import BaseModel, Field  # noqa: E402
 
 
 class _ConfirmationRequest(BaseModel):
@@ -1643,6 +1743,9 @@ def _ws_authorized(websocket: WebSocket) -> bool:
     import base64
     if not _WEB_PASSWORD:
         return False
+    session_user = _session_user_from_cookie(websocket.cookies.get(_SESSION_COOKIE, ""))
+    if session_user:
+        return True
     cookie = websocket.cookies.get("binance_trade_ws", "")
     if cookie and secrets.compare_digest(cookie, _ws_auth_cookie_value()):
         return True

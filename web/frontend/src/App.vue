@@ -1,9 +1,9 @@
 <script setup>
-import { onMounted, onUnmounted, computed, ref } from 'vue'
+import { onMounted, onUnmounted, computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useLiveStore } from './stores/live'
 import { utc8Time } from './labels'
-import { getEnvironment, setEnvironment } from './api'
+import { authLogout, authState, getEnvironment, setEnvironment } from './api'
 
 const live = useLiveStore()
 const route = useRoute()
@@ -28,6 +28,8 @@ const lastUpdateText = computed(() =>
 )
 const activePath = computed(() => route.path)
 const isDark = computed(() => theme.value === 'dark')
+const isLoginRoute = computed(() => route.path === '/login')
+const showShell = computed(() => authState.authenticated && !isLoginRoute.value)
 
 function onMenuSelect(index) {
   if (route.path !== index) router.push(index)
@@ -39,6 +41,7 @@ function pauseLiveTransports() {
 }
 
 function resumeLiveTransports() {
+  if (!showShell.value) return
   live.connect()
   window.dispatchEvent(new Event('binance-trade-resume-live'))
 }
@@ -65,26 +68,48 @@ function toggleTheme() {
 
 function switchEnvironment(value) {
   setEnvironment(value)
+  if (!showShell.value) return
   live.disconnect()
   live.connect()
 }
 
+async function logout() {
+  pauseLiveTransports()
+  await authLogout()
+  router.replace('/login')
+}
+
+function onAuthRequired() {
+  pauseLiveTransports()
+  if (!isLoginRoute.value) {
+    router.replace({ path: '/login', query: { redirect: route.fullPath } })
+  }
+}
+
 onMounted(() => {
   applyTheme(theme.value)
-  live.connect()
+  if (showShell.value) live.connect()
   document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('pagehide', pauseLiveTransports)
+  window.addEventListener('binance-trade-auth-required', onAuthRequired)
 })
 
 onUnmounted(() => {
   document.removeEventListener('visibilitychange', onVisibilityChange)
   window.removeEventListener('pagehide', pauseLiveTransports)
+  window.removeEventListener('binance-trade-auth-required', onAuthRequired)
   live.disconnect()
+})
+
+watch(showShell, (enabled) => {
+  if (enabled) live.connect()
+  else live.disconnect()
 })
 </script>
 
 <template>
-  <el-container class="app-shell" :class="{ 'mainnet-shell': environment === 'mainnet' }">
+  <router-view v-if="isLoginRoute" />
+  <el-container v-else-if="showShell" class="app-shell" :class="{ 'mainnet-shell': environment === 'mainnet' }">
     <el-aside width="200px" class="app-sidebar">
       <div class="brand-title">
         Binance-trade
@@ -114,6 +139,7 @@ onUnmounted(() => {
             :icon="isDark ? 'Sunny' : 'Moon'"
             @click="toggleTheme"
           />
+          <el-button size="small" plain @click="logout">退出</el-button>
           <el-tag :type="live.connected ? 'success' : 'danger'" size="small" effect="dark">
             {{ live.connected ? (live.transport === 'ws' ? '实时(WS)' : '实时(轮询)') : '已断开' }}
           </el-tag>
