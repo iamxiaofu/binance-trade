@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -60,6 +61,27 @@ def test_openai_function_has_no_defs():
     assert fn["function"]["name"] == _TOOL_NAME
     blob = json.dumps(fn["function"]["parameters"])
     assert "$defs" not in blob and "$ref" not in blob
+
+
+def test_openai_request_uses_max_completion_tokens():
+    p = OpenAICompatProvider(model="m", base_url="https://gw", api_key="x", timeout=5)
+    payload = p.request_payload(system="system", user_prompt="user", max_tokens=128)
+    assert payload["max_completion_tokens"] == 128
+    assert "max_tokens" not in payload
+
+
+async def test_openai_ping_uses_max_completion_tokens():
+    p = OpenAICompatProvider(model="m", base_url="https://gw", api_key="x", timeout=5)
+    create = AsyncMock()
+    p._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    await p.ping(max_tokens=16)
+    create.assert_awaited_once_with(
+        model="m",
+        max_completion_tokens=16,
+        messages=[{"role": "user", "content": "ping"}],
+    )
 
 
 def test_anthropic_tool_keeps_schema():

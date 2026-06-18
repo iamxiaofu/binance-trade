@@ -357,6 +357,7 @@ class TradeFilters:
     directions: list[str] = field(default_factory=list)
     statuses: list[str] = field(default_factory=list)
     exit_reasons: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
     start_ts_ms: int | None = None
     end_ts_ms: int | None = None
     limit: int = 100
@@ -402,7 +403,7 @@ def _trade_where(filters: TradeFilters) -> tuple[str, list[Any]]:
 
 
 def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
-    """服务端筛选交易组，返回聚合交易和明细订单。"""
+    """Return strategy and external Binance trade lifecycles without mixing storage."""
     started = time.perf_counter()
     limit = max(1, min(int(filters.limit or 100), 500))
     offset = max(0, int(filters.offset or 0))
@@ -411,6 +412,7 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
         directions=filters.directions,
         statuses=filters.statuses,
         exit_reasons=filters.exit_reasons,
+        sources=filters.sources,
         start_ts_ms=filters.start_ts_ms,
         end_ts_ms=filters.end_ts_ms,
         limit=limit,
@@ -418,36 +420,141 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
     )
     where_sql, args = _trade_where(filters)
     order_count = 0
-    items = _rows(
-        db_path,
-        f"SELECT * FROM trades{where_sql} ORDER BY opened_at_ms DESC, id DESC LIMIT ? OFFSET ?",
-        tuple(args + [limit, offset]),
-    )
-    total_rows = _rows(db_path, f"SELECT COUNT(*) AS total FROM trades{where_sql}", tuple(args))
-    total = int(total_rows[0]["total"]) if total_rows else 0
-    if items:
-        ids = [int(row["id"]) for row in items]
-        placeholders = ",".join("?" for _ in ids)
+    requested_sources = {str(value).strip().lower() for value in filters.sources if value}
+    include_strategy = not requested_sources or "strategy" in requested_sources
+    include_external = not requested_sources or "external" in requested_sources
+    fetch_limit = offset + limit
+
+    strategy_items = []
+    strategy_total = 0
+    if include_strategy:
+        strategy_items = _rows(
+            db_path,
+            f"SELECT * FROM trades{where_sql} "
+            "ORDER BY opened_at_ms DESC, id DESC LIMIT ?",
+            tuple(args + [fetch_limit]),
+        )
+        total_rows = _rows(
+            db_path, f"SELECT COUNT(*) AS total FROM trades{where_sql}", tuple(args)
+        )
+        strategy_total = int(total_rows[0]["total"]) if total_rows else 0
+        for item in strategy_items:
+            item.update({
+                "record_key": f"strategy:{item['id']}",
+                "record_type": "strategy",
+                "ownership": "engine",
+                "source_label": "Engine 策略交易",
+                "classification_reason": "",
+            })
+
+    external_items = []
+    external_total = 0
+    if include_external and _table_exists(db_path, "external_trades"):
+        external_items = _rows(
+            db_path,
+            f"SELECT * FROM external_trades{where_sql} "
+            "ORDER BY opened_at_ms DESC, id DESC LIMIT ?",
+            tuple(args + [fetch_limit]),
+        )
+        total_rows = _rows(
+            db_path,
+            f"SELECT COUNT(*) AS total FROM external_trades{where_sql}",
+            tuple(args),
+        )
+        external_total = int(total_rows[0]["total"]) if total_rows else 0
+        for item in external_items:
+            item.update({
+                "record_key": f"external:{item['id']}",
+                "record_type": "external",
+                "ownership": "external",
+                "source_label": (
+                    "Binance 外部/手工交易（窗口前持仓）"
+                    if item.get("confidence") == "carry_in"
+                    else "Binance 外部/手工交易"
+                ),
+            })
+
+    items = sorted(
+        strategy_items + external_items,
+        key=lambda row: (int(row.get("opened_at_ms") or 0), int(row.get("id") or 0)),
+        reverse=True,
+    )[offset:offset + limit]
+    total = strategy_total + external_total
+
+    strategy_ids = [
+        int(row["id"]) for row in items if row.get("record_type") == "strategy"
+    ]
+    if strategy_ids:
+        placeholders = ",".join("?" for _ in strategy_ids)
         order_rows = _rows(
             db_path,
             f"SELECT * FROM orders WHERE trade_id IN ({placeholders}) ORDER BY trade_id, ts_ms, id",
-            tuple(ids),
+            tuple(strategy_ids),
         )
         order_count = len(order_rows)
         by_trade: dict[int, list[dict[str, Any]]] = {}
         for row in order_rows:
             by_trade.setdefault(int(row.get("trade_id") or 0), []).append(row)
         for item in items:
-            item["orders"] = by_trade.get(int(item["id"]), [])
+            if item.get("record_type") == "strategy":
+                item["orders"] = by_trade.get(int(item["id"]), [])
+
+    external_ids = [
+        int(row["id"]) for row in items if row.get("record_type") == "external"
+    ]
+    if external_ids:
+        placeholders = ",".join("?" for _ in external_ids)
+        fill_rows = _rows(
+            db_path,
+            f"""
+            SELECT etf.external_trade_id AS trade_id, ef.ts_ms, ef.created_at,
+                   ef.symbol,
+                   CASE WHEN etf.role IN ('ENTRY', 'REVERSAL_ENTRY') THEN 'OPEN'
+                        ELSE 'CLOSE' END AS client_kind,
+                   ef.side, 'trade' AS order_type, etf.qty,
+                   etf.price, ABS(etf.qty * etf.price) AS notional,
+                   'filled' AS status, ef.exchange_order_id,
+                   etf.role AS trade_role, 0 AS margin,
+                   etf.realized_pnl, '' AS execution_mode,
+                   ef.liquidity, etf.fee, ef.fee_asset,
+                   ef.client_order_id, ef.raw_json
+            FROM external_trade_fills etf
+            JOIN exchange_fills ef ON ef.id = etf.exchange_fill_id
+            WHERE etf.external_trade_id IN ({placeholders})
+            ORDER BY etf.external_trade_id, ef.ts_ms, etf.id
+            """,
+            tuple(external_ids),
+        )
+        order_count += len(fill_rows)
+        by_external: dict[int, list[dict[str, Any]]] = {}
+        for row in fill_rows:
+            by_external.setdefault(int(row.get("trade_id") or 0), []).append(row)
+        for item in items:
+            if item.get("record_type") == "external":
+                item["orders"] = by_external.get(int(item["id"]), [])
+                item.setdefault("dry_run", False)
+                item.setdefault("entry_order_id", 0)
+                item.setdefault("exit_order_id", 0)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if elapsed_ms >= _SLOW_TRADE_QUERY_MS:
         logger.warning(
             "slow trade search {:.1f}ms limit={} offset={} total={} rows={} orders={} "
-            "symbols={} directions={} statuses={} exit_reasons={} start_ts_ms={} end_ts_ms={}",
+            "symbols={} directions={} statuses={} exit_reasons={} sources={} "
+            "start_ts_ms={} end_ts_ms={}",
             elapsed_ms, limit, offset, total, len(items), order_count,
             filters.symbols, filters.directions, filters.statuses, filters.exit_reasons,
+            filters.sources,
             filters.start_ts_ms, filters.end_ts_ms,
         )
+    audit = {"external": 0, "mixed": 0, "unknown": 0}
+    if _table_exists(db_path, "exchange_fills"):
+        audit_rows = _rows(
+            db_path,
+            "SELECT ownership, COUNT(*) AS total FROM exchange_fills "
+            "WHERE ownership IN ('external', 'mixed', 'unknown') GROUP BY ownership",
+        )
+        for row in audit_rows:
+            audit[str(row.get("ownership") or "")] = int(row.get("total") or 0)
     return {
         "items": items,
         "total": total,
@@ -458,10 +565,21 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
             "directions": filters.directions,
             "statuses": filters.statuses,
             "exit_reasons": filters.exit_reasons,
+            "sources": filters.sources,
             "start_ts_ms": filters.start_ts_ms,
             "end_ts_ms": filters.end_ts_ms,
         },
+        "fill_audit": audit,
     }
+
+
+def _table_exists(db_path: str, table_name: str) -> bool:
+    rows = _rows(
+        db_path,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    )
+    return bool(rows)
 
 
 def recent_rejects(db_path: str, limit: int = 50) -> list[dict]:

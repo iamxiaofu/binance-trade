@@ -24,6 +24,7 @@ from src.engine.decision_guards import (
 )
 from src.exchange.client import ExchangeClient
 from src.exchange.events import rest_snapshot_event
+from src.exchange.fills import ccxt_trade_fill, private_order_trade_fill
 from src.exchange.filters import normalize_order, round_price
 from src.exchange.market_data import MarketData
 from src.exchange.orders import normalize_condition_order
@@ -148,6 +149,7 @@ class TradingEngine:
         self._buffer_private_events = True
         self._private_event_buffer: list = []
         self._startup_complete = False
+        self._last_fill_sync_at = 0.0
 
     # ---------- 生命周期 ----------
     async def startup(self) -> None:
@@ -206,6 +208,7 @@ class TradingEngine:
             try:
                 await self._submit_rest_account_snapshot("startup")
                 await self._replay_private_event_buffer()
+                await self._sync_exchange_fills(force=True)
             except Exception as e:
                 logger.warning("startup reconcile failed: {}", e)
                 self.runtime.halt_entries(f"startup reconcile failed: {e}")
@@ -304,6 +307,23 @@ class TradingEngine:
         await self._account.drain()
         if event.event_type == "ORDER_TRADE_UPDATE":
             order = event.payload.get("o") or {}
+            fill = private_order_trade_fill(event)
+            if fill is not None:
+                try:
+                    position = self.runtime.positions.get(
+                        normalize_symbol(fill.get("symbol"))
+                    ) or {}
+                    fill["leverage"] = int(position.get("leverage") or 0)
+                    result = await self._store.ingest_exchange_fill(fill)
+                    if result.get("inserted") and result.get("ownership") in (
+                        "external", "mixed",
+                    ):
+                        logger.warning(
+                            "{} Binance fill archived ownership={} reason={}",
+                            fill["symbol"], result["ownership"], result.get("reason") or "",
+                        )
+                except Exception as e:
+                    logger.error("private Binance fill archive failed: {}", e)
             await self._mark_condition_exit_from_order_update(event, order)
             client_id = str(order.get("c") or "")
             status = str(order.get("X") or "").upper()
@@ -316,7 +336,7 @@ class TradingEngine:
                     reason_code="EXTERNAL_ORDER_DETECTED",
                     reason=f"external Binance order detected: {client_id} status={status}",
                     source="binance:user-stream",
-                    action="auto_takeover_and_protect",
+                    action="record_only_no_takeover",
                 )
         if event.event_type == "MARGIN_CALL":
             self.runtime.halt_entries("Binance margin call: new entries paused")
@@ -3368,7 +3388,44 @@ class TradingEngine:
         logger.debug("exchange reconcile start: {}", reason)
         async with self._state_sync_lock:
             await self._rest_resync_with_event_buffer(reason)
+        await self._sync_exchange_fills()
         await self._enforce_exchange_invariants(reason)
+
+    async def _sync_exchange_fills(self, *, force: bool = False) -> None:
+        """REST compensation for private-stream fill gaps."""
+        now = time.monotonic()
+        if not force and now - self._last_fill_sync_at < 60.0:
+            return
+        self._last_fill_sync_at = now
+        fallback_since = int(time.time() * 1000) - 300_000
+        for symbol in self._tracked_symbols():
+            try:
+                watermark = await self._store.exchange_fill_watermark(symbol)
+                since = max(0, watermark - 60_000) if watermark else fallback_since
+                while True:
+                    trades = await self._client.fetch_my_trades(symbol, since=since, limit=1000)
+                    if not trades:
+                        break
+                    max_ts = since
+                    for trade in trades:
+                        fill = ccxt_trade_fill(trade, symbol)
+                        if fill is None:
+                            continue
+                        position = self.runtime.positions.get(symbol) or {}
+                        fill["leverage"] = int(position.get("leverage") or 0)
+                        await self._store.ingest_exchange_fill(fill)
+                        max_ts = max(max_ts, int(fill.get("ts_ms") or 0))
+                    if len(trades) < 1000 or max_ts <= since:
+                        break
+                    since = max_ts + 1
+            except Exception as e:
+                logger.warning("{} exchange fill REST compensation failed: {}", symbol, e)
+        try:
+            resolved = await self._store.resolve_unknown_exchange_fills()
+            if resolved:
+                logger.info("reclassified {} deferred Binance fills", resolved)
+        except Exception as e:
+            logger.warning("deferred Binance fill reclassification failed: {}", e)
 
     async def _sync_open_orders_snapshot(self) -> None:
         orders = await self._fetch_open_orders_safe()

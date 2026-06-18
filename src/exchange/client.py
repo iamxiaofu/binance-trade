@@ -222,6 +222,22 @@ class ExchangeClient:
             params={"orderId": order_id},
         )
 
+    async def fetch_my_trades(
+        self,
+        symbol: str,
+        *,
+        since: int | None = None,
+        until: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        params = {"endTime": int(until)} if until is not None else {}
+        return await self._exchange.fetch_my_trades(
+            self._to_ccxt_symbol(symbol),
+            since=since,
+            limit=min(max(int(limit), 1), 1000),
+            params=params,
+        )
+
     async def cancel_order(
         self,
         symbol: str,

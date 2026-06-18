@@ -30,7 +30,7 @@ class OpenAICompatProvider:
     def request_payload(self, *, system: str, user_prompt: str, max_tokens: int) -> dict:
         return {
             "model": self.model,
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
@@ -60,7 +60,7 @@ class OpenAICompatProvider:
     async def ping(self, *, max_tokens: int = 16) -> None:
         await self._client.chat.completions.create(
             model=self.model,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             messages=[{"role": "user", "content": "ping"}],
         )
 

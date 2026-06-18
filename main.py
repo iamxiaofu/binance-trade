@@ -16,6 +16,7 @@ import asyncio
 import csv
 import signal
 import sys
+import time
 
 from src.config.loader import ConfigError, load_config
 from src.utils.logger import setup_logger
@@ -36,6 +37,13 @@ def _build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--csv", required=True, help="OHLCV CSV: ts,open,high,low,close,volume")
     bt.add_argument("--leverage", type=int, default=5, help="模拟 LLM 给出的杠杆（默认5，触发夹断）")
     bt.add_argument("--size-pct", type=float, default=0.1)
+    ext = sub.add_parser(
+        "external-backfill",
+        help="预览或导入 Binance 外部/手工成交（默认最近30天 dry-run）",
+    )
+    ext.add_argument("--days", type=int, default=30, help="回填天数，默认30")
+    ext.add_argument("--apply", action="store_true", help="正式写入外部成交账本")
+    ext.add_argument("--yes", action="store_true", help="跳过 mainnet MAINNET 二次确认")
     return p
 
 
@@ -113,6 +121,77 @@ def _cmd_backtest(args) -> int:
     return 0
 
 
+async def _cmd_external_backfill(args) -> int:
+    from src.exchange.client import ExchangeClient
+    from src.exchange.fills import ccxt_trade_fill
+    from src.store.repo import Store
+
+    settings, creds = load_config(args.config, args.env)
+    setup_logger(settings.logging)
+    days = min(max(int(args.days), 1), 90)
+    if args.apply and settings.is_mainnet and not args.yes:
+        answer = input(
+            f"即将向 {settings.mode.value} 数据库导入最近 {days} 天外部成交。"
+            "输入 MAINNET 继续: "
+        ).strip()
+        if answer != "MAINNET":
+            print("已取消。")
+            return 1
+
+    client = ExchangeClient(settings, creds)
+    store = Store(settings.storage.db_path)
+    await store.connect(run_backfills=False)
+    cutoff = int(time.time() * 1000) - days * 86_400_000
+    now_ms = int(time.time() * 1000)
+    stats = {
+        "fetched": 0, "engine": 0, "external": 0, "mixed": 0,
+        "unknown": 0, "duplicates": 0, "inserted": 0,
+    }
+    try:
+        for symbol in settings.symbols:
+            window_start = cutoff
+            while window_start < now_ms:
+                window_end = min(window_start + 6 * 86_400_000, now_ms)
+                since = window_start
+                while since <= window_end:
+                    trades = await client.fetch_my_trades(
+                        symbol, since=since, until=window_end, limit=1000
+                    )
+                    if not trades:
+                        break
+                    max_ts = since
+                    for trade in trades:
+                        fill = ccxt_trade_fill(trade, symbol)
+                        if fill is None:
+                            continue
+                        stats["fetched"] += 1
+                        preview = await store.preview_exchange_fill(fill)
+                        ownership = str(preview["ownership"])
+                        stats[ownership] += 1
+                        if preview["duplicate"]:
+                            stats["duplicates"] += 1
+                        if args.apply:
+                            result = await store.ingest_exchange_fill(fill)
+                            if result.get("inserted"):
+                                stats["inserted"] += 1
+                        max_ts = max(max_ts, int(fill.get("ts_ms") or 0))
+                    if len(trades) < 1000 or max_ts <= since:
+                        break
+                    since = max_ts + 1
+                window_start = window_end + 1
+    finally:
+        await client.close()
+        await store.close()
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(f"external-backfill {mode}: mode={settings.mode.value} days={days}")
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+    if not args.apply:
+        print("未写入业务数据；确认统计后加 --apply 执行。")
+    return 0
+
+
 def cli() -> int:
     args = _build_parser().parse_args()
     try:
@@ -122,6 +201,8 @@ def cli() -> int:
             return asyncio.run(_cmd_kill(args))
         if args.command == "backtest":
             return _cmd_backtest(args)
+        if args.command == "external-backfill":
+            return asyncio.run(_cmd_external_backfill(args))
     except ConfigError as e:
         print(f"配置错误：{e}", file=sys.stderr)
         return 2

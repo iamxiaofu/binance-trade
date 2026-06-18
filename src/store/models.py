@@ -159,6 +159,88 @@ class TradeRow(Base):
     confidence: Mapped[str] = mapped_column(String(16), default="exact")
 
 
+class ExchangeFillRow(Base):
+    """Binance authoritative fill ledger, independent from engine order history."""
+    __tablename__ = "exchange_fills"
+    __table_args__ = (UniqueConstraint("symbol", "exchange_trade_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    exchange_trade_id: Mapped[str] = mapped_column(String(64), default="")
+    exchange_order_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    client_order_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    side: Mapped[str] = mapped_column(String(8), default="")
+    qty: Mapped[float] = mapped_column(Float, default=0.0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    notional: Mapped[float] = mapped_column(Float, default=0.0)
+    fee: Mapped[float] = mapped_column(Float, default=0.0)
+    fee_asset: Mapped[str] = mapped_column(String(16), default="")
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    liquidity: Mapped[str] = mapped_column(String(12), default="")
+    reduce_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    ownership: Mapped[str] = mapped_column(String(16), default="unknown", index=True)
+    classification_reason: Mapped[str] = mapped_column(String(240), default="")
+    source: Mapped[str] = mapped_column(String(16), default="stream")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+
+
+class ExternalTradeRow(Base):
+    """External/manual Binance position lifecycle, isolated from strategy trades."""
+    __tablename__ = "external_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="")
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    opened_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    opened_at: Mapped[str] = mapped_column(String(32), default="")
+    closed_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    closed_at: Mapped[str] = mapped_column(String(32), default="")
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    qty_opened: Mapped[float] = mapped_column(Float, default=0.0)
+    qty_closed: Mapped[float] = mapped_column(Float, default=0.0)
+    leverage: Mapped[int] = mapped_column(Integer, default=0)
+    entry_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    pnl_pct_on_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    total_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    gross_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    net_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    net_pnl_pct_on_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_liquidity: Mapped[str] = mapped_column(String(12), default="")
+    exit_liquidity: Mapped[str] = mapped_column(String(12), default="")
+    exit_reason: Mapped[str] = mapped_column(String(24), default="")
+    source: Mapped[str] = mapped_column(String(24), default="binance_external")
+    confidence: Mapped[str] = mapped_column(String(16), default="exact")
+    classification_reason: Mapped[str] = mapped_column(String(240), default="")
+
+
+class ExternalTradeFillRow(Base):
+    """Allocation of an exchange fill to an external trade lifecycle."""
+    __tablename__ = "external_trade_fills"
+    __table_args__ = (
+        UniqueConstraint("external_trade_id", "exchange_fill_id", "role"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    external_trade_id: Mapped[int] = mapped_column(Integer, index=True)
+    exchange_fill_id: Mapped[int] = mapped_column(Integer, index=True)
+    role: Mapped[str] = mapped_column(String(24), default="")
+    qty: Mapped[float] = mapped_column(Float, default=0.0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    fee: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class PositionClaimRow(Base):
     """开仓中的仓位所有权声明，避免交易所成交早于本地 trade 落库时被误判。"""
     __tablename__ = "position_claims"

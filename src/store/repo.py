@@ -41,6 +41,9 @@ from src.store.models import (
     ExchangeEventRow,
     ExchangeStateDriftRow,
     ExchangeStreamSessionRow,
+    ExchangeFillRow,
+    ExternalTradeRow,
+    ExternalTradeFillRow,
     LiveBalanceRow,
     LLMPromptVersionRow,
     LivePositionRow,
@@ -147,6 +150,11 @@ _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_trades_symbol_opened_id ON trades(symbol, opened_at_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_trades_status_opened_id ON trades(status, opened_at_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_orders_trade_ts_id ON orders(trade_id, ts_ms ASC, id ASC)",
+    "CREATE INDEX IF NOT EXISTS ix_exchange_fills_ts_id ON exchange_fills(ts_ms ASC, id ASC)",
+    "CREATE INDEX IF NOT EXISTS ix_exchange_fills_ownership_ts ON exchange_fills(ownership, ts_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_external_trades_opened_id ON external_trades(opened_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_external_trades_symbol_status ON external_trades(symbol, status)",
+    "CREATE INDEX IF NOT EXISTS ix_external_trade_fills_trade ON external_trade_fills(external_trade_id, id)",
     "CREATE INDEX IF NOT EXISTS ix_llm_prompt_versions_version ON llm_prompt_versions(version DESC)",
 )
 
@@ -369,12 +377,13 @@ class Store:
             self._engine, expire_on_commit=False
         )
 
-    async def connect(self) -> None:
+    async def connect(self, *, run_backfills: bool = True) -> None:
         """建表（幂等）。"""
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await self._upgrade_schema(conn)
-        await self.backfill_trades()
+        if run_backfills:
+            await self.backfill_trades()
         try:
             Path(self._db_path).chmod(0o600)
         except OSError as e:
@@ -1146,6 +1155,453 @@ class Store:
             if changed:
                 logger.info("backfilled {} historical orders into trades", changed)
             return changed
+
+    # ---------- Binance authoritative fills / external trade archive ----------
+    async def exchange_fill_watermark(self, symbol: str) -> int:
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            value = (
+                await session.execute(
+                    select(ExchangeFillRow.ts_ms)
+                    .where(ExchangeFillRow.symbol == symbol)
+                    .order_by(ExchangeFillRow.ts_ms.desc(), ExchangeFillRow.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        return int(value or 0)
+
+    async def ingest_exchange_fill(self, fill: dict[str, Any]) -> dict[str, Any]:
+        """Persist and classify one Binance fill, then archive pure external lifecycles.
+
+        This method never writes ``orders`` or ``trades``. Duplicate stream/REST events
+        are ignored by the (symbol, exchange_trade_id) unique constraint.
+        """
+        symbol = normalize_symbol(fill.get("symbol"))
+        trade_id = str(fill.get("exchange_trade_id") or "")
+        order_id = str(fill.get("exchange_order_id") or "")
+        client_id = str(fill.get("client_order_id") or "")
+        side = str(fill.get("side") or "").lower()
+        qty = _safe_float(fill.get("qty"))
+        price = _safe_float(fill.get("price"))
+        ts_ms = _safe_int(fill.get("ts_ms")) or int(_t.time() * 1000)
+        if not symbol or not trade_id or side not in ("buy", "sell") or qty <= 0 or price <= 0:
+            return {"inserted": False, "ownership": "unknown", "reason": "invalid fill"}
+
+        async with self._sessionmaker() as session:
+            ownership, reason = await self._classify_exchange_fill(
+                session,
+                symbol=symbol,
+                exchange_order_id=order_id,
+                client_order_id=client_id,
+                ts_ms=ts_ms,
+            )
+            row = ExchangeFillRow(
+                ts_ms=ts_ms,
+                created_at=_iso_utc_from_ms(ts_ms),
+                symbol=symbol,
+                exchange_trade_id=trade_id,
+                exchange_order_id=order_id,
+                client_order_id=client_id,
+                side=side,
+                qty=qty,
+                price=price,
+                notional=abs(qty * price),
+                fee=_safe_float(fill.get("fee")),
+                fee_asset=str(fill.get("fee_asset") or "")[:16],
+                realized_pnl=_safe_float(fill.get("realized_pnl")),
+                liquidity=str(fill.get("liquidity") or "")[:12],
+                reduce_only=bool(fill.get("reduce_only", False)),
+                ownership=ownership,
+                classification_reason=reason[:240],
+                source=str(fill.get("source") or "stream")[:16],
+                raw_json=json.dumps(fill.get("raw") or {}, default=str)[:100000],
+            )
+            session.add(row)
+            try:
+                await session.flush()
+            except IntegrityError:
+                await session.rollback()
+                return {"inserted": False, "ownership": ownership, "reason": "duplicate"}
+
+            external_trade_ids: list[int] = []
+            if ownership == "external":
+                external_trade_ids = await self._apply_external_fill(
+                    session,
+                    row,
+                    leverage=_safe_int(fill.get("leverage")),
+                )
+            await session.commit()
+            return {
+                "inserted": True,
+                "fill_id": row.id,
+                "ownership": ownership,
+                "reason": reason,
+                "external_trade_ids": external_trade_ids,
+            }
+
+    async def _classify_exchange_fill(
+        self,
+        session: AsyncSession,
+        *,
+        symbol: str,
+        exchange_order_id: str,
+        client_order_id: str,
+        ts_ms: int,
+    ) -> tuple[str, str]:
+        if client_order_id.startswith("bt-"):
+            return "engine", "client order id uses engine bt- prefix"
+
+        order_conditions = []
+        if exchange_order_id:
+            order_conditions.append(OrderRow.exchange_order_id == exchange_order_id)
+        if client_order_id:
+            order_conditions.append(OrderRow.client_order_id == client_order_id)
+        if order_conditions:
+            local_order = (
+                await session.execute(
+                    select(OrderRow.id).where(or_(*order_conditions)).limit(1)
+                )
+            ).scalar_one_or_none()
+            if local_order is not None:
+                return "engine", "matched local engine order"
+
+        claim_stmt = (
+            select(PositionClaimRow)
+            .where(PositionClaimRow.symbol == symbol)
+            .where(PositionClaimRow.ts_ms <= ts_ms)
+            .where(PositionClaimRow.expires_at_ms >= ts_ms)
+            .order_by(PositionClaimRow.id.desc())
+            .limit(1)
+        )
+        claim = (await session.execute(claim_stmt)).scalar_one_or_none()
+        if claim is not None:
+            if client_order_id and claim.client_order_id == client_order_id:
+                return "engine", "matched local position claim"
+            if claim.status in _ACTIVE_CLAIM_STATUSES:
+                return "unknown", "active local position claim prevents external classification"
+
+        managed = (
+            await session.execute(
+                select(TradeRow.id)
+                .where(TradeRow.symbol == symbol)
+                .where(TradeRow.opened_at_ms <= ts_ms)
+                .where(
+                    or_(
+                        TradeRow.closed_at_ms == 0,
+                        TradeRow.closed_at_ms >= ts_ms,
+                    )
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if managed is not None:
+            return "mixed", "external fill occurred while an engine trade was open"
+
+        return "external", "not engine-prefixed and no local order, claim, or open strategy trade"
+
+    async def preview_exchange_fill(self, fill: dict[str, Any]) -> dict[str, Any]:
+        symbol = normalize_symbol(fill.get("symbol"))
+        async with self._sessionmaker() as session:
+            duplicate = (
+                await session.execute(
+                    select(ExchangeFillRow.id)
+                    .where(ExchangeFillRow.symbol == symbol)
+                    .where(
+                        ExchangeFillRow.exchange_trade_id
+                        == str(fill.get("exchange_trade_id") or "")
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            ownership, reason = await self._classify_exchange_fill(
+                session,
+                symbol=symbol,
+                exchange_order_id=str(fill.get("exchange_order_id") or ""),
+                client_order_id=str(fill.get("client_order_id") or ""),
+                ts_ms=_safe_int(fill.get("ts_ms")),
+            )
+        return {
+            "duplicate": duplicate is not None,
+            "ownership": ownership,
+            "reason": reason,
+        }
+
+    async def resolve_unknown_exchange_fills(self, limit: int = 200) -> int:
+        """Reclassify fills deferred by an active claim and rebuild affected symbols."""
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(ExchangeFillRow)
+                    .where(ExchangeFillRow.ownership == "unknown")
+                    .order_by(ExchangeFillRow.ts_ms, ExchangeFillRow.id)
+                    .limit(max(1, int(limit)))
+                )
+            ).scalars().all()
+            rebuild_symbols: set[str] = set()
+            changed = 0
+            for row in rows:
+                ownership, reason = await self._classify_exchange_fill(
+                    session,
+                    symbol=row.symbol,
+                    exchange_order_id=row.exchange_order_id,
+                    client_order_id=row.client_order_id,
+                    ts_ms=row.ts_ms,
+                )
+                if ownership == "unknown":
+                    continue
+                row.ownership = ownership
+                row.classification_reason = reason[:240]
+                if ownership == "external":
+                    rebuild_symbols.add(row.symbol)
+                changed += 1
+            await session.flush()
+            for symbol in rebuild_symbols:
+                await self._rebuild_external_symbol(session, symbol)
+            await session.commit()
+            return changed
+
+    async def _rebuild_external_symbol(self, session: AsyncSession, symbol: str) -> None:
+        trade_ids = (
+            await session.execute(
+                select(ExternalTradeRow.id).where(ExternalTradeRow.symbol == symbol)
+            )
+        ).scalars().all()
+        if trade_ids:
+            await session.execute(
+                delete(ExternalTradeFillRow).where(
+                    ExternalTradeFillRow.external_trade_id.in_(tuple(trade_ids))
+                )
+            )
+            await session.execute(
+                delete(ExternalTradeRow).where(ExternalTradeRow.id.in_(tuple(trade_ids)))
+            )
+            await session.flush()
+        fills = (
+            await session.execute(
+                select(ExchangeFillRow)
+                .where(ExchangeFillRow.symbol == symbol)
+                .where(ExchangeFillRow.ownership == "external")
+                .order_by(ExchangeFillRow.ts_ms, ExchangeFillRow.id)
+            )
+        ).scalars().all()
+        for fill in fills:
+            await self._apply_external_fill(session, fill, leverage=0)
+
+    async def _apply_external_fill(
+        self,
+        session: AsyncSession,
+        fill: ExchangeFillRow,
+        *,
+        leverage: int,
+    ) -> list[int]:
+        direction = "long" if fill.side == "buy" else "short"
+        current = (
+            await session.execute(
+                select(ExternalTradeRow)
+                .where(ExternalTradeRow.symbol == fill.symbol)
+                .where(ExternalTradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                .order_by(ExternalTradeRow.opened_at_ms.desc(), ExternalTradeRow.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+        if current is None:
+            if fill.reduce_only or abs(float(fill.realized_pnl or 0.0)) > 1e-12:
+                carry = ExternalTradeRow(
+                    ts_ms=fill.ts_ms,
+                    created_at=fill.created_at,
+                    symbol=fill.symbol,
+                    direction="short" if direction == "long" else "long",
+                    status="closed",
+                    opened_at_ms=fill.ts_ms,
+                    opened_at=fill.created_at,
+                    closed_at_ms=fill.ts_ms,
+                    closed_at=fill.created_at,
+                    entry_price=0.0,
+                    exit_price=fill.price,
+                    qty_opened=fill.qty,
+                    qty_closed=fill.qty,
+                    leverage=leverage,
+                    exit_notional=fill.notional,
+                    realized_pnl=fill.realized_pnl,
+                    gross_realized_pnl=fill.realized_pnl,
+                    exit_fee=fill.fee,
+                    total_fee=fill.fee,
+                    net_realized_pnl=fill.realized_pnl - fill.fee,
+                    exit_liquidity=fill.liquidity,
+                    exit_reason="EXTERNAL",
+                    source="binance_external",
+                    confidence="carry_in",
+                    classification_reason=(
+                        "position existed before the synchronized fill window; "
+                        "entry price intentionally unknown"
+                    ),
+                )
+                session.add(carry)
+                await session.flush()
+                self._add_external_fill_allocation(
+                    session,
+                    trade=carry,
+                    fill=fill,
+                    role="EXIT",
+                    qty=fill.qty,
+                    fee=fill.fee,
+                    realized_pnl=fill.realized_pnl,
+                )
+                return [carry.id]
+            trade = self._new_external_trade(fill, direction=direction, qty=fill.qty, leverage=leverage)
+            session.add(trade)
+            await session.flush()
+            self._add_external_fill_allocation(
+                session, trade=trade, fill=fill, role="ENTRY", qty=fill.qty, fee=fill.fee
+            )
+            return [trade.id]
+
+        open_qty = max(float(current.qty_opened or 0) - float(current.qty_closed or 0), 0.0)
+        if current.direction == direction:
+            previous_notional = float(current.entry_price or 0) * float(current.qty_opened or 0)
+            current.qty_opened += fill.qty
+            current.entry_notional += fill.notional
+            current.entry_price = (
+                (previous_notional + fill.notional) / current.qty_opened
+                if current.qty_opened > 0 else fill.price
+            )
+            current.entry_fee += fill.fee
+            current.total_fee = current.entry_fee + current.exit_fee
+            current.leverage = current.leverage or leverage
+            current.entry_margin = _margin(current.entry_notional, current.leverage)
+            current.status = "open" if current.qty_closed <= 0 else "partial"
+            self._refresh_external_trade_pnl(current)
+            self._add_external_fill_allocation(
+                session, trade=current, fill=fill, role="ENTRY", qty=fill.qty, fee=fill.fee
+            )
+            return [current.id]
+
+        close_qty = min(open_qty, fill.qty)
+        close_ratio = close_qty / fill.qty if fill.qty > 0 else 0.0
+        close_fee = fill.fee * close_ratio
+        close_pnl = fill.realized_pnl * close_ratio
+        prior_closed = float(current.qty_closed or 0)
+        current.exit_price = (
+            ((float(current.exit_price or 0) * prior_closed) + (fill.price * close_qty))
+            / (prior_closed + close_qty)
+            if prior_closed + close_qty > 0 else fill.price
+        )
+        current.qty_closed = min(float(current.qty_opened or 0), prior_closed + close_qty)
+        current.exit_notional += abs(close_qty * fill.price)
+        current.exit_fee += close_fee
+        current.realized_pnl += close_pnl
+        current.gross_realized_pnl = current.realized_pnl
+        current.exit_liquidity = fill.liquidity or current.exit_liquidity
+        current.exit_reason = "EXTERNAL"
+        remaining = max(float(current.qty_opened or 0) - current.qty_closed, 0.0)
+        if remaining <= max(float(current.qty_opened or 0) * 1e-9, 1e-12):
+            current.status = "closed"
+            current.closed_at_ms = fill.ts_ms
+            current.closed_at = fill.created_at
+        else:
+            current.status = "partial"
+        self._refresh_external_trade_pnl(current)
+        self._add_external_fill_allocation(
+            session,
+            trade=current,
+            fill=fill,
+            role="EXIT",
+            qty=close_qty,
+            fee=close_fee,
+            realized_pnl=close_pnl,
+        )
+        ids = [current.id]
+
+        reversal_qty = max(fill.qty - close_qty, 0.0)
+        if reversal_qty > max(fill.qty * 1e-9, 1e-12):
+            reversal_fee = max(fill.fee - close_fee, 0.0)
+            reversal = self._new_external_trade(
+                fill,
+                direction=direction,
+                qty=reversal_qty,
+                leverage=leverage,
+                fee=reversal_fee,
+                role_reason="external reversal remainder",
+            )
+            session.add(reversal)
+            await session.flush()
+            self._add_external_fill_allocation(
+                session,
+                trade=reversal,
+                fill=fill,
+                role="REVERSAL_ENTRY",
+                qty=reversal_qty,
+                fee=reversal_fee,
+            )
+            ids.append(reversal.id)
+        return ids
+
+    @staticmethod
+    def _new_external_trade(
+        fill: ExchangeFillRow,
+        *,
+        direction: str,
+        qty: float,
+        leverage: int,
+        fee: float | None = None,
+        role_reason: str = "",
+    ) -> ExternalTradeRow:
+        entry_fee = fill.fee if fee is None else fee
+        notional = abs(qty * fill.price)
+        return ExternalTradeRow(
+            ts_ms=fill.ts_ms,
+            created_at=fill.created_at,
+            symbol=fill.symbol,
+            direction=direction,
+            status="open",
+            opened_at_ms=fill.ts_ms,
+            opened_at=fill.created_at,
+            entry_price=fill.price,
+            qty_opened=qty,
+            leverage=leverage,
+            entry_notional=notional,
+            entry_margin=_margin(notional, leverage),
+            entry_fee=entry_fee,
+            total_fee=entry_fee,
+            net_realized_pnl=-entry_fee,
+            entry_liquidity=fill.liquidity,
+            source="binance_external",
+            confidence="exact",
+            classification_reason=(role_reason or fill.classification_reason)[:240],
+        )
+
+    @staticmethod
+    def _add_external_fill_allocation(
+        session: AsyncSession,
+        *,
+        trade: ExternalTradeRow,
+        fill: ExchangeFillRow,
+        role: str,
+        qty: float,
+        fee: float,
+        realized_pnl: float = 0.0,
+    ) -> None:
+        session.add(
+            ExternalTradeFillRow(
+                external_trade_id=trade.id,
+                exchange_fill_id=fill.id,
+                role=role,
+                qty=qty,
+                price=fill.price,
+                fee=fee,
+                realized_pnl=realized_pnl,
+            )
+        )
+
+    @staticmethod
+    def _refresh_external_trade_pnl(trade: ExternalTradeRow) -> None:
+        trade.gross_realized_pnl = trade.realized_pnl
+        trade.total_fee = trade.entry_fee + trade.exit_fee
+        trade.net_realized_pnl = trade.gross_realized_pnl - trade.total_fee
+        margin = trade.entry_margin or _margin(trade.entry_notional, trade.leverage)
+        trade.pnl_pct_on_margin = _pnl_pct(trade.realized_pnl, margin)
+        trade.net_pnl_pct_on_margin = _pnl_pct(trade.net_realized_pnl, margin)
 
     # ---------- 决策日志 ----------
     async def log_decision(

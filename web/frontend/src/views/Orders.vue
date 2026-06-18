@@ -25,6 +25,7 @@ import {
 const tab = ref('trades')
 const trades = ref([])
 const tradeTotal = ref(0)
+const fillAudit = ref({ external: 0, mixed: 0, unknown: 0 })
 const orders = ref([])
 const rejects = ref([])
 const rawLoaded = ref(false)
@@ -44,6 +45,7 @@ const filters = ref({
   directions: [],
   statuses: [],
   exitReasons: [],
+  sources: [],
   range: [],
 })
 const page = ref({
@@ -68,6 +70,11 @@ const exitReasonOptions = [
   { label: '保护平仓', value: 'EMERGENCY' },
   { label: '熔断平仓', value: 'CIRCUIT' },
   { label: '未知退出', value: 'UNKNOWN' },
+  { label: '外部平仓', value: 'EXTERNAL' },
+]
+const sourceOptions = [
+  { label: 'Engine 策略交易', value: 'strategy' },
+  { label: 'Binance 外部/手工交易', value: 'external' },
 ]
 const symbolOptions = computed(() => cfg.value?.symbols || [])
 const currentPage = computed(() => Math.floor(page.value.offset / page.value.limit) + 1)
@@ -104,6 +111,7 @@ function queryParams() {
     direction: filters.value.directions,
     status: filters.value.statuses,
     exit_reason: filters.value.exitReasons,
+    source: filters.value.sources,
     start_ts_ms: utc8InputToMs(start),
     end_ts_ms: utc8InputToMs(end),
     limit: page.value.limit,
@@ -133,6 +141,7 @@ async function loadTrades(options = {}) {
     if (seq !== tradeRequestSeq) return
     trades.value = res.items || []
     tradeTotal.value = Number(res.total || 0)
+    fillAudit.value = res.fill_audit || { external: 0, mixed: 0, unknown: 0 }
   } catch (e) {
     if (!isAbortError(e) && seq === tradeRequestSeq && !silent) {
       ElMessage.error(e.message)
@@ -194,7 +203,9 @@ function search() {
 }
 
 function resetFilters() {
-  filters.value = { symbols: [], directions: [], statuses: [], exitReasons: [], range: [] }
+  filters.value = {
+    symbols: [], directions: [], statuses: [], exitReasons: [], sources: [], range: [],
+  }
   search()
 }
 
@@ -238,7 +249,25 @@ onUnmounted(() => {
       </template>
 
       <template v-if="tab === 'trades'">
+        <el-alert
+          v-if="fillAudit.mixed || fillAudit.unknown"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom:12px"
+          :title="`检测到 ${fillAudit.mixed || 0} 笔混合归属成交、${fillAudit.unknown || 0} 笔待确认成交；这些成交仅保留审计账本，不会并入策略或外部交易汇总。`"
+        />
         <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px">
+          <el-select
+            v-model="filters.sources"
+            multiple
+            clearable
+            placeholder="交易来源"
+            style="width:230px"
+            @change="search"
+          >
+            <el-option v-for="item in sourceOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
           <el-select
             v-model="filters.symbols"
             multiple
@@ -296,7 +325,7 @@ onUnmounted(() => {
           <el-button :icon="'RefreshLeft'" @click="resetFilters">重置</el-button>
         </div>
 
-        <el-table :data="trades" stripe height="calc(100vh - 315px)" v-loading="loading" row-key="id">
+        <el-table :data="trades" stripe height="calc(100vh - 315px)" v-loading="loading" row-key="record_key">
           <el-table-column type="expand" width="42">
             <template #default="{ row }">
               <el-table :data="row.orders || []" size="small" stripe>
@@ -351,6 +380,20 @@ onUnmounted(() => {
             <template #default="{ row }">{{ localTime(row.opened_at_ms, row.opened_at) }}</template>
           </el-table-column>
           <el-table-column prop="symbol" label="币种" width="100" />
+          <el-table-column label="来源" width="185">
+            <template #default="{ row }">
+              <el-tooltip
+                :content="row.record_type === 'external'
+                  ? '该记录来自 Binance 外部成交，仅同步归档，Engine 未接管止盈止损或主动平仓。'
+                  : '该记录由 Engine 策略创建并管理。'"
+                placement="top"
+              >
+                <el-tag :type="row.record_type === 'external' ? 'warning' : 'primary'" size="small">
+                  {{ row.source_label }}
+                </el-tag>
+              </el-tooltip>
+            </template>
+          </el-table-column>
           <el-table-column label="方向" width="85">
             <template #default="{ row }">
               <el-tag :type="tradeDirectionTag(row.direction)" size="small">
@@ -370,7 +413,7 @@ onUnmounted(() => {
           </el-table-column>
           <el-table-column label="开/平价" width="150">
             <template #default="{ row }">
-              <span class="mono">{{ fmt(row.entry_price, 4) }} / {{ row.exit_price ? fmt(row.exit_price, 4) : '—' }}</span>
+              <span class="mono">{{ row.entry_price ? fmt(row.entry_price, 4) : '—' }} / {{ row.exit_price ? fmt(row.exit_price, 4) : '—' }}</span>
             </template>
           </el-table-column>
           <el-table-column label="杠杆" width="75">
@@ -398,7 +441,7 @@ onUnmounted(() => {
           <el-table-column label="保证金收益率" width="125">
             <template #default="{ row }">
               <span class="mono" :class="pnlClass(row.pnl_pct_on_margin)">
-                {{ row.status !== 'open' ? fmt(row.pnl_pct_on_margin) + '%' : '—' }}
+                {{ row.status !== 'open' && row.entry_margin ? fmt(row.pnl_pct_on_margin) + '%' : '—' }}
               </span>
             </template>
           </el-table-column>

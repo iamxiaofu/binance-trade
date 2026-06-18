@@ -453,6 +453,40 @@ def test_search_trades_filters_direction_and_status(db):
     assert empty["total"] == 0
 
 
+async def test_search_trades_combines_external_records_without_changing_strategy_rows(db):
+    s = Store(db)
+    await s.connect()
+    await s.ingest_exchange_fill({
+        "symbol": "ETHUSDT",
+        "exchange_trade_id": "external-1",
+        "exchange_order_id": "manual-order-1",
+        "client_order_id": "web_manual_1",
+        "side": "buy",
+        "qty": 0.5,
+        "price": 2000.0,
+        "ts_ms": 9_999_999_999_999,
+        "fee": 0.2,
+        "fee_asset": "USDT",
+        "liquidity": "taker",
+        "source": "rest",
+    })
+    await s.close()
+
+    combined = status.search_trades(db, status.TradeFilters())
+    assert combined["total"] == 2
+    assert {row["record_type"] for row in combined["items"]} == {"strategy", "external"}
+    external = next(row for row in combined["items"] if row["record_type"] == "external")
+    assert external["source_label"] == "Binance 外部/手工交易"
+    assert external["record_key"].startswith("external:")
+    assert external["orders"][0]["client_kind"] == "OPEN"
+
+    strategy_only = status.search_trades(
+        db, status.TradeFilters(sources=["strategy"])
+    )
+    assert strategy_only["total"] == 1
+    assert strategy_only["items"][0]["record_type"] == "strategy"
+
+
 async def test_missing_table_degrades_to_empty(tmp_path):
     # 全新空库（无表）→ 查询不应抛错，返回空
     empty = str(tmp_path / "empty.db")

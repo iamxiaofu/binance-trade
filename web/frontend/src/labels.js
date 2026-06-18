@@ -194,6 +194,7 @@ export function exitReasonLabel(reason) {
     EMERGENCY: '保护平仓',
     CIRCUIT: '熔断平仓',
     UNKNOWN: '未知退出',
+    EXTERNAL: '外部平仓',
   }[reason] || reason || '—'
 }
 

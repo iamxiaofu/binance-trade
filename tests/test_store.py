@@ -17,6 +17,9 @@ from src.exchange.filters import SymbolFilters
 from src.store.models import (
     BalanceSnapshotRow,
     DecisionRow,
+    ExchangeFillRow,
+    ExternalTradeFillRow,
+    ExternalTradeRow,
     OpenOrderRow,
     OrderRow,
     PositionClaimRow,
@@ -64,6 +67,155 @@ async def test_connect_creates_read_query_indexes(store):
     assert "ix_trades_symbol_opened_id" in trade_names
     assert "ix_trades_status_opened_id" in trade_names
     assert "ix_orders_trade_ts_id" in order_names
+
+
+def _fill(
+    trade_id: str,
+    *,
+    side: str,
+    qty: float,
+    price: float,
+    ts_ms: int,
+    client_order_id: str = "manual-order",
+    realized_pnl: float = 0.0,
+    fee: float = 0.01,
+) -> dict:
+    return {
+        "symbol": "BTCUSDT",
+        "exchange_trade_id": trade_id,
+        "exchange_order_id": f"order-{trade_id}",
+        "client_order_id": client_order_id,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "ts_ms": ts_ms,
+        "realized_pnl": realized_pnl,
+        "fee": fee,
+        "fee_asset": "USDT",
+        "liquidity": "taker",
+        "source": "stream",
+    }
+
+
+async def test_engine_fill_is_ledgered_without_external_trade(store):
+    result = await store.ingest_exchange_fill(
+        _fill("1", side="buy", qty=0.1, price=100.0, ts_ms=1_000, client_order_id="bt-entry")
+    )
+    assert result["ownership"] == "engine"
+    assert await _count(store, ExchangeFillRow) == 1
+    assert await _count(store, ExternalTradeRow) == 0
+
+
+async def test_external_fill_lifecycle_and_duplicate_are_isolated(store):
+    opened = await store.ingest_exchange_fill(
+        _fill("10", side="buy", qty=2.0, price=100.0, ts_ms=10_000)
+    )
+    assert opened["ownership"] == "external"
+    duplicate = await store.ingest_exchange_fill(
+        _fill("10", side="buy", qty=2.0, price=100.0, ts_ms=10_000)
+    )
+    assert duplicate["inserted"] is False
+
+    await store.ingest_exchange_fill(
+        _fill("11", side="sell", qty=0.5, price=110.0, ts_ms=11_000, realized_pnl=5.0)
+    )
+    await store.ingest_exchange_fill(
+        _fill("12", side="sell", qty=1.5, price=90.0, ts_ms=12_000, realized_pnl=-15.0)
+    )
+
+    async with store._sessionmaker() as session:
+        trade = (
+            await session.execute(select(ExternalTradeRow).order_by(ExternalTradeRow.id))
+        ).scalar_one()
+    assert trade.status == "closed"
+    assert trade.qty_opened == pytest.approx(2.0)
+    assert trade.qty_closed == pytest.approx(2.0)
+    assert trade.exit_price == pytest.approx(95.0)
+    assert trade.realized_pnl == pytest.approx(-10.0)
+    assert trade.source == "binance_external"
+    assert await _count(store, ExchangeFillRow) == 3
+    assert await _count(store, ExternalTradeFillRow) == 3
+    assert await _count(store, TradeRow) == 0
+    assert await _count(store, OrderRow) == 0
+
+
+async def test_external_reversal_splits_fill_between_two_lifecycles(store):
+    await store.ingest_exchange_fill(
+        _fill("20", side="buy", qty=1.0, price=100.0, ts_ms=20_000)
+    )
+    await store.ingest_exchange_fill(
+        _fill("21", side="sell", qty=1.5, price=105.0, ts_ms=21_000, realized_pnl=5.0)
+    )
+    async with store._sessionmaker() as session:
+        trades = (
+            await session.execute(select(ExternalTradeRow).order_by(ExternalTradeRow.id))
+        ).scalars().all()
+    assert len(trades) == 2
+    assert trades[0].direction == "long"
+    assert trades[0].status == "closed"
+    assert trades[1].direction == "short"
+    assert trades[1].status == "open"
+    assert trades[1].qty_opened == pytest.approx(0.5)
+
+
+async def test_external_fill_before_sync_window_is_archived_as_carry_in(store):
+    await store.ingest_exchange_fill({
+        **_fill("25", side="sell", qty=0.4, price=105.0, ts_ms=25_000, realized_pnl=2.0),
+        "reduce_only": True,
+    })
+    async with store._sessionmaker() as session:
+        trade = (
+            await session.execute(select(ExternalTradeRow).order_by(ExternalTradeRow.id))
+        ).scalar_one()
+    assert trade.status == "closed"
+    assert trade.direction == "long"
+    assert trade.entry_price == 0
+    assert trade.confidence == "carry_in"
+    assert trade.realized_pnl == pytest.approx(2.0)
+    assert trade.pnl_pct_on_margin == 0
+
+
+async def test_unknown_fill_is_reclassified_after_position_claim_finishes(store):
+    claim_id = await store.begin_position_claim(
+        symbol="BTCUSDT", side="long", planned_qty=1.0, ttl_ms=60_000
+    )
+    fill = _fill(
+        "26",
+        side="buy",
+        qty=0.2,
+        price=100.0,
+        ts_ms=int(time.time() * 1000),
+        client_order_id="manual-during-claim",
+    )
+    result = await store.ingest_exchange_fill(fill)
+    assert result["ownership"] == "unknown"
+    assert await _count(store, ExternalTradeRow) == 0
+
+    await store.finish_position_claim(claim_id, status="canceled")
+    assert await store.resolve_unknown_exchange_fills() == 1
+    async with store._sessionmaker() as session:
+        ledger = (
+            await session.execute(
+                select(ExchangeFillRow).where(ExchangeFillRow.exchange_trade_id == "26")
+            )
+        ).scalar_one()
+    assert ledger.ownership == "external"
+    assert await _count(store, ExternalTradeRow) == 1
+
+
+async def test_external_fill_during_strategy_trade_is_mixed_only(store):
+    await store.log_order({
+        "symbol": "BTCUSDT", "kind": "OPEN", "side": "buy",
+        "order_type": "market", "qty": 1.0, "price": 100.0,
+        "notional": 100.0, "status": "filled", "id": "engine-open",
+        "client_order_id": "bt-engine-open", "raw": {},
+    })
+    result = await store.ingest_exchange_fill(
+        _fill("30", side="sell", qty=0.25, price=101.0, ts_ms=int(time.time() * 1000))
+    )
+    assert result["ownership"] == "mixed"
+    assert await _count(store, ExternalTradeRow) == 0
+    assert await _count(store, TradeRow) == 1
 
 
 async def test_connect_upgrades_position_projection_columns(tmp_path):
