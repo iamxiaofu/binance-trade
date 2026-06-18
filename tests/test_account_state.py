@@ -106,3 +106,36 @@ async def test_order_update_marks_strategy_wake_event(tmp_path):
     finally:
         await coordinator.close()
         await store.close()
+
+
+async def test_algo_update_projects_tp_trigger_price(tmp_path):
+    store, runtime, coordinator = await _coordinator(tmp_path)
+    try:
+        now = int(time.time() * 1000)
+        await coordinator.submit(ExchangeEvent(
+            event_type="ALGO_UPDATE",
+            transaction_time_ms=now,
+            payload={"o": {
+                "aid": 2000001144654254,
+                "caid": "ios-example",
+                "s": "SOLUSDT",
+                "S": "SELL",
+                "o": "TAKE_PROFIT_MARKET",
+                "q": "4.51",
+                "p": "0",
+                "tp": "72.23",
+                "X": "NEW",
+                "R": True,
+            }},
+            event_key="algo-tp-trigger",
+        ))
+        await coordinator.drain()
+        order = runtime.open_orders["SOLUSDT"][0]
+        assert order["status"] == "placed"
+        assert order["price"] == 0
+        assert order["trigger_price"] == 72.23
+        live = await store.live_account_state()
+        assert live["open_orders"][0]["trigger_price"] == 72.23
+    finally:
+        await coordinator.close()
+        await store.close()

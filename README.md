@@ -88,6 +88,7 @@ sudo journalctl -u binance-trade@testnet -f
 
 完整步骤（NTP、防火墙、testnet→mainnet 切换）见 **[docs/DEPLOY.md](docs/DEPLOY.md)**；
 日常运维（启停、紧急熔断、看日志、复盘决策、故障排查）见 **[docs/RUNBOOK.md](docs/RUNBOOK.md)**。
+整体技术架构、模块边界和贡献流程见 **[contributing.md](contributing.md)**。
 
 ## 测试
 

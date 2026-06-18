@@ -285,7 +285,7 @@ class AccountStateCoordinator:
             "orderType": raw.get("o") or raw.get("orderType"),
             "quantity": raw.get("q") or raw.get("quantity"),
             "price": raw.get("p") or raw.get("price"),
-            "triggerPrice": raw.get("sp") or raw.get("triggerPrice"),
+            "triggerPrice": raw.get("sp") or raw.get("triggerPrice") or raw.get("tp"),
             "algoStatus": raw.get("X") or raw.get("algoStatus"),
             "reduceOnly": raw.get("R") if raw.get("R") is not None else raw.get("reduceOnly"),
             "updateTime": event.transaction_time_ms,

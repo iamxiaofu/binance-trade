@@ -47,6 +47,27 @@ def test_normalize_condition_order_status_and_kind():
     assert order["trigger_price"] == pytest.approx(90.0)
 
 
+def test_normalize_condition_order_reads_algo_update_tp_trigger_price():
+    order = normalize_condition_order({
+        "info": {
+            "algoId": 2000001144654254,
+            "clientAlgoId": "ios-example",
+            "symbol": "SOLUSDT",
+            "side": "SELL",
+            "orderType": "TAKE_PROFIT_MARKET",
+            "quantity": "4.51",
+            "price": "0",
+            "tp": "72.23",
+            "algoStatus": "NEW",
+            "reduceOnly": True,
+        },
+    })
+    assert order["kind"] == "TP"
+    assert order["status"] == "placed"
+    assert order["price"] == 0
+    assert order["trigger_price"] == pytest.approx(72.23)
+
+
 def test_normalize_position_isolated_derives_leverage_when_null():
     """B6：ISOLATED 模式交易所不返回 leverage，从 notional/initial_margin 反推。"""
     pos = normalize_position({

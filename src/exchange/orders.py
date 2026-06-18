@@ -63,7 +63,9 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
     info = o.get("info") if isinstance(o.get("info"), Mapping) else {}
     order_type = str(_value(o, info, "orderType", "type") or "").upper()
     qty = abs(_float(_value(o, info, "amount", "quantity", "origQty")))
-    trigger = _float(_value(o, info, "triggerPrice", "stopPrice"))
+    # Binance ALGO_UPDATE uses ``tp`` for the condition trigger price, while
+    # REST/ccxt responses normally expose ``triggerPrice`` or ``stopPrice``.
+    trigger = _float(_value(o, info, "triggerPrice", "stopPrice", "tp"))
     price = _float(_value(o, info, "price"))
     filled_qty = abs(_float(_value(o, info, "filled", "filledQty", "executedQty", "actualQty")))
     filled_price = _float(_value(o, info, "average", "avgPrice", "actualPrice"))
