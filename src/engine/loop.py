@@ -30,7 +30,7 @@ from src.exchange.market_data import MarketData
 from src.exchange.orders import normalize_condition_order
 from src.exchange.positions import normalize_position, normalize_symbol
 from src.exchange.user_stream import BinanceUserDataStream
-from src.execution.executor import Executor, realized_pnl
+from src.execution.executor import Executor, ProtectionOrderSpec, realized_pnl
 from src.execution.settings import (
     RUNTIME_EXECUTION_KEY,
     RUNTIME_EXECUTION_VERSION_KEY,
@@ -52,7 +52,13 @@ from src.engine.settings import (
 )
 from src.features.builder import build_context, build_position_snapshot
 from src.llm.client import LLMClient
-from src.llm.schema import Action, MarketContext, PositionSnapshot, TradeDecision
+from src.llm.schema import (
+    Action,
+    MarketContext,
+    PositionSnapshot,
+    ProtectionOrderSnapshot,
+    TradeDecision,
+)
 from src.notify.telegram import Event, Notifier
 from src.risk.manager import RejectCode, RiskContext, Verdict, validate
 from src.risk.settings import (
@@ -132,6 +138,7 @@ class TradingEngine:
         self._recent_explicit_closes: dict[str, float] = {}
         self._close_confirmations: dict[str, CloseConfirmationState] = {}
         self._last_sltp_adjust: dict[str, SltpAdjustState] = {}
+        self._last_protection_alerts: dict[str, tuple[str, ...]] = {}
         self._reconcile_task: asyncio.Task | None = None
         self._cycle_leader_snapshot: FeatureSnapshot | None = None
         self._risk_defaults = settings.risk.model_copy(deep=True)
@@ -1499,6 +1506,11 @@ class TradingEngine:
 
         close_side = "sell" if side == "long" else "buy"
         active_orders = await self._active_protection_orders(symbol)
+        replace_external = bool(payload.get("replace_external"))
+        takeover_old_orders = [
+            order for order in active_orders
+            if str(order.get("origin") or "EXTERNAL") != "ENGINE"
+        ] if replace_external else []
         await self._sync_condition_history(symbol, active_orders)
         stale = self._stale_protection_orders(
             active_orders,
@@ -1521,7 +1533,7 @@ class TradingEngine:
             active_orders = await self._active_protection_orders(symbol)
 
         equity = await self._current_equity()
-        specs: list[tuple[str, str, float]] = []
+        specs: list[ProtectionOrderSpec] = []
         skipped: list[str] = []
         errors: list[str] = []
         triggers = self._manual_protection_triggers(payload, side=side, entry=entry, mark=mark)
@@ -1532,12 +1544,68 @@ class TradingEngine:
             raise ValueError(f"{symbol}: 当前缺少止损，接管保护必须提供新的 SL trigger")
 
         filters = self._client.filters(symbol)
-        for kind in ("SL", "TP"):
-            trigger = float(triggers.get(kind) or 0.0)
+        requested = [
+            ProtectionOrderSpec(
+                kind="SL",
+                order_type="STOP_MARKET",
+                trigger_price=float(triggers.get("SL") or 0.0),
+                qty=target_qty,
+                leg_id="SL",
+            )
+        ]
+        tp_targets = payload.get("take_profit_targets")
+        if isinstance(tp_targets, list) and tp_targets:
+            if len(tp_targets) > 3:
+                errors.append("分批止盈最多支持 3 档")
+            for index, target in enumerate(tp_targets[:3], start=1):
+                if not isinstance(target, dict):
+                    errors.append(f"TP{index}: 格式必须是对象")
+                    continue
+                position_pct = float(target.get("position_pct") or 0.0)
+                leg_qty = float(target.get("qty") or 0.0)
+                if leg_qty <= 0 and position_pct > 0:
+                    leg_qty = target_qty * position_pct
+                if position_pct > 1:
+                    errors.append(f"TP{index}: position_pct 不能超过 1")
+                    continue
+                if leg_qty <= 0:
+                    errors.append(f"TP{index}: 必须提供 qty 或 position_pct")
+                    continue
+                requested.append(ProtectionOrderSpec(
+                    kind="TP",
+                    order_type="TAKE_PROFIT_MARKET",
+                    trigger_price=float(
+                        target.get("trigger_price") or target.get("price") or 0.0
+                    ),
+                    qty=leg_qty,
+                    leg_id=str(target.get("leg_id") or f"TP{index}"),
+                    position_pct=position_pct if position_pct > 0 else None,
+                ))
+        else:
+            requested.append(ProtectionOrderSpec(
+                kind="TP",
+                order_type="TAKE_PROFIT_MARKET",
+                trigger_price=float(triggers.get("TP") or 0.0),
+                qty=target_qty,
+                leg_id="TP1",
+                position_pct=1.0,
+            ))
+
+        tp_requested_qty = sum(
+            float(spec.qty or 0.0) for spec in requested if spec.kind == "TP"
+        )
+        if tp_requested_qty - target_qty > qty_tol:
+            errors.append(
+                f"TP 分批数量合计 {tp_requested_qty:g} 超过接管数量 {target_qty:g}"
+            )
+
+        for spec in requested:
+            kind = spec.kind
+            trigger = float(spec.trigger_price or 0.0)
             if trigger <= 0:
                 continue
             trigger = float(round_price(trigger, filters))
-            if self._has_active_protection(
+            if not replace_external and self._has_active_protection(
                 active_orders,
                 kind=kind,
                 close_side=close_side,
@@ -1548,6 +1616,7 @@ class TradingEngine:
             ):
                 skipped.append(f"{kind}: 已有有效条件单")
                 continue
+            spec_qty = float(spec.qty or target_qty)
             reason = self._validate_repair_trigger(
                 symbol=symbol,
                 side=side,
@@ -1555,18 +1624,26 @@ class TradingEngine:
                 trigger=trigger,
                 entry=entry,
                 mark=mark,
-                qty=target_qty,
+                qty=spec_qty,
                 equity=equity,
                 leverage=int(position.get("leverage") or 0),
             )
             if reason:
-                errors.append(f"{kind}@{trigger:.2f}: {reason}")
+                errors.append(f"{spec.leg_id or kind}@{trigger:.2f}: {reason}")
                 continue
-            if normalize_order(qty=target_qty, price=trigger, f=filters, is_market=True) is None:
-                errors.append(f"{kind}@{trigger:.2f}: 数量/名义价值低于交易所最小限制")
+            if normalize_order(qty=spec_qty, price=trigger, f=filters, is_market=True) is None:
+                errors.append(
+                    f"{spec.leg_id or kind}@{trigger:.2f}: 数量/名义价值低于交易所最小限制"
+                )
                 continue
-            otype = "STOP_MARKET" if kind == "SL" else "TAKE_PROFIT_MARKET"
-            specs.append((kind, otype, trigger))
+            specs.append(ProtectionOrderSpec(
+                kind=kind,
+                order_type=spec.order_type,
+                trigger_price=trigger,
+                qty=spec_qty,
+                leg_id=spec.leg_id,
+                position_pct=spec.position_pct,
+            ))
 
         if errors:
             raise ValueError(f"{symbol}: 接管保护参数无效；" + "；".join(errors))
@@ -1614,7 +1691,26 @@ class TradingEngine:
         self.runtime.mark_order_event(symbol)
         if not placed:
             raise ValueError(f"{symbol}: 接管保护下发失败；" + "；".join(failed))
+        if replace_external:
+            sl_requested = any(spec.kind == "SL" for spec in specs)
+            sl_placed = any(
+                order.get("kind") == "SL" and order.get("status") == "placed"
+                for order in results
+            )
+            if sl_requested and not sl_placed:
+                raise ValueError(f"{symbol}: 新止损未成功挂出，保留原外部保护单")
+            remaining = await self._cancel_stale_condition_orders(
+                symbol=symbol,
+                orders=takeover_old_orders,
+                reason="explicit_protection_takeover",
+            )
+            if remaining:
+                details = ", ".join(self._condition_order_label(order) for order in remaining)
+                await self._disable_symbol_due_stale_conditions(symbol, details)
+                raise ValueError(f"{symbol}: 新保护已挂出，但旧外部条件单未完全撤销: {details}")
         parts = [f"{symbol}: 已接管保护 {', '.join(placed)}"]
+        if replace_external and takeover_old_orders:
+            parts.append(f"已替换 {len(takeover_old_orders)} 个外部条件单")
         if skipped:
             parts.append("跳过: " + "；".join(skipped))
         if failed:
@@ -1947,18 +2043,42 @@ class TradingEngine:
         self,
         decision: TradeDecision,
         entry_price: float,
-    ) -> list[tuple[str, str, float]]:
+        qty: float | None = None,
+    ) -> list[ProtectionOrderSpec]:
         """复用 executor 的触发价规则，提前做本地最小量校验。"""
         symbol = decision.symbol
         is_long = decision.action == Action.OPEN_LONG
         filters = self._client.filters(symbol)
-        specs: list[tuple[str, str, float]] = []
+        specs: list[ProtectionOrderSpec] = []
         if decision.stop_loss_pct > 0:
             raw = entry_price * (1 - decision.stop_loss_pct) if is_long else entry_price * (1 + decision.stop_loss_pct)
-            specs.append(("SL", "STOP_MARKET", float(round_price(raw, filters))))
-        if decision.take_profit_pct > 0:
-            raw = entry_price * (1 + decision.take_profit_pct) if is_long else entry_price * (1 - decision.take_profit_pct)
-            specs.append(("TP", "TAKE_PROFIT_MARKET", float(round_price(raw, filters))))
+            specs.append(ProtectionOrderSpec(
+                "SL", "STOP_MARKET", float(round_price(raw, filters)),
+                qty=qty, leg_id="SL",
+            ))
+        allocated_qty = 0.0
+        targets = decision.effective_take_profit_targets
+        for index, target in enumerate(targets, start=1):
+            target_qty = None
+            if qty is not None:
+                is_last = index == len(targets)
+                if is_last and sum(item.position_pct for item in targets) >= 1.0 - 1e-9:
+                    target_qty = max(0.0, qty - allocated_qty)
+                else:
+                    from src.exchange.filters import round_qty
+                    target_qty = float(round_qty(qty * target.position_pct, filters))
+                allocated_qty += target_qty
+            raw = (
+                entry_price * (1 + target.price_distance_pct)
+                if is_long
+                else entry_price * (1 - target.price_distance_pct)
+            )
+            specs.append(ProtectionOrderSpec(
+                "TP", "TAKE_PROFIT_MARKET", float(round_price(raw, filters)),
+                qty=target_qty,
+                leg_id=target.leg_id or f"TP{index}",
+                position_pct=target.position_pct,
+            ))
         return specs
 
     def _protection_specs_reject_reason(
@@ -1966,15 +2086,21 @@ class TradingEngine:
         *,
         symbol: str,
         qty: float,
-        specs: list[tuple[str, str, float]],
+        specs: list[ProtectionOrderSpec | tuple[str, str, float]],
     ) -> str:
         if not specs:
             return ""
         filters = self._client.filters(symbol)
-        for kind, _otype, trigger in specs:
-            norm = normalize_order(qty=qty, price=trigger, f=filters, is_market=True)
+        for spec in specs:
+            if isinstance(spec, tuple):
+                kind, _otype, trigger = spec
+                spec_qty = qty
+            else:
+                kind, trigger = spec.kind, spec.trigger_price
+                spec_qty = float(spec.qty if spec.qty is not None else qty)
+            norm = normalize_order(qty=spec_qty, price=trigger, f=filters, is_market=True)
             if norm is None:
-                return f"{kind} qty={qty:g} trigger={trigger:g} below minQty/minNotional"
+                return f"{kind} qty={spec_qty:g} trigger={trigger:g} below minQty/minNotional"
         return ""
 
     async def _handle_unprotected_open_failure(
@@ -2303,6 +2429,9 @@ class TradingEngine:
     ) -> list[tuple[dict, str]]:
         stale: list[tuple[dict, str]] = []
         for order in orders:
+            # 外部/手工条件单由系统观察和告警，但绝不自动撤销。
+            if str(order.get("origin") or "EXTERNAL") != "ENGINE":
+                continue
             kind = str(order.get("kind") or "")
             reason = self._protection_mismatch_reason(
                 order,
@@ -2316,6 +2445,55 @@ class TradingEngine:
             if reason:
                 stale.append((order, reason))
         return stale
+
+    @staticmethod
+    def _protection_collection_alerts(
+        orders: list[dict],
+        *,
+        qty: float,
+    ) -> list[str]:
+        qty_tol = max(abs(qty) * 1e-6, 1e-12)
+        sl_orders = [order for order in orders if order.get("kind") == "SL"]
+        tp_orders = [order for order in orders if order.get("kind") == "TP"]
+        tp_qty = sum(
+            qty if order.get("close_position") else max(0.0, float(order.get("qty") or 0.0))
+            for order in tp_orders
+        )
+        alerts: list[str] = []
+        if len(sl_orders) > 1:
+            alerts.append(f"MULTIPLE_SL:{len(sl_orders)}")
+        if tp_qty - qty > qty_tol:
+            alerts.append(f"TP_OVER_COVERED:{tp_qty:g}>{qty:g}")
+        elif tp_orders and qty - tp_qty > qty_tol:
+            alerts.append(f"TP_PARTIAL_COVERAGE:{tp_qty:g}<{qty:g}")
+        origins = {str(order.get("origin") or "EXTERNAL") for order in orders}
+        if len(origins) > 1:
+            alerts.append("MIXED_AUTHORITY")
+        return alerts
+
+    async def _report_protection_collection_alerts(
+        self,
+        symbol: str,
+        orders: list[dict],
+        *,
+        qty: float,
+    ) -> None:
+        alerts = tuple(self._protection_collection_alerts(orders, qty=qty))
+        previous = self._last_protection_alerts.get(symbol, ())
+        if alerts == previous:
+            return
+        if not alerts:
+            self._last_protection_alerts.pop(symbol, None)
+            return
+        self._last_protection_alerts[symbol] = alerts
+        message = f"{symbol} protection collection alert: {', '.join(alerts)}"
+        logger.warning(message)
+        await self._store.log_audit(
+            symbol=symbol,
+            action="PROTECTION_ALERT",
+            reason=message,
+        )
+        await self._notifier.send(Event.ERROR, message)
 
     @staticmethod
     def _safe_float(value: object) -> float:
@@ -2372,15 +2550,21 @@ class TradingEngine:
             return "kind mismatch"
         if order.get("status") != "placed":
             return "not placed"
-        if not order.get("reduce_only"):
+        if not order.get("reduce_only") and not order.get("close_position"):
             return "not reduceOnly"
         side = (order.get("side") or "").lower()
         if side and side != close_side:
             return f"side {side} != close side {close_side}"
         order_qty = float(order.get("qty") or 0.0)
         qty_tol = max(abs(qty) * 1e-6, 1e-12)
-        if order_qty <= 0 or abs(order_qty - qty) > qty_tol:
-            return f"qty {order_qty:g} != position qty {qty:g}"
+        if order.get("close_position"):
+            if kind not in ("SL", "TP"):
+                return "closePosition unsupported kind"
+        elif kind == "SL":
+            if order_qty <= 0 or abs(order_qty - qty) > qty_tol:
+                return f"SL qty {order_qty:g} != position qty {qty:g}"
+        elif order_qty <= 0 or order_qty - qty > qty_tol:
+            return f"TP qty {order_qty:g} exceeds position qty {qty:g}"
         trigger = float(order.get("trigger_price") or 0.0)
         if trigger <= 0 or entry <= 0:
             return "invalid trigger/entry"
@@ -2626,11 +2810,47 @@ class TradingEngine:
             await self._enrich_position_timing(symbol, position)
             try:
                 active_orders = await self._active_protection_orders(symbol)
-                for order in active_orders:
+                origins: set[str] = set()
+                tp_covered_qty = 0.0
+                for index, order in enumerate(active_orders, start=1):
+                    origin = str(order.get("origin") or "EXTERNAL")
+                    origins.add(origin)
+                    snapshot = ProtectionOrderSnapshot(
+                        kind=str(order.get("kind") or ""),
+                        trigger_price=float(order.get("trigger_price") or 0.0),
+                        qty=float(order.get("qty") or 0.0),
+                        close_position=bool(order.get("close_position")),
+                        origin=origin,
+                        leg_id=str(order.get("leg_id") or ""),
+                    )
                     if order["kind"] == "SL" and order.get("trigger_price"):
                         position.sl_price = float(order["trigger_price"])
+                        position.sl_orders.append(snapshot)
                     elif order["kind"] == "TP" and order.get("trigger_price"):
-                        position.tp_price = float(order["trigger_price"])
+                        if position.tp_price is None:
+                            position.tp_price = float(order["trigger_price"])
+                        if not snapshot.leg_id:
+                            snapshot.leg_id = f"TP{len(position.tp_orders) + 1}"
+                        position.tp_orders.append(snapshot)
+                        tp_covered_qty += (
+                            float(position.size or 0.0)
+                            if snapshot.close_position
+                            else snapshot.qty
+                        )
+                position.protection_authority = (
+                    next(iter(origins)) if len(origins) == 1
+                    else "MIXED" if origins
+                    else "NONE"
+                )
+                position.tp_orders.sort(key=lambda row: row.trigger_price)
+                position.sl_orders.sort(key=lambda row: row.trigger_price)
+                position.tp_coverage_pct = (
+                    min(tp_covered_qty / float(position.size or 0.0), 1.0)
+                    if float(position.size or 0.0) > 0 else 0.0
+                )
+                position.runner_qty = max(
+                    0.0, float(position.size or 0.0) - tp_covered_qty
+                )
             except Exception as _e:
                 logger.debug("fetch protection orders for snapshot failed {}: {}", symbol, _e)
         higher_tf = await self._fetch_higher_tf_safe(symbol)
@@ -2870,7 +3090,7 @@ class TradingEngine:
                     return
                 attach_qty = float(precheck.get("qty") or result["qty"])
                 attach_entry = float(precheck.get("entry") or result["price"])
-                specs = self._planned_protection_specs(decision, attach_entry)
+                specs = self._planned_protection_specs(decision, attach_entry, attach_qty)
                 reject_reason = self._protection_specs_reject_reason(
                     symbol=symbol,
                     qty=attach_qty,
@@ -3081,6 +3301,25 @@ class TradingEngine:
         trade = await self._store.latest_open_trade_summary(symbol)
         trade_id = int((trade or {}).get("id") or 0)
         old_orders = await self._active_protection_orders(symbol)
+        external_orders = [
+            order for order in old_orders
+            if str(order.get("origin") or "EXTERNAL") != "ENGINE"
+        ]
+        if external_orders:
+            await self._store.log_audit(
+                symbol=symbol,
+                action="SLTP_BLOCKED",
+                reason=(
+                    "LLM ADJUST_SLTP blocked because protection authority is "
+                    f"{'MIXED' if len(external_orders) < len(old_orders) else 'EXTERNAL'}; "
+                    "explicit PROTECT_POSITION takeover is required"
+                ),
+            )
+            logger.warning(
+                "[{}] ADJUST_SLTP blocked: external protection orders require explicit takeover",
+                symbol,
+            )
+            return
         old_sl = next(
             (
                 float(order.get("trigger_price") or order.get("price") or 0.0)
@@ -3091,12 +3330,34 @@ class TradingEngine:
         )
 
         # 用标记价作为基准计算新触发价
-        specs: list[tuple[str, str, float]] = []
+        specs: list[ProtectionOrderSpec] = []
         rejected: list[str] = []
-        for kind, pct, otype in (
-            ("SL", decision.stop_loss_pct, "STOP_MARKET"),
-            ("TP", decision.take_profit_pct, "TAKE_PROFIT_MARKET"),
-        ):
+        requested: list[ProtectionOrderSpec] = []
+        if decision.stop_loss_pct > 0:
+            requested.append(ProtectionOrderSpec(
+                "SL", "STOP_MARKET", decision.stop_loss_pct,
+                qty=qty, leg_id="SL",
+            ))
+        allocated_qty = 0.0
+        targets = decision.effective_take_profit_targets
+        for index, target in enumerate(targets, start=1):
+            is_last = index == len(targets)
+            if is_last and sum(item.position_pct for item in targets) >= 1.0 - 1e-9:
+                target_qty = max(0.0, qty - allocated_qty)
+            else:
+                from src.exchange.filters import round_qty
+                target_qty = float(round_qty(qty * target.position_pct, filters))
+            allocated_qty += target_qty
+            requested.append(ProtectionOrderSpec(
+                "TP", "TAKE_PROFIT_MARKET", target.price_distance_pct,
+                qty=target_qty,
+                leg_id=target.leg_id or f"TP{index}",
+                position_pct=target.position_pct,
+            ))
+
+        for requested_spec in requested:
+            kind = requested_spec.kind
+            pct = requested_spec.trigger_price
             if pct <= 0:
                 continue
             raw_trigger = (
@@ -3109,14 +3370,24 @@ class TradingEngine:
                 qty=qty, equity=equity, leverage=int(position.get("leverage") or 0),
             )
             if reason:
-                rejected.append(f"{kind}@{trigger:.4f}: {reason}")
+                rejected.append(f"{requested_spec.leg_id or kind}@{trigger:.4f}: {reason}")
                 continue
-            specs.append((kind, otype, trigger))
+            specs.append(ProtectionOrderSpec(
+                kind=kind,
+                order_type=requested_spec.order_type,
+                trigger_price=trigger,
+                qty=requested_spec.qty,
+                leg_id=requested_spec.leg_id,
+                position_pct=requested_spec.position_pct,
+            ))
 
         if not specs:
             logger.warning("[{}] ADJUST_SLTP: 全部触发价校验失败 {}", symbol, rejected)
             return
-        new_sl = next((trigger for kind, _otype, trigger in specs if kind == "SL"), 0.0)
+        new_sl = next(
+            (spec.trigger_price for spec in specs if spec.kind == "SL"),
+            0.0,
+        )
         guard = evaluate_sltp_adjust_guard(
             state=self._last_sltp_adjust.get(symbol),
             trade_id=trade_id,
@@ -3178,7 +3449,11 @@ class TradingEngine:
         replaced_kinds = {
             o.get("kind") for o in results if o.get("status") == "placed"
         }
-        stale_old = [o for o in old_orders if o.get("kind") in replaced_kinds]
+        stale_old = [
+            o for o in old_orders
+            if o.get("kind") in replaced_kinds
+            and str(o.get("origin") or "EXTERNAL") == "ENGINE"
+        ]
         remaining = await self._cancel_stale_condition_orders(
             symbol=symbol, orders=stale_old, reason="adjust_sltp_replace"
         )
@@ -3649,6 +3924,9 @@ class TradingEngine:
             entry = float(position["entry_price"] or 0.0)
             mark = await self._current_mark_price(symbol, position)
             close_side = "sell" if side == "long" else "buy"
+            await self._report_protection_collection_alerts(
+                symbol, active_orders, qty=qty,
+            )
             stale = self._stale_protection_orders(
                 active_orders,
                 side=side,
@@ -3908,6 +4186,8 @@ class TradingEngine:
             # 构造一个临时的"决策视图"给 _planned_protection_specs 用
             from src.llm.schema import Action, TradeDecision as _TD
             try:
+                raw_plan = str(decision.get("take_profit_plan_json") or "")
+                take_profit_targets = json.loads(raw_plan) if raw_plan else []
                 tdec = _TD(
                     symbol=symbol,
                     action=Action.OPEN_LONG if side == "long" else Action.OPEN_SHORT,
@@ -3915,10 +4195,14 @@ class TradingEngine:
                     size_pct=0.0,
                     leverage=leverage or 1,
                     stop_loss_pct=float(decision.get("stop_loss_pct") or 0.0),
-                    take_profit_pct=float(decision.get("take_profit_pct") or 0.0),
+                    take_profit_pct=(
+                        0.0 if take_profit_targets
+                        else float(decision.get("take_profit_pct") or 0.0)
+                    ),
+                    take_profit_targets=take_profit_targets,
                     reason="orphan_adoption",
                 )
-                placed_specs = self._planned_protection_specs(tdec, entry)
+                placed_specs = self._planned_protection_specs(tdec, entry, qty)
             except Exception as e:
                 logger.warning("{} orphan adopt: build specs failed: {}", symbol, e)
 

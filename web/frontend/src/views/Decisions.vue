@@ -80,6 +80,20 @@ const decisionTypeOptions = [
 
 const symbolOptions = computed(() => cfg.value?.symbols || [])
 
+function takeProfitPlan(row) {
+  try {
+    const targets = JSON.parse(row?.take_profit_plan_json || '[]')
+    if (Array.isArray(targets) && targets.length) {
+      return targets
+        .map((target, index) =>
+          `${target.leg_id || `TP${index + 1}`}:${target.price_distance_pct}/${target.position_pct}`
+        )
+        .join(' ')
+    }
+  } catch (_) { /* legacy row */ }
+  return String(row?.take_profit_pct ?? 0)
+}
+
 function quickRangeBounds(value) {
   if (!value) return null
   const map = {
@@ -458,7 +472,7 @@ onUnmounted(() => {
         </el-table-column>
         <el-table-column label="SL/TP" width="120">
           <template #default="{ row }">
-            <span v-if="!row.skipped" class="mono">{{ row.stop_loss_pct }}/{{ row.take_profit_pct }}</span>
+            <span v-if="!row.skipped" class="mono">{{ row.stop_loss_pct }}/{{ takeProfitPlan(row) }}</span>
             <span v-else>—</span>
           </template>
         </el-table-column>
@@ -520,7 +534,12 @@ onUnmounted(() => {
           <el-descriptions-item label="置信度">{{ detail.confidence }}</el-descriptions-item>
           <el-descriptions-item label="杠杆">{{ detail.leverage }}x</el-descriptions-item>
           <el-descriptions-item label="参考价">{{ detail.ref_price }}</el-descriptions-item>
-          <el-descriptions-item label="SL/TP">{{ detail.stop_loss_pct }} / {{ detail.take_profit_pct }}</el-descriptions-item>
+          <el-descriptions-item label="SL/TP">
+            {{ detail.stop_loss_pct }} / {{ takeProfitPlan(detail) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="决策协议">
+            V{{ detail.decision_schema_version || 1 }}
+          </el-descriptions-item>
           <el-descriptions-item label="成交后保护价" :span="2">
             <el-tag
               size="small"

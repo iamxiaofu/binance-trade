@@ -44,6 +44,8 @@ class DecisionRow(Base):
     leverage: Mapped[int] = mapped_column(Integer, default=0)
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=0.0)
     take_profit_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    decision_schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    take_profit_plan_json: Mapped[str] = mapped_column(Text, default="")
     reason: Mapped[str] = mapped_column(String(1000), default="")
 
     # 审计：完整输入上下文 JSON（便于复盘）
@@ -298,6 +300,7 @@ class PositionSnapshotRow(Base):
     notional: Mapped[float] = mapped_column(Float, default=0.0)
     initial_margin: Mapped[float] = mapped_column(Float, default=0.0)
     isolated_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    isolated_wallet: Mapped[float] = mapped_column(Float, default=0.0)
     maintenance_margin: Mapped[float] = mapped_column(Float, default=0.0)
     roi_pct: Mapped[float] = mapped_column(Float, default=0.0)
     liquidation_price: Mapped[float] = mapped_column(Float, default=0.0)
@@ -489,6 +492,7 @@ class LivePositionRow(Base):
     notional: Mapped[float] = mapped_column(Float, default=0.0)
     initial_margin: Mapped[float] = mapped_column(Float, default=0.0)
     isolated_margin: Mapped[float] = mapped_column(Float, default=0.0)
+    isolated_wallet: Mapped[float] = mapped_column(Float, default=0.0)
     maintenance_margin: Mapped[float] = mapped_column(Float, default=0.0)
     roi_pct: Mapped[float] = mapped_column(Float, default=0.0)
     liquidation_price: Mapped[float] = mapped_column(Float, default=0.0)
@@ -517,6 +521,8 @@ class LiveOrderRow(Base):
     trigger_price: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(24), default="")
     reduce_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    close_position: Mapped[bool] = mapped_column(Boolean, default=False)
+    origin: Mapped[str] = mapped_column(String(16), default="EXTERNAL")
     source: Mapped[str] = mapped_column(String(16), default="")
     updated_at_ms: Mapped[int] = mapped_column(Integer, default=0)
     raw_json: Mapped[str] = mapped_column(Text, default="")

@@ -240,7 +240,12 @@ class AccountStateCoordinator:
             symbol = normalize_symbol(raw.get("s"))
             if not symbol or not self._newer(f"position:{symbol}", event.transaction_time_ms):
                 continue
+            previous = self._positions.get(symbol) or {}
+            previous_info = (
+                previous.get("info") if isinstance(previous.get("info"), dict) else {}
+            )
             position = {
+                **previous,
                 "symbol": symbol,
                 "positionAmt": raw.get("pa"),
                 "entryPrice": raw.get("ep"),
@@ -249,7 +254,10 @@ class AccountStateCoordinator:
                 "isolatedWallet": raw.get("iw"),
                 "positionSide": raw.get("ps"),
                 "updateTime": event.transaction_time_ms,
-                "info": raw,
+                # ACCOUNT_UPDATE is sparse. Preserve the latest REST-only fields
+                # (mark, liquidation, leverage, margin details) until the next
+                # authoritative REST snapshot, while applying fresh stream values.
+                "info": {**previous_info, **raw},
             }
             pos = normalize_position(position)
             if pos["contracts"] > 0:
@@ -288,6 +296,9 @@ class AccountStateCoordinator:
             "triggerPrice": raw.get("sp") or raw.get("triggerPrice") or raw.get("tp"),
             "algoStatus": raw.get("X") or raw.get("algoStatus"),
             "reduceOnly": raw.get("R") if raw.get("R") is not None else raw.get("reduceOnly"),
+            "closePosition": (
+                raw.get("cp") if raw.get("cp") is not None else raw.get("closePosition")
+            ),
             "updateTime": event.transaction_time_ms,
         }})
         key = order["id"] or order["client_algo_id"]

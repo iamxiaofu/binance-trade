@@ -96,3 +96,44 @@ def test_json_schema_generated():
     assert "2.00%" in schema["properties"]["take_profit_pct"]["description"]
     assert "OPEN_LONG 的 SL 低于 entry_ref" in schema["properties"]["reason"]["description"]
     assert "OPEN_SHORT 的 SL 高于 entry_ref" in schema["properties"]["reason"]["description"]
+
+
+def test_multi_take_profit_targets_parse_and_replace_legacy_target():
+    decision = TradeDecision.model_validate({
+        **VALID,
+        "take_profit_pct": 0.0,
+        "take_profit_targets": [
+            {"leg_id": "TP1", "price_distance_pct": 0.02, "position_pct": 0.5},
+            {"leg_id": "TP2", "price_distance_pct": 0.04, "position_pct": 0.5},
+        ],
+    })
+    assert decision.schema_version == 2
+    assert [target.leg_id for target in decision.effective_take_profit_targets] == ["TP1", "TP2"]
+
+
+def test_legacy_take_profit_becomes_single_effective_target():
+    decision = TradeDecision.model_validate(VALID)
+    assert decision.schema_version == 1
+    assert decision.effective_take_profit_targets[0].position_pct == 1.0
+
+
+def test_legacy_and_multi_take_profit_are_mutually_exclusive():
+    with pytest.raises(ValidationError):
+        TradeDecision.model_validate({
+            **VALID,
+            "take_profit_targets": [
+                {"price_distance_pct": 0.06, "position_pct": 0.5},
+            ],
+        })
+
+
+def test_multi_take_profit_total_and_order_are_validated():
+    with pytest.raises(ValidationError):
+        TradeDecision.model_validate({
+            **VALID,
+            "take_profit_pct": 0.0,
+            "take_profit_targets": [
+                {"price_distance_pct": 0.04, "position_pct": 0.6},
+                {"price_distance_pct": 0.02, "position_pct": 0.6},
+            ],
+        })

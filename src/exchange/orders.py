@@ -58,6 +58,10 @@ def _kind(order_type: str) -> str:
     return ""
 
 
+def _origin(client_order_id: str) -> str:
+    return "ENGINE" if client_order_id.startswith("bt-") else "EXTERNAL"
+
+
 def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]:
     o = order or {}
     info = o.get("info") if isinstance(o.get("info"), Mapping) else {}
@@ -72,6 +76,8 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
     ts_ms = int(_float(_value(o, info, "updateTime", "timestamp", "createTime")))
     if not ts_ms:
         ts_ms = int(_float(_value(o, info, "timestamp", "createTime")))
+    client_algo_id = str(_value(o, info, "clientAlgoId") or "")
+    close_position = _bool(_value(o, info, "closePosition"))
 
     return {
         "id": str(_value(o, info, "id", "algoId", "orderId") or ""),
@@ -88,7 +94,9 @@ def normalize_condition_order(order: Mapping[str, Any] | None) -> dict[str, Any]
         "status": _status(o, info),
         "raw_status": str(_value(o, info, "status", "algoStatus") or ""),
         "reduce_only": _bool(_value(o, info, "reduceOnly")),
-        "client_algo_id": str(_value(o, info, "clientAlgoId") or ""),
+        "close_position": close_position,
+        "client_algo_id": client_algo_id,
+        "origin": _origin(client_algo_id),
         "position_side": str(_value(o, info, "positionSide") or ""),
         "ts_ms": ts_ms,
     }
@@ -107,6 +115,7 @@ def normalize_open_order(order: Mapping[str, Any] | None) -> dict[str, Any]:
     filled_qty = abs(_float(_value(o, info, "filled", "executedQty")))
     avg_price = _float(_value(o, info, "average", "avgPrice"))
     ts_ms = int(_float(_value(o, info, "updateTime", "timestamp", "time", "createTime")))
+    client_order_id = str(_value(o, info, "clientOrderId", "origClientOrderId") or "")
 
     return {
         "id": str(_value(o, info, "id", "orderId") or ""),
@@ -121,7 +130,9 @@ def normalize_open_order(order: Mapping[str, Any] | None) -> dict[str, Any]:
         "raw_status": str(_value(o, info, "status") or ""),
         "time_in_force": str(_value(o, info, "timeInForce") or "").upper(),
         "reduce_only": _bool(_value(o, info, "reduceOnly")),
-        "client_order_id": str(_value(o, info, "clientOrderId", "origClientOrderId") or ""),
+        "close_position": _bool(_value(o, info, "closePosition")),
+        "client_order_id": client_order_id,
+        "origin": _origin(client_order_id),
         "position_side": str(_value(o, info, "positionSide") or ""),
         "ts_ms": ts_ms,
     }

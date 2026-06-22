@@ -105,6 +105,8 @@ _SYMBOL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("last_filter_sync_at", "VARCHAR(32) NOT NULL DEFAULT ''"),
 )
 _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("decision_schema_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("take_profit_plan_json", "TEXT NOT NULL DEFAULT ''"),
     ("llm_system_prompt", "TEXT NOT NULL DEFAULT ''"),
     ("llm_prompt", "TEXT NOT NULL DEFAULT ''"),
     ("llm_request_json", "TEXT NOT NULL DEFAULT ''"),
@@ -118,11 +120,16 @@ _DECISION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
 _POSITION_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("initial_margin", "FLOAT NOT NULL DEFAULT 0.0"),
     ("isolated_margin", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("isolated_wallet", "FLOAT NOT NULL DEFAULT 0.0"),
     ("maintenance_margin", "FLOAT NOT NULL DEFAULT 0.0"),
     ("roi_pct", "FLOAT NOT NULL DEFAULT 0.0"),
     ("liquidation_price", "FLOAT NOT NULL DEFAULT 0.0"),
     ("margin_ratio", "FLOAT NOT NULL DEFAULT 0.0"),
     ("margin_mode", "VARCHAR(16) NOT NULL DEFAULT ''"),
+)
+_LIVE_ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("close_position", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("origin", "VARCHAR(16) NOT NULL DEFAULT 'EXTERNAL'"),
 )
 _LLM_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("api_key", "TEXT NOT NULL DEFAULT ''"),
@@ -442,6 +449,13 @@ class Store:
             for name, ddl in _POSITION_EXTENSION_COLUMNS:
                 if position_existing and name not in position_existing:
                     await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {ddl}"))
+        live_order_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(live_orders)"))).fetchall()
+        }
+        for name, ddl in _LIVE_ORDER_EXTENSION_COLUMNS:
+            if live_order_existing and name not in live_order_existing:
+                await conn.execute(text(f"ALTER TABLE live_orders ADD COLUMN {name} {ddl}"))
         for ddl in _SQLITE_INDEX_DDL:
             await conn.execute(text(ddl))
 
@@ -627,8 +641,8 @@ class Store:
             for key in (
                 "side", "contracts", "entry_price", "mark_price", "leverage",
                 "unrealized_pnl", "notional", "initial_margin", "isolated_margin",
-                "maintenance_margin", "roi_pct", "liquidation_price", "margin_ratio",
-                "margin_mode",
+                "isolated_wallet", "maintenance_margin", "roi_pct",
+                "liquidation_price", "margin_ratio", "margin_mode",
             ):
                 setattr(row, key, pos[key])
             row.source = source
@@ -668,6 +682,8 @@ class Store:
             row.trigger_price = float(order.get("trigger_price") or 0)
             row.status = str(order.get("status") or "")
             row.reduce_only = bool(order.get("reduce_only"))
+            row.close_position = bool(order.get("close_position"))
+            row.origin = str(order.get("origin") or "EXTERNAL")
             row.source = source
             row.updated_at_ms = int(order.get("ts_ms") or _t.time() * 1000)
             row.raw_json = json.dumps(order, default=str)[:8000]
@@ -1636,6 +1652,14 @@ class Store:
             row.leverage = decision.leverage
             row.stop_loss_pct = decision.stop_loss_pct
             row.take_profit_pct = decision.take_profit_pct
+            row.decision_schema_version = decision.schema_version
+            row.take_profit_plan_json = json.dumps(
+                [
+                    target.model_dump(mode="json")
+                    for target in decision.effective_take_profit_targets
+                ],
+                ensure_ascii=False,
+            )
             row.reason = decision.reason[:DECISION_REASON_MAX_LENGTH]
         if ctx is not None:
             try:
@@ -2207,6 +2231,7 @@ class Store:
                         notional=pos["notional"],
                         initial_margin=pos["initial_margin"],
                         isolated_margin=pos["isolated_margin"],
+                        isolated_wallet=pos["isolated_wallet"],
                         maintenance_margin=pos["maintenance_margin"],
                         roi_pct=pos["roi_pct"],
                         liquidation_price=pos["liquidation_price"],
@@ -2407,6 +2432,8 @@ class Store:
                 "action": row.action,
                 "stop_loss_pct": row.stop_loss_pct,
                 "take_profit_pct": row.take_profit_pct,
+                "decision_schema_version": row.decision_schema_version,
+                "take_profit_plan_json": row.take_profit_plan_json,
                 "ref_price": row.ref_price,
                 "ts_ms": row.ts_ms,
                 "created_at": row.created_at,

@@ -17,7 +17,7 @@ const closeConfirm = ref(false)
 const takeoverForm = ref({
   qty: '',
   sl: '',
-  tp: '',
+  tpTargets: [],
   confirm: false,
 })
 const positions = computed(() => live.positions || [])
@@ -55,6 +55,9 @@ const marketSyncedAtText = computed(() => {
 const displayPositions = computed(() => positions.value.map(applyRealtimeMark))
 const hasMissingProtection = computed(() => displayPositions.value.some((p) =>
   p.protection?.missing_sl || p.protection?.missing_tp
+))
+const hasProtectionConflict = computed(() => displayPositions.value.some((p) =>
+  (p.protection?.conflicts || []).length > 0
 ))
 // B5：暴露 symbol_enabled 表与「持仓 + 币种已禁用」集合。
 const symbolEnabledMap = computed(() => live.summary?.symbol_enabled || {})
@@ -96,6 +99,11 @@ function fmtTime(ts) {
 }
 
 function margin(row) {
+  const wallet = Number(row.isolated_wallet || 0)
+  const pnl = Number(row.unrealized_pnl || 0)
+  if (String(row.margin_mode || '').toLowerCase() === 'isolated' && wallet > 0) {
+    return Math.max(0, wallet + (Number.isFinite(pnl) ? pnl : 0))
+  }
   return Number(row.isolated_margin || row.initial_margin || 0)
 }
 
@@ -251,8 +259,20 @@ function protection(row, kind) {
   return kind === 'SL' ? row.protection?.sl : row.protection?.tp
 }
 
+function protectionOrders(row, kind) {
+  const key = kind === 'SL' ? 'sl_orders' : 'tp_orders'
+  const orders = row.protection?.[key]
+  if (Array.isArray(orders) && orders.length) return orders
+  const fallback = protection(row, kind)
+  return fallback ? [fallback] : []
+}
+
 function needsRepair(row) {
   return Boolean(row.protection?.missing_sl || row.protection?.missing_tp)
+}
+
+function protectionNeedsAttention(row) {
+  return row.protection?.status !== 'COMPLETE'
 }
 
 function missingProtectionText(row) {
@@ -270,7 +290,32 @@ function protectionTag(order) {
 function protectionText(order) {
   if (!order) return '未挂出'
   const price = order.trigger_price || order.price
-  return `${orderStatusLabel({ client_kind: order.kind, status: order.status })} @ ${fmt(price, 2)}`
+  const qty = order.close_position ? '全仓' : `${fmt(order.qty)}`
+  return `${orderStatusLabel({ client_kind: order.kind, status: order.status })} @ ${fmt(price, 2)} · ${qty}`
+}
+
+function protectionOriginText(row) {
+  return {
+    ENGINE: 'Engine 管理',
+    EXTERNAL: 'Binance 外部',
+    MIXED: '混合管理',
+  }[row.protection?.authority] || '未识别'
+}
+
+function protectionStatusText(row) {
+  return {
+    COMPLETE: '保护完整',
+    PARTIAL_TP_COVERAGE: '止盈部分覆盖',
+    MISSING_SL: '缺少止损',
+    MISSING_TP: '缺少止盈',
+    CONFLICT: '保护单冲突',
+  }[row.protection?.status] || '状态未知'
+}
+
+function tpCoverageText(row) {
+  const pct = Number(row.protection?.tp_coverage_pct || 0) * 100
+  const runner = Number(row.protection?.runner_qty || 0)
+  return `覆盖 ${pct.toFixed(2)}% · Runner ${fmt(runner)}`
 }
 
 function isRepairing(row) {
@@ -294,14 +339,42 @@ async function repairProtection(row) {
 }
 
 function openTakeover(row) {
+  const existingTargets = protectionOrders(row, 'TP').map((order, index) => ({
+    leg_id: `TP${index + 1}`,
+    trigger_price: order.trigger_price || order.price || '',
+    position_pct: Number(row.contracts || 0) > 0
+      ? Number(order.qty || 0) / Number(row.contracts)
+      : 0,
+  }))
   takeoverRow.value = row
   takeoverForm.value = {
     qty: row.contracts || '',
-    sl: '',
-    tp: row.protection?.tp?.trigger_price || row.protection?.tp?.price || '',
+    sl: protectionOrders(row, 'SL')[0]?.trigger_price
+      || protectionOrders(row, 'SL')[0]?.price
+      || '',
+    tpTargets: existingTargets.length
+      ? existingTargets
+      : [{ leg_id: 'TP1', trigger_price: '', position_pct: 1 }],
     confirm: false,
   }
   takeoverVisible.value = true
+}
+
+function addTakeProfitTarget() {
+  if (takeoverForm.value.tpTargets.length >= 3) return
+  const index = takeoverForm.value.tpTargets.length + 1
+  takeoverForm.value.tpTargets.push({
+    leg_id: `TP${index}`,
+    trigger_price: '',
+    position_pct: 0,
+  })
+}
+
+function removeTakeProfitTarget(index) {
+  takeoverForm.value.tpTargets.splice(index, 1)
+  takeoverForm.value.tpTargets.forEach((target, idx) => {
+    target.leg_id = `TP${idx + 1}`
+  })
 }
 
 function recomputeTakeover() {
@@ -312,10 +385,16 @@ function recomputeTakeover() {
   if (!Number.isFinite(mark) || mark <= 0 || !Number.isFinite(entry) || entry <= 0) return
   if (row.side === 'long') {
     takeoverForm.value.sl = (mark * 0.99).toFixed(2)
-    takeoverForm.value.tp = (entry * 1.02).toFixed(2)
+    takeoverForm.value.tpTargets = [
+      { leg_id: 'TP1', trigger_price: (entry * 1.02).toFixed(2), position_pct: 0.5 },
+      { leg_id: 'TP2', trigger_price: (entry * 1.04).toFixed(2), position_pct: 0.5 },
+    ]
   } else if (row.side === 'short') {
     takeoverForm.value.sl = (mark * 1.01).toFixed(2)
-    takeoverForm.value.tp = (entry * 0.98).toFixed(2)
+    takeoverForm.value.tpTargets = [
+      { leg_id: 'TP1', trigger_price: (entry * 0.98).toFixed(2), position_pct: 0.5 },
+      { leg_id: 'TP2', trigger_price: (entry * 0.96).toFixed(2), position_pct: 0.5 },
+    ]
   }
 }
 
@@ -332,20 +411,34 @@ async function submitTakeover() {
     ElMessage.error('请输入有效的接管数量和止损触发价')
     return
   }
-  const tp = Number(takeoverForm.value.tp)
+  const takeProfitTargets = takeoverForm.value.tpTargets
+    .map((target, index) => ({
+      leg_id: target.leg_id || `TP${index + 1}`,
+      trigger_price: Number(target.trigger_price),
+      position_pct: Number(target.position_pct),
+    }))
+    .filter((target) => Number.isFinite(target.trigger_price) && target.trigger_price > 0)
+  const totalPct = takeProfitTargets.reduce((sum, target) => sum + target.position_pct, 0)
+  if (takeProfitTargets.some((target) =>
+    !Number.isFinite(target.position_pct) || target.position_pct <= 0
+  ) || totalPct > 1.000001) {
+    ElMessage.error('每档止盈比例必须大于 0，且合计不能超过 100%')
+    return
+  }
   const payload = {
     symbol: row.symbol,
     mode: 'manual',
     qty,
     sl_trigger: sl,
     confirm: true,
+    replace_external: row.protection?.authority === 'EXTERNAL' || row.protection?.authority === 'MIXED',
     position: {
       side: row.side,
       qty: row.contracts,
       entry: row.entry_price,
     },
   }
-  if (Number.isFinite(tp) && tp > 0) payload.tp_trigger = tp
+  if (takeProfitTargets.length) payload.take_profit_targets = takeProfitTargets
   takeoverSubmitting.value = true
   try {
     const res = await api.command('PROTECT_POSITION', JSON.stringify(payload))
@@ -479,6 +572,14 @@ async function cancelConditionOrder(order) {
         title="存在持仓缺少止盈或止损条件单，请检查交易所后台或重新挂保护单"
       />
       <el-alert
+        v-if="hasProtectionConflict"
+        type="error"
+        :closable="false"
+        show-icon
+        style="margin-bottom:12px"
+        title="检测到保护单过度覆盖或多止损冲突；外部订单不会被系统自动撤销，请人工确认后接管"
+      />
+      <el-alert
         v-if="disabledWithPosition.size > 0"
         type="warning"
         :closable="false"
@@ -506,7 +607,7 @@ async function cancelConditionOrder(order) {
           v-for="row in displayPositions"
           :key="row.symbol"
           class="position-card"
-          :class="[`side-${row.side || 'flat'}`, { 'needs-attention': needsRepair(row) || isSymbolDisabled(row.symbol) }]"
+          :class="[`side-${row.side || 'flat'}`, { 'needs-attention': protectionNeedsAttention(row) || isSymbolDisabled(row.symbol) }]"
         >
           <div class="position-card-head">
             <div>
@@ -559,15 +660,43 @@ async function cancelConditionOrder(order) {
           <div class="position-protection-grid">
             <div>
               <span class="position-field-label">止损保护</span>
-              <el-tag :type="protectionTag(protection(row, 'SL'))" size="small">
-                {{ protectionText(protection(row, 'SL')) }}
-              </el-tag>
+              <div class="protection-order-list">
+                <el-tag
+                  v-for="order in protectionOrders(row, 'SL')"
+                  :key="order.id || `${order.kind}-${order.trigger_price}`"
+                  :type="protectionTag(order)"
+                  size="small"
+                >
+                  {{ protectionText(order) }}
+                </el-tag>
+                <el-tag v-if="!protectionOrders(row, 'SL').length" type="danger" size="small">
+                  未挂出
+                </el-tag>
+              </div>
             </div>
             <div>
               <span class="position-field-label">止盈保护</span>
-              <el-tag :type="protectionTag(protection(row, 'TP'))" size="small">
-                {{ protectionText(protection(row, 'TP')) }}
-              </el-tag>
+              <div class="protection-order-list">
+                <el-tag
+                  v-for="(order, index) in protectionOrders(row, 'TP')"
+                  :key="order.id || `${order.kind}-${order.trigger_price}`"
+                  :type="protectionTag(order)"
+                  size="small"
+                >
+                  TP{{ index + 1 }} · {{ protectionText(order) }}
+                </el-tag>
+                <el-tag v-if="!protectionOrders(row, 'TP').length" type="danger" size="small">
+                  未挂出
+                </el-tag>
+              </div>
+            </div>
+            <div class="protection-summary">
+              <span class="position-field-label">止盈覆盖</span>
+              <strong class="mono">{{ tpCoverageText(row) }}</strong>
+            </div>
+            <div class="protection-summary">
+              <span class="position-field-label">订单来源</span>
+              <strong>{{ protectionOriginText(row) }}</strong>
             </div>
           </div>
 
@@ -576,11 +705,18 @@ async function cancelConditionOrder(order) {
               <el-tag v-if="isSymbolDisabled(row.symbol)" type="warning" size="small" effect="dark">
                 币种已禁用
               </el-tag>
-              <el-tag v-else-if="!needsRepair(row)" type="success" size="small">保护完整</el-tag>
+              <el-tag
+                v-else
+                :type="row.protection?.status === 'COMPLETE' ? 'success' : 'warning'"
+                size="small"
+              >
+                {{ protectionStatusText(row) }}
+              </el-tag>
             </div>
-            <div v-if="needsRepair(row) || isSymbolDisabled(row.symbol)" class="position-actions__row">
-              <template v-if="needsRepair(row)">
+            <div v-if="protectionNeedsAttention(row) || isSymbolDisabled(row.symbol)" class="position-actions__row">
+              <template v-if="protectionNeedsAttention(row)">
                 <el-button
+                  v-if="needsRepair(row)"
                   type="danger"
                   size="small"
                   :icon="'CirclePlus'"
@@ -614,6 +750,14 @@ async function cancelConditionOrder(order) {
 
     <el-dialog v-model="takeoverVisible" title="接管保护" width="520px">
       <el-form v-if="takeoverRow" label-width="120px">
+        <el-alert
+          v-if="['EXTERNAL', 'MIXED'].includes(takeoverRow.protection?.authority)"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom:12px"
+          title="提交成功后，系统会先挂出新保护单，再撤销当前 Binance 外部保护单，并切换为 Engine 管理。"
+        />
         <el-form-item label="币种">
           <span class="mono">{{ takeoverRow.symbol }}</span>
         </el-form-item>
@@ -629,8 +773,41 @@ async function cancelConditionOrder(order) {
         <el-form-item label="止损触发价">
           <el-input v-model="takeoverForm.sl" class="protect-input" />
         </el-form-item>
-        <el-form-item label="止盈触发价">
-          <el-input v-model="takeoverForm.tp" class="protect-input" />
+        <el-form-item label="分批止盈">
+          <div class="take-profit-editor">
+            <div
+              v-for="(target, index) in takeoverForm.tpTargets"
+              :key="target.leg_id"
+              class="take-profit-row"
+            >
+              <span class="mono">{{ target.leg_id }}</span>
+              <el-input v-model="target.trigger_price" placeholder="触发价" />
+              <el-input-number
+                v-model="target.position_pct"
+                :min="0.01"
+                :max="1"
+                :step="0.05"
+                :precision="2"
+                controls-position="right"
+              />
+              <span>仓位比例</span>
+              <el-button
+                v-if="takeoverForm.tpTargets.length > 1"
+                link
+                type="danger"
+                @click="removeTakeProfitTarget(index)"
+              >
+                删除
+              </el-button>
+            </div>
+            <el-button
+              v-if="takeoverForm.tpTargets.length < 3"
+              size="small"
+              @click="addTakeProfitTarget"
+            >
+              添加止盈档
+            </el-button>
+          </div>
         </el-form-item>
         <el-form-item>
           <el-button size="small" @click="recomputeTakeover">按当前价重算</el-button>
@@ -917,6 +1094,19 @@ async function cancelConditionOrder(order) {
   width: 180px;
 }
 
+.take-profit-editor {
+  display: grid;
+  width: 100%;
+  gap: 8px;
+}
+
+.take-profit-row {
+  display: grid;
+  grid-template-columns: 38px minmax(100px, 1fr) 130px auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
 .open-orders-card {
   margin-top: 16px;
 }
@@ -1066,6 +1256,18 @@ async function cancelConditionOrder(order) {
   padding: 3px 7px;
   white-space: normal;
   line-height: 1.25;
+}
+
+.protection-order-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.protection-summary strong {
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .position-actions {

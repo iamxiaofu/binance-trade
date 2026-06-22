@@ -270,7 +270,10 @@ async def test_connect_upgrades_position_projection_columns(tmp_path):
         }
     await s.close()
 
-    for column in ("initial_margin", "isolated_margin", "roi_pct", "liquidation_price"):
+    for column in (
+        "initial_margin", "isolated_margin", "isolated_wallet",
+        "roi_pct", "liquidation_price",
+    ):
         assert column in live_cols
         assert column in snapshot_cols
 
@@ -300,6 +303,37 @@ async def test_log_actual_decision_with_context(store):
     assert "request" in row.llm_request_json
     assert "response" in row.llm_response_json
     assert "last_price" in row.feature_snapshot_json
+    assert row.decision_schema_version == 1
+    assert json.loads(row.take_profit_plan_json) == [{
+        "leg_id": "TP1",
+        "price_distance_pct": 0.04,
+        "position_pct": 1.0,
+    }]
+
+
+async def test_log_multi_take_profit_decision_plan(store):
+    decision = TradeDecision(
+        symbol="BTCUSDT",
+        action=Action.OPEN_LONG,
+        confidence=0.8,
+        size_pct=0.1,
+        leverage=3,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.0,
+        take_profit_targets=[
+            {"leg_id": "TP1", "price_distance_pct": 0.03, "position_pct": 0.5},
+            {"leg_id": "TP2", "price_distance_pct": 0.06, "position_pct": 0.5},
+        ],
+        reason="分批止盈",
+    )
+
+    await store.log_decision(symbol="BTCUSDT", decision=decision)
+
+    sm = async_sessionmaker(store._engine, expire_on_commit=False)
+    async with sm() as session:
+        row = (await session.execute(select(DecisionRow))).scalar_one()
+    assert row.decision_schema_version == 2
+    assert len(json.loads(row.take_profit_plan_json)) == 2
 
 
 async def test_llm_prompt_versions(store):
@@ -412,6 +446,7 @@ async def test_live_position_state_includes_margin_roi_and_liquidation(store):
         "notional": 121.9832,
         "initialMargin": 24.39664,
         "collateral": 24.15579944,
+        "isolatedWallet": 24.33619944,
         "liquidationPrice": 88.66581692,
         "marginRatio": 0.0252,
         "marginMode": "isolated",
@@ -424,6 +459,7 @@ async def test_live_position_state_includes_margin_roi_and_liquidation(store):
     assert pos["symbol"] == "SOLUSDT"
     assert pos["initial_margin"] == pytest.approx(24.39664)
     assert pos["isolated_margin"] == pytest.approx(24.15579944)
+    assert pos["isolated_wallet"] == pytest.approx(24.33619944)
     assert pos["roi_pct"] == pytest.approx(-0.1804 / 24.39664 * 100)
     assert pos["liquidation_price"] == pytest.approx(88.66581692)
     assert pos["margin_mode"] == "isolated"

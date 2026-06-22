@@ -63,6 +63,91 @@ def test_attach_protection_uses_active_placed_condition_orders():
     assert protection["missing_tp"] is True
 
 
+def test_attach_protection_exposes_multiple_tp_orders_and_coverage():
+    positions = [{"symbol": "SOLUSDT", "contracts": 4.51}]
+    orders = [
+        {
+            "id": "sl",
+            "symbol": "SOLUSDT",
+            "kind": "SL",
+            "status": "placed",
+            "trigger_price": 69.88,
+            "qty": 0.0,
+            "close_position": True,
+            "origin": "EXTERNAL",
+        },
+        {
+            "id": "tp-2",
+            "symbol": "SOLUSDT",
+            "kind": "TP",
+            "status": "placed",
+            "trigger_price": 73.0,
+            "qty": 2.25,
+            "origin": "EXTERNAL",
+        },
+        {
+            "id": "tp-1",
+            "symbol": "SOLUSDT",
+            "kind": "TP",
+            "status": "placed",
+            "trigger_price": 72.23,
+            "qty": 2.25,
+            "origin": "EXTERNAL",
+        },
+    ]
+
+    _attach_projection_metadata(positions, orders)
+
+    protection = positions[0]["protection"]
+    assert [row["id"] for row in protection["tp_orders"]] == ["tp-1", "tp-2"]
+    assert protection["tp_covered_qty"] == pytest.approx(4.5)
+    assert protection["tp_coverage_pct"] == pytest.approx(4.5 / 4.51)
+    assert protection["runner_qty"] == pytest.approx(0.01)
+    assert protection["authority"] == "EXTERNAL"
+    assert protection["mode"] == "OBSERVE"
+    assert protection["status"] == "PARTIAL_TP_COVERAGE"
+
+
+def test_attach_protection_reports_over_coverage_conflict():
+    positions = [{"symbol": "SOLUSDT", "contracts": 4.0}]
+    orders = [
+        {
+            "id": "sl",
+            "symbol": "SOLUSDT",
+            "kind": "SL",
+            "status": "placed",
+            "trigger_price": 69.0,
+            "qty": 4.0,
+            "origin": "ENGINE",
+        },
+        {
+            "id": "tp-1",
+            "symbol": "SOLUSDT",
+            "kind": "TP",
+            "status": "placed",
+            "trigger_price": 73.0,
+            "qty": 2.5,
+            "origin": "ENGINE",
+        },
+        {
+            "id": "tp-2",
+            "symbol": "SOLUSDT",
+            "kind": "TP",
+            "status": "placed",
+            "trigger_price": 74.0,
+            "qty": 2.5,
+            "origin": "ENGINE",
+        },
+    ]
+
+    _attach_projection_metadata(positions, orders)
+
+    protection = positions[0]["protection"]
+    assert protection["status"] == "CONFLICT"
+    assert protection["conflicts"] == ["TP_OVER_COVERED"]
+    assert protection["tp_ordered_qty"] == pytest.approx(5.0)
+
+
 def test_apply_live_balance_recomputes_day_equity_from_exchange(monkeypatch):
     monkeypatch.setattr(server, "_DB", "/tmp/test.db")
     monkeypatch.setattr(

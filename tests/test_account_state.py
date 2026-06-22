@@ -139,3 +139,57 @@ async def test_algo_update_projects_tp_trigger_price(tmp_path):
     finally:
         await coordinator.close()
         await store.close()
+
+
+async def test_account_update_preserves_rest_margin_fields_and_updates_isolated_wallet(tmp_path):
+    store, runtime, coordinator = await _coordinator(tmp_path)
+    try:
+        baseline = rest_snapshot_event(
+            positions=[{
+                "symbol": "SOL/USDT:USDT",
+                "side": "long",
+                "contracts": 4.51,
+                "entryPrice": 71.13,
+                "markPrice": 71.20,
+                "notional": 321.112,
+                "initialMargin": 126.10,
+                "collateral": 64.45,
+                "isolatedWallet": 64.09,
+                "liquidationPrice": 50.0,
+                "marginMode": "isolated",
+            }],
+            open_orders=[],
+            balance={"total": {"USDT": 1000}, "free": {"USDT": 900}},
+            reason="margin-baseline",
+        )
+        await coordinator.submit(baseline)
+        await coordinator.drain()
+
+        await coordinator.submit(ExchangeEvent(
+            event_type="ACCOUNT_UPDATE",
+            event_time_ms=baseline.event_time_ms + 1,
+            transaction_time_ms=baseline.transaction_time_ms + 1,
+            payload={"a": {"P": [{
+                "s": "SOLUSDT",
+                "pa": "4.51",
+                "ep": "71.13",
+                "up": "0.50",
+                "mt": "isolated",
+                "iw": "64.20",
+                "ps": "BOTH",
+            }]}},
+            event_key="isolated-wallet-update",
+        ))
+        await coordinator.drain()
+
+        live = await store.live_account_state()
+        position = live["positions"][0]
+        assert position["source"] == "stream"
+        assert position["isolated_wallet"] == 64.20
+        assert position["unrealized_pnl"] == 0.50
+        assert position["isolated_margin"] == 64.45
+        assert position["initial_margin"] == 126.10
+        assert position["liquidation_price"] == 50.0
+    finally:
+        await coordinator.close()
+        await store.close()

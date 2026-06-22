@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------- 输入：喂给 LLM 的市场上下文 ----------
@@ -104,6 +104,15 @@ class MarketSentiment(BaseModel):
     fear_greed_index: int | None = None       # 恐惧贪婪指数 0-100(可选)
 
 
+class ProtectionOrderSnapshot(BaseModel):
+    kind: str
+    trigger_price: float
+    qty: float = 0.0
+    close_position: bool = False
+    origin: str = "EXTERNAL"
+    leg_id: str = ""
+
+
 class PositionSnapshot(BaseModel):
     has_position: bool = False
     side: str | None = None  # LONG | SHORT | None
@@ -113,6 +122,11 @@ class PositionSnapshot(BaseModel):
     current_leverage: int | None = None
     sl_price: float | None = None   # 当前交易所挂单的止损触发价（无则 None）
     tp_price: float | None = None   # 当前交易所挂单的止盈触发价（无则 None）
+    sl_orders: list[ProtectionOrderSnapshot] = Field(default_factory=list)
+    tp_orders: list[ProtectionOrderSnapshot] = Field(default_factory=list)
+    protection_authority: str = "NONE"
+    tp_coverage_pct: float = 0.0
+    runner_qty: float = 0.0
     opened_at_ms: int | None = None
     position_age_minutes: float | None = None
     position_age_1m_bars: int | None = None
@@ -162,6 +176,22 @@ class Action(str, Enum):
     ADJUST_SLTP = "ADJUST_SLTP"   # 已有持仓时调整止盈止损，不平仓
 
 
+class TakeProfitTarget(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    leg_id: str = Field(default="", max_length=16)
+    price_distance_pct: float = Field(
+        gt=0.0,
+        le=1.0,
+        description="相对 OPEN entry_ref 或 ADJUST_SLTP 当前 mark 的价格距离小数。",
+    )
+    position_pct: float = Field(
+        gt=0.0,
+        le=1.0,
+        description="该止盈档覆盖的当前持仓比例；0.5 表示 50% 仓位。",
+    )
+
+
 class TradeDecision(BaseModel):
     """LLM 决策输出。extra=forbid → 多余字段直接拒绝。"""
     model_config = {"extra": "forbid"}
@@ -189,11 +219,21 @@ class TradeDecision(BaseModel):
         ),
     )
     take_profit_pct: float = Field(
+        default=0.0,
         ge=0.0, le=1.0,
         description=(
+            "兼容旧版的单目标止盈距离；使用 take_profit_targets 时必须为 0。"
             "相对基准价的价格止盈距离小数，不是保证金比例或权益比例；"
             "百分比=小数×100；0.02 必须解释为 2.00% 价格距离。"
             "OPEN 时基准价=entry_ref；ADJUST_SLTP 时基准价=当前标记价 mark。"
+        ),
+    )
+    take_profit_targets: list[TakeProfitTarget] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "分批止盈计划，最多 3 档；position_pct 合计不得超过 1。"
+            "目标按距离从近到远排列。使用本字段时 take_profit_pct 必须为 0。"
         ),
     )
     reason: str = Field(
@@ -212,6 +252,18 @@ class TradeDecision(BaseModel):
     def _symbol_upper(cls, v: str) -> str:
         return v.upper()
 
+    @model_validator(mode="after")
+    def _validate_take_profit_plan(self) -> "TradeDecision":
+        if self.take_profit_pct > 0 and self.take_profit_targets:
+            raise ValueError("take_profit_pct and take_profit_targets are mutually exclusive")
+        total = sum(target.position_pct for target in self.take_profit_targets)
+        if total > 1.0 + 1e-9:
+            raise ValueError("take_profit_targets position_pct total cannot exceed 1")
+        distances = [target.price_distance_pct for target in self.take_profit_targets]
+        if distances != sorted(distances) or len(set(distances)) != len(distances):
+            raise ValueError("take_profit_targets must use strictly increasing distances")
+        return self
+
     @property
     def is_open(self) -> bool:
         return self.action in (Action.OPEN_LONG, Action.OPEN_SHORT)
@@ -219,6 +271,24 @@ class TradeDecision(BaseModel):
     @property
     def is_adjust(self) -> bool:
         return self.action == Action.ADJUST_SLTP
+
+    @property
+    def effective_take_profit_targets(self) -> list[TakeProfitTarget]:
+        if self.take_profit_targets:
+            return self.take_profit_targets
+        if self.take_profit_pct > 0:
+            return [
+                TakeProfitTarget(
+                    leg_id="TP1",
+                    price_distance_pct=self.take_profit_pct,
+                    position_pct=1.0,
+                )
+            ]
+        return []
+
+    @property
+    def schema_version(self) -> int:
+        return 2 if self.take_profit_targets else 1
 
     @classmethod
     def safe_hold(cls, symbol: str, reason: str) -> "TradeDecision":

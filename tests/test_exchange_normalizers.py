@@ -17,12 +17,14 @@ def test_normalize_position_margin_roi_and_liquidation():
         "unrealizedPnl": -0.5,
         "initialMargin": 10.0,
         "collateral": 9.5,
+        "isolatedWallet": 10.0,
         "liquidationPrice": 150.0,
         "percentage": -5.0,
     })
     assert pos["symbol"] == "BTCUSDT"
     assert pos["initial_margin"] == pytest.approx(10.0)
     assert pos["isolated_margin"] == pytest.approx(9.5)
+    assert pos["isolated_wallet"] == pytest.approx(10.0)
     assert pos["roi_pct"] == pytest.approx(-5.0)
     assert pos["liquidation_price"] == pytest.approx(150.0)
 
@@ -66,6 +68,27 @@ def test_normalize_condition_order_reads_algo_update_tp_trigger_price():
     assert order["status"] == "placed"
     assert order["price"] == 0
     assert order["trigger_price"] == pytest.approx(72.23)
+    assert order["origin"] == "EXTERNAL"
+
+
+def test_normalize_condition_order_close_all_and_engine_origin():
+    order = normalize_condition_order({
+        "info": {
+            "algoId": "10",
+            "clientAlgoId": "bt-protection",
+            "symbol": "SOLUSDT",
+            "side": "SELL",
+            "orderType": "STOP_MARKET",
+            "quantity": "0",
+            "triggerPrice": "69.88",
+            "algoStatus": "NEW",
+            "closePosition": True,
+            "reduceOnly": False,
+        },
+    })
+    assert order["qty"] == 0
+    assert order["close_position"] is True
+    assert order["origin"] == "ENGINE"
 
 
 def test_normalize_position_isolated_derives_leverage_when_null():
@@ -116,3 +139,17 @@ def test_normalize_position_no_margin_returns_zero_leverage():
         "initialMargin": 0.0,
     })
     assert pos["leverage"] == 0
+
+
+def test_normalize_position_reads_private_stream_isolated_wallet():
+    pos = normalize_position({
+        "symbol": "SOLUSDT",
+        "positionAmt": "4.51",
+        "entryPrice": "71.13",
+        "unRealizedProfit": "0.40831785",
+        "isolatedWallet": "64.09510074",
+        "marginType": "isolated",
+    })
+    assert pos["isolated_wallet"] == pytest.approx(64.09510074)
+    assert pos["unrealized_pnl"] == pytest.approx(0.40831785)
+    assert pos["margin_mode"] == "isolated"

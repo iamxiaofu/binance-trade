@@ -12,13 +12,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
 import ccxt.async_support as ccxt
 from loguru import logger
 
 from src.config.schema import ExecutionConfig, ExecutionMode, MakerUnfilledAction, Settings
 from src.exchange.client import ExchangeClient
-from src.exchange.filters import normalize_order
+from src.exchange.filters import normalize_order, round_price, round_qty
 from src.exchange.orders import normalize_condition_order
 from src.execution.policy import ExecutionPolicy
 from src.llm.schema import Action, TradeDecision
@@ -98,6 +99,17 @@ def realized_pnl(*, side: str, entry_price: float, exit_price: float, qty: float
 
 # OPEN_LONG → buy, OPEN_SHORT → sell
 _OPEN_SIDE = {Action.OPEN_LONG: "buy", Action.OPEN_SHORT: "sell"}
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionOrderSpec:
+    kind: str
+    order_type: str
+    trigger_price: float
+    qty: float | None = None
+    leg_id: str = ""
+    position_pct: float | None = None
+    close_position: bool = False
 
 
 class Executor:
@@ -1015,14 +1027,31 @@ class Executor:
                 raw = entry_price * (1 - pct) if is_long else entry_price * (1 + pct)
             else:
                 raw = entry_price * (1 + pct) if is_long else entry_price * (1 - pct)
-            from src.exchange.filters import round_price
             return float(round_price(raw, f))
 
-        specs = []
+        specs: list[ProtectionOrderSpec] = []
         if decision.stop_loss_pct > 0:
-            specs.append(("SL", "STOP_MARKET", _trigger(decision.stop_loss_pct, True)))
-        if decision.take_profit_pct > 0:
-            specs.append(("TP", "TAKE_PROFIT_MARKET", _trigger(decision.take_profit_pct, False)))
+            specs.append(ProtectionOrderSpec(
+                "SL", "STOP_MARKET", _trigger(decision.stop_loss_pct, True),
+                qty=qty, leg_id="SL",
+            ))
+        targets = decision.effective_take_profit_targets
+        allocated_qty = 0.0
+        for index, target in enumerate(targets, start=1):
+            is_last = index == len(targets)
+            if is_last and sum(item.position_pct for item in targets) >= 1.0 - 1e-9:
+                target_qty = max(0.0, qty - allocated_qty)
+            else:
+                target_qty = float(round_qty(qty * target.position_pct, f))
+            allocated_qty += target_qty
+            specs.append(ProtectionOrderSpec(
+                "TP",
+                "TAKE_PROFIT_MARKET",
+                _trigger(target.price_distance_pct, False),
+                qty=target_qty,
+                leg_id=target.leg_id or f"TP{index}",
+                position_pct=target.position_pct,
+            ))
 
         return await self.place_protection_orders(
             symbol=symbol,
@@ -1037,38 +1066,74 @@ class Executor:
         symbol: str,
         pos_side: str,
         qty: float,
-        specs: list[tuple[str, str, float]],
+        specs: list[ProtectionOrderSpec | tuple[str, str, float]],
     ) -> list[dict]:
         """按明确触发价补挂 reduce-only 保护条件单。"""
         close_side = "sell" if pos_side.lower() == "long" else "buy"
         results: list[dict] = []
-        errors: list[str] = []
-        for kind, otype, trigger in specs:
+        filters = self._client.filters(symbol)
+        normalized_specs = [
+            spec if isinstance(spec, ProtectionOrderSpec)
+            else ProtectionOrderSpec(spec[0], spec[1], spec[2])
+            for spec in specs
+        ]
+        for spec in normalized_specs:
+            kind = spec.kind
+            otype = spec.order_type
+            trigger = spec.trigger_price
+            requested_qty = qty if spec.qty is None else float(spec.qty)
+            order_qty = requested_qty
+            if not spec.close_position:
+                normalized = normalize_order(
+                    qty=requested_qty, price=trigger, f=filters, is_market=True
+                )
+                if normalized is None:
+                    results.append(_result(
+                        symbol=symbol, kind=kind, side=close_side, qty=requested_qty,
+                        order_type=otype, price=trigger, notional=0.0, dry_run=False,
+                        status="rejected",
+                        raw={"error": "qty/trigger below minQty or minNotional"},
+                        requested_qty=requested_qty,
+                    ) | {
+                        "leg_id": spec.leg_id,
+                        "position_pct": spec.position_pct,
+                        "close_position": False,
+                    })
+                    continue
+                order_qty = float(normalized.qty)
             client_algo_id = self._protection_client_algo_id(
-                symbol=symbol, kind=kind, side=close_side, qty=qty, trigger=trigger
+                symbol=symbol, kind=kind, side=close_side, qty=order_qty,
+                trigger=trigger, leg_id=spec.leg_id,
             )
+            params = {"stopPrice": trigger, "clientAlgoId": client_algo_id}
+            if spec.close_position:
+                params["closePosition"] = True
+            else:
+                params["reduceOnly"] = True
             try:
                 order = await self._with_retry(
-                    lambda otype=otype, trigger=trigger: self._client.create_order(
-                        symbol, close_side, qty, otype.lower(), None,
-                        {
-                            "stopPrice": trigger,
-                            "reduceOnly": True,
-                            "clientAlgoId": client_algo_id,
-                        },
+                    lambda otype=otype, params=params, order_qty=order_qty: self._client.create_order(
+                        symbol, close_side, order_qty, otype.lower(), None, params,
                     ),
                     f"{kind} {symbol}",
                 )
-                results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
-                                       order_type=otype, price=trigger,
-                                       notional=qty * trigger, dry_run=False, status="placed",
-                                       order_id=str(order.get("id") or ""), raw=order))
+                results.append(_result(
+                    symbol=symbol, kind=kind, side=close_side, qty=order_qty,
+                    order_type=otype, price=trigger,
+                    notional=order_qty * trigger, dry_run=False, status="placed",
+                    order_id=str(order.get("id") or ""), raw=order,
+                    requested_qty=requested_qty, client_order_id=client_algo_id,
+                ) | {
+                    "leg_id": spec.leg_id,
+                    "position_pct": spec.position_pct,
+                    "close_position": spec.close_position,
+                })
             except Exception as e:
                 recovered = await self._find_matching_condition_order(
                     symbol=symbol,
                     kind=kind,
                     side=close_side,
-                    qty=qty,
+                    qty=order_qty,
                     trigger=trigger,
                     client_algo_id=client_algo_id,
                 )
@@ -1081,21 +1146,34 @@ class Executor:
                         symbol=symbol,
                         kind=kind,
                         side=close_side,
-                        qty=qty,
+                        qty=order_qty,
                         order_type=otype,
                         price=trigger,
-                        notional=qty * trigger,
+                        notional=order_qty * trigger,
                         dry_run=False,
                         status="placed",
                         order_id=str(recovered.get("id") or ""),
                         raw=recovered.get("raw") or recovered,
-                    ))
+                        requested_qty=requested_qty,
+                        client_order_id=client_algo_id,
+                    ) | {
+                        "leg_id": spec.leg_id,
+                        "position_pct": spec.position_pct,
+                        "close_position": spec.close_position,
+                    })
                     continue
                 logger.error("[{}] place {} failed: {}", symbol, kind, e)
-                results.append(_result(symbol=symbol, kind=kind, side=close_side, qty=qty,
-                                       order_type=otype, price=trigger, notional=0.0,
-                                       dry_run=False, status="error",
-                                       raw={"error": str(e), "clientAlgoId": client_algo_id}))
+                results.append(_result(
+                    symbol=symbol, kind=kind, side=close_side, qty=order_qty,
+                    order_type=otype, price=trigger, notional=0.0,
+                    dry_run=False, status="error",
+                    raw={"error": str(e), "clientAlgoId": client_algo_id},
+                    requested_qty=requested_qty, client_order_id=client_algo_id,
+                ) | {
+                    "leg_id": spec.leg_id,
+                    "position_pct": spec.position_pct,
+                    "close_position": spec.close_position,
+                })
         return results
 
     @staticmethod
@@ -1106,10 +1184,11 @@ class Executor:
         side: str,
         qty: float,
         trigger: float,
+        leg_id: str = "",
     ) -> str:
         import hashlib
 
-        raw = f"{symbol}:{kind}:{side}:{qty:.12g}:{trigger:.12g}"
+        raw = f"{symbol}:{kind}:{leg_id}:{side}:{qty:.12g}:{trigger:.12g}"
         digest = hashlib.sha1(raw.encode("ascii")).hexdigest()[:22]
         return f"bt-{digest}"
 

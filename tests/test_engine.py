@@ -27,6 +27,72 @@ from src.llm.schema import (
 from src.notify.telegram import Event
 
 
+def _protection_order(**overrides):
+    row = {
+        "symbol": "SOLUSDT",
+        "kind": "TP",
+        "status": "placed",
+        "reduce_only": True,
+        "close_position": False,
+        "side": "sell",
+        "qty": 2.25,
+        "trigger_price": 72.23,
+        "origin": "EXTERNAL",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_partial_tp_is_valid_protection_order():
+    reason = TradingEngine._protection_mismatch_reason(
+        _protection_order(),
+        kind="TP",
+        close_side="sell",
+        pos_side="long",
+        qty=4.51,
+        entry=71.13,
+        mark=71.90,
+    )
+    assert reason == ""
+
+
+def test_close_all_stop_is_valid_with_zero_quantity():
+    reason = TradingEngine._protection_mismatch_reason(
+        _protection_order(
+            kind="SL",
+            qty=0.0,
+            trigger_price=69.88,
+            reduce_only=False,
+            close_position=True,
+        ),
+        kind="SL",
+        close_side="sell",
+        pos_side="long",
+        qty=4.51,
+        entry=71.13,
+        mark=71.90,
+    )
+    assert reason == ""
+
+
+def test_protection_collection_alerts_cover_partial_over_and_mixed():
+    partial = TradingEngine._protection_collection_alerts(
+        [_protection_order(qty=2.25)],
+        qty=4.51,
+    )
+    assert partial == ["TP_PARTIAL_COVERAGE:2.25<4.51"]
+
+    over_mixed = TradingEngine._protection_collection_alerts(
+        [
+            _protection_order(qty=3.0, origin="ENGINE"),
+            _protection_order(qty=2.0, trigger_price=73.0, origin="EXTERNAL"),
+        ],
+        qty=4.51,
+    )
+    assert "TP_OVER_COVERED:5>4.51" in over_mixed
+    assert "MIXED_AUTHORITY" in over_mixed
+
+
 @pytest.fixture
 def creds():
     return Credentials(
@@ -503,12 +569,25 @@ class FakeExecutor:
         ]
 
     async def place_protection_orders(self, *, symbol, pos_side, qty, specs):
-        return [
-            {"symbol": symbol, "kind": kind, "side": "sell" if pos_side == "long" else "buy",
-             "order_type": otype, "qty": qty, "price": trigger, "notional": qty * trigger,
-             "dry_run": False, "status": "placed", "id": f"{kind}-1", "raw": {}}
-            for kind, otype, trigger in specs
-        ]
+        results = []
+        for spec in specs:
+            if isinstance(spec, tuple):
+                kind, otype, trigger = spec
+                order_qty = qty
+                leg_id = ""
+            else:
+                kind, otype, trigger = spec.kind, spec.order_type, spec.trigger_price
+                order_qty = float(spec.qty or qty)
+                leg_id = spec.leg_id
+            results.append({
+                "symbol": symbol, "kind": kind,
+                "side": "sell" if pos_side == "long" else "buy",
+                "order_type": otype, "qty": order_qty, "price": trigger,
+                "notional": order_qty * trigger, "dry_run": False,
+                "status": "placed", "id": f"{kind}-1", "raw": {},
+                "leg_id": leg_id,
+            })
+        return results
 
     async def close_position(self, position, *, mode=None, skip_slippage_guard=False):
         self.closed.append((position, mode, skip_slippage_guard))
@@ -1964,6 +2043,17 @@ class RepairClient:
         self.open_orders = []
 
 
+class CancellableRepairClient(RepairClient):
+    async def cancel_condition_order(self, symbol, order_id, *, client_algo_id=""):
+        await super().cancel_condition_order(
+            symbol, order_id, client_algo_id=client_algo_id,
+        )
+        self.open_orders = [
+            order for order in self.open_orders
+            if str(order.get("id") or "") != str(order_id)
+        ]
+
+
 class ManualCloseExecutor(FakeExecutor):
     def __init__(self, client):
         super().__init__()
@@ -2114,8 +2204,8 @@ async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, cred
         },
         open_orders=[
             {"id": "tp-old", "symbol": "BTC/USDT:USDT", "type": "TAKE_PROFIT_MARKET",
-             "side": "buy", "amount": 0.5, "stopPrice": 95.0, "status": "open",
-             "reduceOnly": True},
+             "side": "buy", "amount": 1.5, "stopPrice": 95.0, "status": "open",
+             "reduceOnly": True, "clientAlgoId": "bt-stale-tp"},
         ],
         equity=1000.0,
     )
@@ -2192,6 +2282,89 @@ async def test_command_protect_position_takeover_only_residual_qty(settings, cre
     assert "已接管保护 SL@98.00" in result
     assert eng._store.takeover_trades[0]["qty"] == pytest.approx(0.02)
     assert "trade_id" not in eng._store.orders[0]
+
+
+async def test_command_protect_position_places_multiple_tp_legs(settings, creds, monkeypatch):
+    settings.risk.max_loss_per_order_margin_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+            "markPrice": 101.0,
+            "leverage": 2,
+        },
+        equity=1000.0,
+    )
+    payload = {
+        "symbol": "BTCUSDT",
+        "qty": 0.1,
+        "sl_trigger": 99.0,
+        "take_profit_targets": [
+            {"leg_id": "TP1", "trigger_price": 103.0, "position_pct": 0.5},
+            {"leg_id": "TP2", "trigger_price": 106.0, "position_pct": 0.5},
+        ],
+        "confirm": True,
+        "position": {"side": "long", "qty": 0.1, "entry": 100.0},
+    }
+
+    result = await eng._exec_command("PROTECT_POSITION", json.dumps(payload))
+
+    assert "已接管保护" in result
+    assert [o["kind"] for o in eng._store.orders] == ["SL", "TP", "TP"]
+    assert [o["qty"] for o in eng._store.orders[1:]] == pytest.approx([0.05, 0.05])
+    assert [o["leg_id"] for o in eng._store.orders[1:]] == ["TP1", "TP2"]
+
+
+async def test_command_protect_position_explicitly_replaces_external_orders(
+    settings, creds, monkeypatch,
+):
+    settings.risk.max_loss_per_order_margin_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = CancellableRepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 100.0,
+            "markPrice": 101.0,
+            "leverage": 2,
+        },
+        open_orders=[
+            {
+                "id": "external-sl", "symbol": "BTC/USDT:USDT",
+                "type": "STOP_MARKET", "side": "sell", "amount": 0.1,
+                "stopPrice": 99.0, "status": "open", "reduceOnly": True,
+                "clientAlgoId": "ios-sl",
+            },
+            {
+                "id": "external-tp", "symbol": "BTC/USDT:USDT",
+                "type": "TAKE_PROFIT_MARKET", "side": "sell", "amount": 0.1,
+                "stopPrice": 104.0, "status": "open", "reduceOnly": True,
+                "clientAlgoId": "ios-tp",
+            },
+        ],
+        equity=1000.0,
+    )
+    payload = {
+        "symbol": "BTCUSDT",
+        "qty": 0.1,
+        "sl_trigger": 99.0,
+        "take_profit_targets": [
+            {"leg_id": "TP1", "trigger_price": 104.0, "position_pct": 1.0},
+        ],
+        "replace_external": True,
+        "confirm": True,
+        "position": {"side": "long", "qty": 0.1, "entry": 100.0},
+    }
+
+    result = await eng._exec_command("PROTECT_POSITION", json.dumps(payload))
+
+    assert "已替换 2 个外部条件单" in result
+    assert {item[1] for item in eng._client.canceled} == {"external-sl", "external-tp"}
+    assert [order["kind"] for order in eng._store.orders] == ["SL", "TP"]
 
 
 async def test_command_close_position_closes_and_cancels_protection_without_disabling(settings, creds, monkeypatch):

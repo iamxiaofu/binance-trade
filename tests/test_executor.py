@@ -10,7 +10,7 @@ from src.config.schema import ExecutionMode
 import time
 
 import ccxt.async_support as ccxt
-from src.execution.executor import Executor, realized_pnl
+from src.execution.executor import Executor, ProtectionOrderSpec, realized_pnl
 from src.llm.schema import Action, TradeDecision
 
 
@@ -188,7 +188,7 @@ async def test_sl_tp_trigger_prices_for_long(settings):
     settings.execution.attach_sl_tp = True
     client = FakeClient()
     ex = Executor(client, settings)
-    out = await ex.place_sl_tp(decision=_decision(), entry_price=100.0, qty=0.05)
+    out = await ex.place_sl_tp(decision=_decision(), entry_price=100.0, qty=0.06)
     kinds = {o["kind"]: o for o in out}
     assert set(kinds) == {"SL", "TP"}
     # long: SL 在下方(98)，TP 在上方(104)，并按 tick=0.1 规整
@@ -204,7 +204,7 @@ async def test_sl_tp_live_records_placed_status(settings):
     settings.execution.attach_sl_tp = True
     client = FakeClient()
     ex = Executor(client, settings)
-    out = await ex.place_sl_tp(decision=_decision(), entry_price=100.0, qty=0.05)
+    out = await ex.place_sl_tp(decision=_decision(), entry_price=100.0, qty=0.06)
     kinds = {o["kind"]: o for o in out}
     assert kinds["SL"]["status"] == "placed"
     assert kinds["TP"]["status"] == "placed"
@@ -254,6 +254,50 @@ async def test_sl_tp_recovers_unknown_create_status(settings):
 
     assert out[0]["status"] == "placed"
     assert out[0]["id"] == "algo-1"
+
+
+async def test_place_multiple_take_profit_legs(settings):
+    client = FakeClient()
+    ex = Executor(client, settings)
+
+    out = await ex.place_protection_orders(
+        symbol="BTCUSDT",
+        pos_side="long",
+        qty=0.1,
+        specs=[
+            ProtectionOrderSpec(
+                "TP", "TAKE_PROFIT_MARKET", 104.0,
+                qty=0.05, leg_id="TP1", position_pct=0.5,
+            ),
+            ProtectionOrderSpec(
+                "TP", "TAKE_PROFIT_MARKET", 108.0,
+                qty=0.05, leg_id="TP2", position_pct=0.5,
+            ),
+        ],
+    )
+
+    assert [row["leg_id"] for row in out] == ["TP1", "TP2"]
+    assert [row["qty"] for row in out] == pytest.approx([0.05, 0.05])
+    assert [row[2] for row in client.created] == pytest.approx([0.05, 0.05])
+    assert client.created[0][4]["clientAlgoId"] != client.created[1][4]["clientAlgoId"]
+
+
+async def test_place_sl_tp_uses_llm_multi_target_plan(settings):
+    client = FakeClient()
+    ex = Executor(client, settings)
+    decision = _decision(
+        take_profit_pct=0.0,
+        take_profit_targets=[
+            {"leg_id": "TP1", "price_distance_pct": 0.04, "position_pct": 0.5},
+            {"leg_id": "TP2", "price_distance_pct": 0.08, "position_pct": 0.5},
+        ],
+    )
+
+    out = await ex.place_sl_tp(decision=decision, entry_price=100.0, qty=0.1)
+    take_profits = [row for row in out if row["kind"] == "TP"]
+
+    assert [row["price"] for row in take_profits] == pytest.approx([104.0, 108.0])
+    assert [row["qty"] for row in take_profits] == pytest.approx([0.05, 0.05])
 
 
 async def test_close_position_calls_exchange(settings):

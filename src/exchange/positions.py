@@ -82,6 +82,7 @@ def normalize_position(
     )
     maintenance_margin = _float(_value(p, info, "maintenanceMargin", "maintMargin"))
     isolated_margin = _float(_value(p, info, "collateral", "isolatedMargin"))
+    isolated_wallet = _float(_value(p, info, "isolatedWallet", "isolated_wallet", "iw"))
     unrealized_pnl = _float(
         _value(p, info, "unrealizedPnl", "unRealizedProfit", "unrealized_pnl")
     )
@@ -107,6 +108,7 @@ def normalize_position(
         "notional": notional,
         "initial_margin": initial_margin,
         "isolated_margin": isolated_margin,
+        "isolated_wallet": isolated_wallet,
         "maintenance_margin": maintenance_margin,
         "roi_pct": roi_pct,
         "liquidation_price": _float(_value(p, info, "liquidationPrice")),

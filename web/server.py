@@ -339,12 +339,64 @@ def _attach_projection_metadata(
             row for row in by_symbol.get(symbol, [])
             if row.get("status") in ("placed", "new", "open", "working", "partial")
         ]
-        sl = next((row for row in related if row.get("kind") == "SL"), None)
-        tp = next((row for row in related if row.get("kind") == "TP"), None)
+        sl_orders = sorted(
+            (row for row in related if row.get("kind") == "SL"),
+            key=lambda row: (float(row.get("trigger_price") or 0), str(row.get("id") or "")),
+        )
+        tp_orders = sorted(
+            (row for row in related if row.get("kind") == "TP"),
+            key=lambda row: (float(row.get("trigger_price") or 0), str(row.get("id") or "")),
+        )
+        qty = abs(float(position.get("contracts") or 0.0))
+        tp_ordered_qty = sum(
+            qty if row.get("close_position") else max(0.0, float(row.get("qty") or 0.0))
+            for row in tp_orders
+        )
+        tp_covered_qty = min(tp_ordered_qty, qty) if qty > 0 else tp_ordered_qty
+        tp_coverage_pct = min(tp_covered_qty / qty, 1.0) if qty > 0 else 0.0
+        origins = {str(row.get("origin") or "EXTERNAL") for row in related}
+        authority = (
+            next(iter(origins)) if len(origins) == 1
+            else "MIXED" if origins
+            else "NONE"
+        )
+        mode = {
+            "ENGINE": "ENGINE",
+            "EXTERNAL": "OBSERVE",
+            "MIXED": "MIXED",
+        }.get(authority, "UNPROTECTED")
+        qty_tol = max(qty * 1e-6, 1e-12)
+        conflicts: list[str] = []
+        if qty > 0 and tp_ordered_qty - qty > qty_tol:
+            conflicts.append("TP_OVER_COVERED")
+        if len(sl_orders) > 1:
+            conflicts.append("MULTIPLE_SL")
+        if not sl_orders:
+            status = "MISSING_SL"
+        elif not tp_orders:
+            status = "MISSING_TP"
+        elif conflicts:
+            status = "CONFLICT"
+        elif qty > 0 and qty - tp_ordered_qty > qty_tol:
+            status = "PARTIAL_TP_COVERAGE"
+        else:
+            status = "COMPLETE"
+        sl = sl_orders[0] if sl_orders else None
+        tp = tp_orders[0] if tp_orders else None
         position["protection_orders"] = related
         position["protection"] = {
             "sl": sl, "tp": tp, "sl_active": sl is not None, "tp_active": tp is not None,
             "missing_sl": sl is None, "missing_tp": tp is None,
+            "sl_orders": sl_orders,
+            "tp_orders": tp_orders,
+            "tp_ordered_qty": tp_ordered_qty,
+            "tp_covered_qty": tp_covered_qty,
+            "tp_coverage_pct": tp_coverage_pct,
+            "runner_qty": max(0.0, qty - tp_covered_qty),
+            "authority": authority,
+            "mode": mode,
+            "status": status,
+            "conflicts": conflicts,
         }
         metadata = local.get(symbol)
         if metadata:

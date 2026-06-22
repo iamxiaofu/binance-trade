@@ -76,9 +76,13 @@ def _decision_actual_protection(db_path: str, row: dict[str, Any]) -> dict[str, 
     symbol = str(row.get("symbol") or "")
     decision_ts = int(row.get("ts_ms") or 0)
     decision_id = int(row.get("id") or 0)
+    try:
+        tp_plan = json.loads(str(row.get("take_profit_plan_json") or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        tp_plan = []
     expected = {
         "sl": float(row.get("stop_loss_pct") or 0.0) > 0,
-        "tp": float(row.get("take_profit_pct") or 0.0) > 0,
+        "tp": float(row.get("take_profit_pct") or 0.0) > 0 or bool(tp_plan),
     }
     if not symbol or decision_ts <= 0:
         return {
@@ -143,10 +147,13 @@ def _decision_actual_protection(db_path: str, row: dict[str, Any]) -> dict[str, 
         )
 
     latest: dict[str, dict[str, Any]] = {}
+    tp_orders: list[dict[str, Any]] = []
     for order in protection_rows:
         kind = str(order.get("client_kind") or "").upper()
         if kind in ("SL", "TP"):
             latest[kind] = order
+        if kind == "TP":
+            tp_orders.append(order)
 
     missing = []
     if expected["sl"] and "SL" not in latest:
@@ -161,6 +168,7 @@ def _decision_actual_protection(db_path: str, row: dict[str, Any]) -> dict[str, 
         "entry": _order_public_fields(entry),
         "sl": _order_public_fields(latest.get("SL")),
         "tp": _order_public_fields(latest.get("TP")),
+        "tp_orders": [_order_public_fields(order) for order in tp_orders],
         "expected": expected,
     }
 

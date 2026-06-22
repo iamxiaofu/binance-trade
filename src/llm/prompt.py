@@ -68,6 +68,11 @@ SYSTEM_PROMPT = """\
     - 同一仓位移动 SL 至少间隔约 15 分钟。
     - 新 SL 必须比旧 SL 有明显改善，至少约 0.4 ATR。
     - 保本/锁利 SL 必须覆盖手续费与滑点缓冲，不能把 SL 刚好放在 entry 附近。
+15. 支持分批止盈：
+    - 单目标可继续使用 take_profit_pct。
+    - 多目标使用 take_profit_targets，最多3档；每档包含 price_distance_pct 和 position_pct。
+    - 使用 take_profit_targets 时 take_profit_pct 必须为0；position_pct 合计不得超过1。
+    - 各档 price_distance_pct 必须从近到远严格递增。
 
 风格：专业、客观、基于证据。有把握的机会要敢于参与，不确定时也不勉强。追求长期正期望，而非频繁交易。
 """
@@ -88,6 +93,7 @@ DEFAULT_USER_PROMPT_TEMPLATE = """\
 风险字段语义与 reason 必填格式:
   - 本周期估算参考开仓价 entry_ref = 最新价 {last_price}；实际成交价可能由执行层按盘口略有偏移。
   - stop_loss_pct / take_profit_pct 是价格距离小数，不是保证金比例，也不是账户权益比例。
+  - 分批止盈使用 take_profit_targets；position_pct 是持仓比例，各档合计不得超过100%。
     OPEN 时基准=entry_ref；ADJUST_SLTP 时基准=当前标记价 mark={mark_price}。
   - 百分比换算公式: pct_percent = pct_decimal × 100。
   - 0.012 必须写为 1.20% 价格距离，不能写成 0.12%；0.02 必须写为 2.00% 价格距离。
@@ -233,10 +239,28 @@ def _position_block(ctx: MarketContext) -> str:
             sltp_desc = f"距上次接受SL调整约{pos.minutes_since_last_sltp_adjust:.2f}分钟"
         else:
             sltp_desc = "上次接受SL调整=无记录"
+        tp_plan = "；".join(
+            (
+                f"{order.leg_id or f'TP{index}'}@{order.trigger_price}"
+                f"×{'全仓' if order.close_position else order.qty}"
+                f"[{order.origin}]"
+            )
+            for index, order in enumerate(pos.tp_orders, start=1)
+        ) or tp_desc
+        sl_plan = "；".join(
+            (
+                f"SL@{order.trigger_price}"
+                f"×{'全仓' if order.close_position else order.qty}"
+                f"[{order.origin}]"
+            )
+            for order in pos.sl_orders
+        ) or sl_desc
         return (
             f"持仓: {pos.side} 数量={pos.size} 开仓价={pos.entry_price} "
             f"未实现盈亏={pos.unrealized_pnl_pct}% 当前杠杆={pos.current_leverage}x  "
-            f"当前保护单: {sl_desc} / {tp_desc}\n"
+            f"当前保护单: {sl_plan} / {tp_plan}\n"
+            f"保护控制权={pos.protection_authority}；TP覆盖={pos.tp_coverage_pct * 100:.2f}%；"
+            f"Runner数量={pos.runner_qty}\n"
             f"持仓时间: {age_desc}（{bars_desc}）；{sltp_desc}；"
             f"当前主动CLOSE连续确认计数={pos.close_confirm_count}"
         )
