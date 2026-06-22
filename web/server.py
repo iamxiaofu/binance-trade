@@ -329,6 +329,50 @@ def _apply_live_balance(summary: dict[str, Any], live_balance: dict[str, Any]) -
     summary["balance"] = balance
 
 
+def _apply_account_risk_metrics(
+    summary: dict[str, Any],
+    *,
+    equity_peak: float = 0.0,
+) -> None:
+    """Attach explicitly named account, position and reserved-margin metrics."""
+    balance = dict(summary.get("balance") or {})
+    positions = list(summary.get("positions") or [])
+    regular_orders = list(summary.get("open_orders") or [])
+    total_equity = max(float(balance.get("total_equity") or 0.0), 0.0)
+    available_margin = max(float(balance.get("available_margin") or 0.0), 0.0)
+    unrealized_pnl = sum(float(row.get("unrealized_pnl") or 0.0) for row in positions)
+    floating_loss = max(-unrealized_pnl, 0.0)
+    position_initial_margin = sum(
+        max(float(row.get("initial_margin") or 0.0), 0.0) for row in positions
+    )
+    unavailable_margin = max(total_equity - available_margin, 0.0)
+    order_reserved_estimate = max(unavailable_margin - position_initial_margin, 0.0)
+    drawdown_pct = max(float(balance.get("drawdown_pct") or 0.0), 0.0)
+    if equity_peak <= 0 and total_equity > 0 and drawdown_pct < 100:
+        equity_peak = total_equity / (1.0 - drawdown_pct / 100.0)
+
+    balance.update({
+        # Backward-compatible drawdown_pct remains the circuit-breaker metric.
+        "account_drawdown_pct": drawdown_pct,
+        "account_equity_peak": max(float(equity_peak or 0.0), 0.0),
+        "position_unrealized_pnl": unrealized_pnl,
+        "position_floating_loss": floating_loss,
+        "position_floating_loss_pct_equity": (
+            floating_loss / total_equity * 100.0 if total_equity > 0 else 0.0
+        ),
+        "position_initial_margin": position_initial_margin,
+        "unavailable_margin": unavailable_margin,
+        "open_order_reserved_margin_estimate": order_reserved_estimate,
+        "regular_open_order_count": len(regular_orders),
+        "external_open_order_count": sum(
+            1 for row in regular_orders
+            if str(row.get("origin") or "EXTERNAL").upper() == "EXTERNAL"
+        ),
+        "drawdown_breaker_basis": "ACCOUNT_EQUITY_HIGH_WATER_MARK",
+    })
+    summary["balance"] = balance
+
+
 def _attach_projection_metadata(
     positions: list[dict[str, Any]], orders: list[dict[str, Any]]
 ) -> None:
@@ -439,6 +483,15 @@ async def _status_summary() -> dict[str, Any]:
         ]
         summary["all_open_orders"] = live_orders
         _attach_projection_metadata(summary["positions"], live_orders)
+        raw_peak = (
+            await store.get_runtime_setting("risk.equity_peak")
+            if hasattr(store, "get_runtime_setting") else None
+        )
+        try:
+            equity_peak = float(raw_peak or 0.0)
+        except (TypeError, ValueError):
+            equity_peak = 0.0
+        _apply_account_risk_metrics(summary, equity_peak=equity_peak)
         summary["open_orders_error"] = ""
         summary["condition_orders_error"] = ""
         summary["open_orders_synced_at_ms"] = max(
@@ -457,6 +510,7 @@ async def _status_summary() -> dict[str, Any]:
         summary["open_orders"] = []
         summary["open_orders_error"] = ""
         summary["open_orders_synced_at_ms"] = None
+        _apply_account_risk_metrics(summary)
     # B5：补 symbol_enabled + 标注「持仓 + 禁用」的孤儿币种，方便前端定位。
     try:
         symbol_enabled = await _effective_symbol_enabled()

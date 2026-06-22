@@ -106,9 +106,63 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
       </el-col>
       <el-col :span="6">
         <el-card class="metric-card" shadow="never">
-          <div class="label">当前回撤</div>
-          <div class="value" :class="Number(bal.drawdown_pct) > 0 ? 'pnl-neg' : ''">
-            {{ fmt(bal.drawdown_pct) }}%
+          <el-tooltip
+            content="账户权益相对历史最高权益的回撤；风控参数“回撤熔断”使用此指标。"
+            placement="top"
+          >
+            <div class="label">账户历史回撤（熔断依据）</div>
+          </el-tooltip>
+          <div class="value" :class="Number(bal.account_drawdown_pct ?? bal.drawdown_pct) > 0 ? 'pnl-neg' : ''">
+            {{ fmt(bal.account_drawdown_pct ?? bal.drawdown_pct) }}%
+          </div>
+          <div class="metric-note">峰值 {{ fmt(bal.account_equity_peak) }} USDT</div>
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="16" style="margin-top:16px">
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <div class="label">当前持仓未实现盈亏</div>
+          <div
+            class="value"
+            :class="Number(bal.position_unrealized_pnl) > 0
+              ? 'pnl-pos'
+              : Number(bal.position_unrealized_pnl) < 0 ? 'pnl-neg' : ''"
+          >
+            {{ Number(bal.position_unrealized_pnl || 0) > 0 ? '+' : '' }}{{ fmt(bal.position_unrealized_pnl) }}
+          </div>
+          <div class="metric-note">无持仓时为 0</div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <el-tooltip content="仅统计当前持仓负的未实现盈亏，占当前账户权益的比例；不参与回撤熔断。" placement="top">
+            <div class="label">当前持仓浮亏占权益</div>
+          </el-tooltip>
+          <div class="value" :class="Number(bal.position_floating_loss_pct_equity) > 0 ? 'pnl-neg' : ''">
+            {{ fmt(bal.position_floating_loss_pct_equity) }}%
+          </div>
+          <div class="metric-note">浮亏 {{ fmt(bal.position_floating_loss) }} USDT</div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <el-tooltip content="账户权益减去 Binance 可用保证金，包含持仓和挂单等保证金占用。" placement="top">
+            <div class="label">不可用保证金</div>
+          </el-tooltip>
+          <div class="value">{{ fmt(bal.unavailable_margin) }}</div>
+          <div class="metric-note">持仓初始保证金 {{ fmt(bal.position_initial_margin) }}</div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <el-tooltip content="不可用保证金扣除持仓初始保证金后的估算值；交易所未提供逐挂单精确占用。" placement="top">
+            <div class="label">挂单预留保证金（估算）</div>
+          </el-tooltip>
+          <div class="value">{{ fmt(bal.open_order_reserved_margin_estimate) }}</div>
+          <div class="metric-note">
+            普通挂单 {{ bal.regular_open_order_count || 0 }} · 外部挂单 {{ bal.external_open_order_count || 0 }}
           </div>
         </el-card>
       </el-col>
@@ -169,3 +223,11 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
     </el-row>
   </div>
 </template>
+
+<style scoped>
+.metric-note {
+  color: var(--bt-muted);
+  font-size: 12px;
+  margin-top: 6px;
+}
+</style>

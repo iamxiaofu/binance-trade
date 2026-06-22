@@ -27,7 +27,7 @@ const riskFields = [
   { key: 'max_loss_per_order_margin_pct', label: '单笔止损占订单保证金上限 (%)', min: 0.01, max: 100, step: 1 },
   { key: 'liq_distance_min_pct', label: '最小爆仓距离 (%)', min: 0, max: 100, step: 1 },
   { key: 'daily_max_loss_pct', label: '日亏熔断 (%)', min: 0.01, max: 100, step: 1 },
-  { key: 'max_drawdown_pct', label: '回撤熔断 (%)', min: 0.01, max: 100, step: 1 },
+  { key: 'max_drawdown_pct', label: '账户历史回撤熔断 (%)', min: 0.01, max: 100, step: 1 },
   { key: 'min_confidence', label: '最小置信度', min: 0, max: 1, step: 0.05 },
 ]
 

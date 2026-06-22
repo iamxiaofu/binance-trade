@@ -177,8 +177,44 @@ def test_apply_live_balance_recomputes_day_equity_from_exchange(monkeypatch):
     assert balance["equity_source"] == "exchange"
 
 
+def test_account_risk_metrics_separate_breaker_position_and_orders():
+    summary = {
+        "balance": {
+            "total_equity": 200.0,
+            "available_margin": 120.0,
+            "drawdown_pct": 10.0,
+        },
+        "positions": [{
+            "symbol": "BTCUSDT",
+            "unrealized_pnl": -5.0,
+            "initial_margin": 30.0,
+        }],
+        "open_orders": [
+            {"origin": "EXTERNAL"},
+            {"origin": "ENGINE"},
+        ],
+    }
+
+    server._apply_account_risk_metrics(summary, equity_peak=222.222222)
+
+    balance = summary["balance"]
+    assert balance["account_drawdown_pct"] == pytest.approx(10.0)
+    assert balance["account_equity_peak"] == pytest.approx(222.222222)
+    assert balance["position_unrealized_pnl"] == pytest.approx(-5.0)
+    assert balance["position_floating_loss"] == pytest.approx(5.0)
+    assert balance["position_floating_loss_pct_equity"] == pytest.approx(2.5)
+    assert balance["unavailable_margin"] == pytest.approx(80.0)
+    assert balance["open_order_reserved_margin_estimate"] == pytest.approx(50.0)
+    assert balance["regular_open_order_count"] == 2
+    assert balance["external_open_order_count"] == 1
+    assert balance["drawdown_breaker_basis"] == "ACCOUNT_EQUITY_HIGH_WATER_MARK"
+
+
 async def test_status_summary_separates_regular_and_condition_orders(monkeypatch):
     class FakeStore:
+        async def get_runtime_setting(self, key):
+            return "250" if key == "risk.equity_peak" else None
+
         async def live_account_state(self):
             return {
                 "balances": [{
@@ -187,7 +223,12 @@ async def test_status_summary_separates_regular_and_condition_orders(monkeypatch
                     "available_balance": 180.0,
                     "updated_at_ms": 1000,
                 }],
-                "positions": [{"symbol": "BTCUSDT", "updated_at_ms": 1000}],
+                "positions": [{
+                    "symbol": "BTCUSDT",
+                    "updated_at_ms": 1000,
+                    "unrealized_pnl": -2.0,
+                    "initial_margin": 10.0,
+                }],
                 "open_orders": [
                     {
                         "symbol": "BTCUSDT",
@@ -223,6 +264,9 @@ async def test_status_summary_separates_regular_and_condition_orders(monkeypatch
     assert [row["id"] for row in summary["open_orders"]] == ["limit-1"]
     assert [row["id"] for row in summary["condition_orders"]] == ["sl-1"]
     assert [row["id"] for row in summary["all_open_orders"]] == ["limit-1", "sl-1"]
+    assert summary["balance"]["account_equity_peak"] == pytest.approx(250.0)
+    assert summary["balance"]["position_floating_loss"] == pytest.approx(2.0)
+    assert summary["balance"]["regular_open_order_count"] == 1
 
 
 def test_projection_metadata_applies_local_trade_fields(monkeypatch):
