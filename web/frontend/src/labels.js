@@ -195,6 +195,9 @@ export function exitReasonLabel(reason) {
     CIRCUIT: '熔断平仓',
     UNKNOWN: '未知退出',
     EXTERNAL: '外部平仓',
+    MANUAL_REDUCE: '手工只减仓',
+    MANUAL_CLOSE: '手工平仓',
+    MIXED_EXIT: '分批混合退出',
   }[reason] || reason || '—'
 }
 

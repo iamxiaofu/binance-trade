@@ -191,6 +191,31 @@ export const api = {
     const query = typeof params === 'number' ? qs({ limit: params }) : qs(params)
     return req(`/api/trades?${query}`, opts)
   },
+  tradeReconcilePreview: (days = 30) =>
+    req('/api/trades/reconcile/preview', {
+      method: 'POST',
+      body: JSON.stringify({ days }),
+    }),
+  tradeReconcileApply: async (preview, days = 30) => {
+    const commandPayload = JSON.stringify({
+      run_id: preview.run_id,
+      preview_hash: preview.preview_hash,
+      days,
+    })
+    const confirmation_token = await mainnetConfirmation(
+      'RECONCILE_BINANCE_TRADES',
+      commandPayload,
+    )
+    return req('/api/trades/reconcile/apply', {
+      method: 'POST',
+      body: JSON.stringify({
+        run_id: preview.run_id,
+        preview_hash: preview.preview_hash,
+        days,
+        confirmation_token,
+      }),
+    })
+  },
   orders: (limit = 100, opts = {}) => req(`/api/orders?limit=${limit}`, opts),
   rejects: (limit = 100, opts = {}) => req(`/api/rejects?limit=${limit}`, opts),
   pnl: (params = {}) => req(`/api/pnl?${qs(params)}`),

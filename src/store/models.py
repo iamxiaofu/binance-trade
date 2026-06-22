@@ -186,6 +186,14 @@ class ExchangeFillRow(Base):
     classification_reason: Mapped[str] = mapped_column(String(240), default="")
     source: Mapped[str] = mapped_column(String(16), default="stream")
     raw_json: Mapped[str] = mapped_column(Text, default="")
+    resolved_ownership: Mapped[str] = mapped_column(String(16), default="", index=True)
+    resolved_client_order_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    resolved_reduce_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolved_order_type: Mapped[str] = mapped_column(String(32), default="")
+    resolved_exit_reason: Mapped[str] = mapped_column(String(32), default="")
+    resolved_algo_id: Mapped[str] = mapped_column(String(64), default="")
+    resolved_metadata_source: Mapped[str] = mapped_column(String(64), default="")
+    reconciled_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
 
 class ExternalTradeRow(Base):
@@ -241,6 +249,81 @@ class ExternalTradeFillRow(Base):
     price: Mapped[float] = mapped_column(Float, default=0.0)
     fee: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class ExchangeReconcileRunRow(Base):
+    """Versioned Binance reconciliation generation and immutable preview."""
+    __tablename__ = "exchange_reconcile_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    applied_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="preview", index=True)
+    scope_start_ms: Mapped[int] = mapped_column(Integer, default=0)
+    scope_end_ms: Mapped[int] = mapped_column(Integer, default=0)
+    preview_hash: Mapped[str] = mapped_column(String(64), default="", unique=True, index=True)
+    local_fill_count: Mapped[int] = mapped_column(Integer, default=0)
+    remote_fill_count: Mapped[int] = mapped_column(Integer, default=0)
+    cycle_count: Mapped[int] = mapped_column(Integer, default=0)
+    ownership_change_count: Mapped[int] = mapped_column(Integer, default=0)
+    metadata_change_count: Mapped[int] = mapped_column(Integer, default=0)
+    summary_json: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
+class BinanceTradeCycleRow(Base):
+    """Canonical account lifecycle generation; only external-involved cycles are shown."""
+    __tablename__ = "binance_trade_cycles"
+    __table_args__ = (UniqueConstraint("run_id", "sequence"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="")
+    ownership: Mapped[str] = mapped_column(String(16), default="external", index=True)
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    opened_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    opened_at: Mapped[str] = mapped_column(String(32), default="")
+    closed_at_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    closed_at: Mapped[str] = mapped_column(String(32), default="")
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    qty_opened: Mapped[float] = mapped_column(Float, default=0.0)
+    qty_closed: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    total_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    gross_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    net_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_liquidity: Mapped[str] = mapped_column(String(12), default="")
+    exit_liquidity: Mapped[str] = mapped_column(String(12), default="")
+    exit_reason: Mapped[str] = mapped_column(String(32), default="")
+    confidence: Mapped[str] = mapped_column(String(16), default="exact")
+    classification_reason: Mapped[str] = mapped_column(String(240), default="")
+
+
+class BinanceTradeCycleFillRow(Base):
+    """Quantity/fee/PnL-conserving allocation of a fill to a canonical lifecycle."""
+    __tablename__ = "binance_trade_cycle_fills"
+    __table_args__ = (
+        UniqueConstraint("cycle_id", "exchange_fill_id", "role"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, index=True)
+    cycle_id: Mapped[int] = mapped_column(Integer, index=True)
+    exchange_fill_id: Mapped[int] = mapped_column(Integer, index=True)
+    role: Mapped[str] = mapped_column(String(24), default="")
+    qty: Mapped[float] = mapped_column(Float, default=0.0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    fee: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    fill_ownership: Mapped[str] = mapped_column(String(16), default="")
+    exit_reason: Mapped[str] = mapped_column(String(32), default="")
 
 
 class PositionClaimRow(Base):

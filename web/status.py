@@ -457,30 +457,62 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
 
     external_items = []
     external_total = 0
-    if include_external and _table_exists(db_path, "external_trades"):
-        external_items = _rows(
-            db_path,
-            f"SELECT * FROM external_trades{where_sql} "
-            "ORDER BY opened_at_ms DESC, id DESC LIMIT ?",
-            tuple(args + [fetch_limit]),
-        )
-        total_rows = _rows(
-            db_path,
-            f"SELECT COUNT(*) AS total FROM external_trades{where_sql}",
-            tuple(args),
-        )
+    active_run_id = _active_binance_trade_run(db_path)
+    canonical_external = bool(
+        active_run_id and _table_exists(db_path, "binance_trade_cycles")
+    )
+    if include_external and (canonical_external or _table_exists(db_path, "external_trades")):
+        if canonical_external:
+            run_clause = "run_id = ?"
+            combined_where = (
+                f" WHERE {run_clause} AND {where_sql[7:]}"
+                if where_sql else f" WHERE {run_clause}"
+            )
+            external_items = _rows(
+                db_path,
+                "SELECT *, gross_realized_pnl AS realized_pnl, "
+                "0 AS leverage, 0.0 AS entry_margin, "
+                "'binance_reconciled' AS source "
+                f"FROM binance_trade_cycles{combined_where} "
+                "ORDER BY opened_at_ms DESC, id DESC LIMIT ?",
+                tuple([active_run_id] + args + [fetch_limit]),
+            )
+            total_rows = _rows(
+                db_path,
+                f"SELECT COUNT(*) AS total FROM binance_trade_cycles{combined_where}",
+                tuple([active_run_id] + args),
+            )
+        else:
+            external_items = _rows(
+                db_path,
+                f"SELECT * FROM external_trades{where_sql} "
+                "ORDER BY opened_at_ms DESC, id DESC LIMIT ?",
+                tuple(args + [fetch_limit]),
+            )
+            total_rows = _rows(
+                db_path,
+                f"SELECT COUNT(*) AS total FROM external_trades{where_sql}",
+                tuple(args),
+            )
         external_total = int(total_rows[0]["total"]) if total_rows else 0
         for item in external_items:
             item.update({
-                "record_key": f"external:{item['id']}",
+                "record_key": (
+                    f"binance:{active_run_id}:{item['id']}"
+                    if canonical_external else f"external:{item['id']}"
+                ),
                 "record_type": "external",
-                "ownership": "external",
                 "source_label": (
                     "Binance 外部/手工交易（窗口前持仓）"
                     if item.get("confidence") == "carry_in"
-                    else "Binance 外部/手工交易"
+                    else (
+                        "Binance 外部/Engine 混合交易"
+                        if item.get("ownership") == "mixed"
+                        else "Binance 外部/手工交易"
+                    )
                 ),
             })
+            item.setdefault("ownership", "external")
 
     items = sorted(
         strategy_items + external_items,
@@ -512,27 +544,53 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
     ]
     if external_ids:
         placeholders = ",".join("?" for _ in external_ids)
-        fill_rows = _rows(
-            db_path,
-            f"""
-            SELECT etf.external_trade_id AS trade_id, ef.ts_ms, ef.created_at,
-                   ef.symbol,
-                   CASE WHEN etf.role IN ('ENTRY', 'REVERSAL_ENTRY') THEN 'OPEN'
-                        ELSE 'CLOSE' END AS client_kind,
-                   ef.side, 'trade' AS order_type, etf.qty,
-                   etf.price, ABS(etf.qty * etf.price) AS notional,
-                   'filled' AS status, ef.exchange_order_id,
-                   etf.role AS trade_role, 0 AS margin,
-                   etf.realized_pnl, '' AS execution_mode,
-                   ef.liquidity, etf.fee, ef.fee_asset,
-                   ef.client_order_id, ef.raw_json
-            FROM external_trade_fills etf
-            JOIN exchange_fills ef ON ef.id = etf.exchange_fill_id
-            WHERE etf.external_trade_id IN ({placeholders})
-            ORDER BY etf.external_trade_id, ef.ts_ms, etf.id
-            """,
-            tuple(external_ids),
-        )
+        if canonical_external:
+            fill_rows = _rows(
+                db_path,
+                f"""
+                SELECT bcf.cycle_id AS trade_id, ef.ts_ms, ef.created_at,
+                       ef.symbol,
+                       CASE WHEN bcf.role IN ('ENTRY', 'REVERSAL_ENTRY') THEN 'OPEN'
+                            ELSE 'CLOSE' END AS client_kind,
+                       ef.side,
+                       COALESCE(NULLIF(ef.resolved_order_type, ''), 'trade') AS order_type,
+                       bcf.qty, bcf.price, ABS(bcf.qty * bcf.price) AS notional,
+                       'filled' AS status, ef.exchange_order_id,
+                       bcf.role AS trade_role, 0 AS margin,
+                       bcf.realized_pnl, '' AS execution_mode,
+                       ef.liquidity, bcf.fee, ef.fee_asset,
+                       COALESCE(NULLIF(ef.resolved_client_order_id, ''), ef.client_order_id)
+                           AS client_order_id,
+                       ef.raw_json, bcf.fill_ownership, bcf.exit_reason
+                FROM binance_trade_cycle_fills bcf
+                JOIN exchange_fills ef ON ef.id = bcf.exchange_fill_id
+                WHERE bcf.run_id = ? AND bcf.cycle_id IN ({placeholders})
+                ORDER BY bcf.cycle_id, ef.ts_ms, bcf.id
+                """,
+                tuple([active_run_id] + external_ids),
+            )
+        else:
+            fill_rows = _rows(
+                db_path,
+                f"""
+                SELECT etf.external_trade_id AS trade_id, ef.ts_ms, ef.created_at,
+                       ef.symbol,
+                       CASE WHEN etf.role IN ('ENTRY', 'REVERSAL_ENTRY') THEN 'OPEN'
+                            ELSE 'CLOSE' END AS client_kind,
+                       ef.side, 'trade' AS order_type, etf.qty,
+                       etf.price, ABS(etf.qty * etf.price) AS notional,
+                       'filled' AS status, ef.exchange_order_id,
+                       etf.role AS trade_role, 0 AS margin,
+                       etf.realized_pnl, '' AS execution_mode,
+                       ef.liquidity, etf.fee, ef.fee_asset,
+                       ef.client_order_id, ef.raw_json
+                FROM external_trade_fills etf
+                JOIN exchange_fills ef ON ef.id = etf.exchange_fill_id
+                WHERE etf.external_trade_id IN ({placeholders})
+                ORDER BY etf.external_trade_id, ef.ts_ms, etf.id
+                """,
+                tuple(external_ids),
+            )
         order_count += len(fill_rows)
         by_external: dict[int, list[dict[str, Any]]] = {}
         for row in fill_rows:
@@ -558,8 +616,10 @@ def search_trades(db_path: str, filters: TradeFilters) -> dict[str, Any]:
     if _table_exists(db_path, "exchange_fills"):
         audit_rows = _rows(
             db_path,
-            "SELECT ownership, COUNT(*) AS total FROM exchange_fills "
-            "WHERE ownership IN ('external', 'mixed', 'unknown') GROUP BY ownership",
+            "SELECT COALESCE(NULLIF(resolved_ownership, ''), ownership) AS ownership, "
+            "COUNT(*) AS total FROM exchange_fills "
+            "WHERE COALESCE(NULLIF(resolved_ownership, ''), ownership) "
+            "IN ('external', 'mixed', 'unknown') GROUP BY 1",
         )
         for row in audit_rows:
             audit[str(row.get("ownership") or "")] = int(row.get("total") or 0)
@@ -588,6 +648,20 @@ def _table_exists(db_path: str, table_name: str) -> bool:
         (table_name,),
     )
     return bool(rows)
+
+
+def _active_binance_trade_run(db_path: str) -> int:
+    if not _table_exists(db_path, "runtime_settings"):
+        return 0
+    rows = _rows(
+        db_path,
+        "SELECT value FROM runtime_settings WHERE key = ? LIMIT 1",
+        ("binance.trade_cycles.active_run_id",),
+    )
+    try:
+        return int(rows[0]["value"]) if rows else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def recent_rejects(db_path: str, limit: int = 50) -> list[dict]:

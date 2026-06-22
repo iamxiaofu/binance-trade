@@ -29,6 +29,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.config.loader import load_config
+from src.exchange.client import ExchangeClient
 from src.exchange.positions import normalize_symbol
 from src.features.indicators import compute_snapshot
 from src.engine.settings import (
@@ -56,6 +57,7 @@ from src.risk.settings import (
     validate_risk_payload,
 )
 from src.store.repo import Store
+from src.reconcile.service import BinanceTradeReconciler, ReconcileError
 from web import status as st
 from web.market_feed import MarketFeedRegistry
 
@@ -83,6 +85,7 @@ _DEFAULT_SOURCE = _SOURCE_ENV if _SOURCE_ENV in ("mainnet", "testnet") else _set
 _store: Store | None = None
 _confirmations: dict[str, dict[str, Any]] = {}
 _MAINNET_CONFIRM_TTL_SECONDS = 120
+_reconcile_lock = asyncio.Lock()
 
 
 def _ws_auth_cookie_value() -> str:
@@ -847,6 +850,14 @@ def _payload_hash(action: str, payload: str) -> str:
     return hashlib.sha256(f"{_settings.mode.value}:{action}:{canonical}".encode()).hexdigest()
 
 
+def _canonical_reconcile_payload(run_id: int, preview_hash: str, days: int) -> str:
+    return json.dumps(
+        {"run_id": int(run_id), "preview_hash": preview_hash, "days": int(days)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _consume_confirmation(token: str, action: str, payload: str) -> None:
     if not _settings.is_mainnet:
         return
@@ -881,6 +892,17 @@ class _ExecutionUpdateRequest(BaseModel):
     confirmation_token: str = ""
 
 
+class _TradeReconcilePreviewRequest(BaseModel):
+    days: int = Field(default=30, ge=1, le=90)
+
+
+class _TradeReconcileApplyRequest(BaseModel):
+    run_id: int = Field(gt=0)
+    preview_hash: str = Field(min_length=64, max_length=64)
+    days: int = Field(default=30, ge=1, le=90)
+    confirmation_token: str = ""
+
+
 @app.post("/api/confirmations")
 async def api_confirmation(
     body: _ConfirmationRequest,
@@ -900,6 +922,67 @@ async def api_confirmation(
         "expires_at": time.time() + _MAINNET_CONFIRM_TTL_SECONDS,
     }
     return {"token": token, "expires_in": _MAINNET_CONFIRM_TTL_SECONDS}
+
+
+async def _run_trade_reconcile_preview(days: int) -> dict[str, Any]:
+    client = ExchangeClient(_settings, _creds)
+    try:
+        reconciler = BinanceTradeReconciler(await _get_store(), client, _DB)
+        result = await reconciler.preview(days=days)
+        result.pop("_resolved_fills", None)
+        return result
+    finally:
+        await client.close()
+
+
+@app.post("/api/trades/reconcile/preview")
+async def api_trade_reconcile_preview(
+    body: _TradeReconcilePreviewRequest,
+    _: str = Depends(_check_auth),
+):
+    if _reconcile_lock.locked():
+        raise HTTPException(status_code=409, detail="已有 Binance 成交核对任务正在运行")
+    async with _reconcile_lock:
+        try:
+            return await _run_trade_reconcile_preview(body.days)
+        except ReconcileError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Binance trade reconcile preview failed")
+            raise HTTPException(status_code=502, detail=f"核对失败：{exc}") from exc
+
+
+@app.post("/api/trades/reconcile/apply")
+async def api_trade_reconcile_apply(
+    body: _TradeReconcileApplyRequest,
+    request: Request,
+    expected_environment: str | None = Header(default=None, alias="X-Trade-Environment"),
+    _: str = Depends(_check_auth),
+):
+    _require_environment(expected_environment)
+    _check_mainnet_origin(request)
+    payload = _canonical_reconcile_payload(body.run_id, body.preview_hash, body.days)
+    _consume_confirmation(
+        body.confirmation_token, "RECONCILE_BINANCE_TRADES", payload
+    )
+    if _reconcile_lock.locked():
+        raise HTTPException(status_code=409, detail="已有 Binance 成交核对任务正在运行")
+    async with _reconcile_lock:
+        client = ExchangeClient(_settings, _creds)
+        try:
+            reconciler = BinanceTradeReconciler(await _get_store(), client, _DB)
+            return await reconciler.apply(
+                run_id=body.run_id,
+                preview_hash=body.preview_hash,
+                days=body.days,
+            )
+        except ReconcileError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Binance trade reconcile apply failed")
+            raise HTTPException(status_code=502, detail=f"修复失败：{exc}") from exc
+        finally:
+            await client.close()
 
 
 @app.post("/api/command/{name}")

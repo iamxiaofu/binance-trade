@@ -32,6 +32,11 @@ const rawLoaded = ref(false)
 const cfg = ref(null)
 const tradeLoading = ref(false)
 const rawLoading = ref(false)
+const reconcileLoading = ref(false)
+const reconcileApplying = ref(false)
+const reconcileDialog = ref(false)
+const reconcileDays = ref(30)
+const reconcilePreview = ref(null)
 const loading = computed(() => tab.value === 'trades' ? tradeLoading.value : rawLoading.value)
 const TRADE_SEARCH_DEBOUNCE_MS = 200
 const RAW_LIST_LIMIT = 100
@@ -71,6 +76,9 @@ const exitReasonOptions = [
   { label: '熔断平仓', value: 'CIRCUIT' },
   { label: '未知退出', value: 'UNKNOWN' },
   { label: '外部平仓', value: 'EXTERNAL' },
+  { label: '手工只减仓', value: 'MANUAL_REDUCE' },
+  { label: '手工平仓', value: 'MANUAL_CLOSE' },
+  { label: '分批混合退出', value: 'MIXED_EXIT' },
 ]
 const sourceOptions = [
   { label: 'Engine 策略交易', value: 'strategy' },
@@ -126,6 +134,36 @@ function fmt(value, digits = 2) {
 
 function pnlClass(value) {
   return Number(value || 0) >= 0 ? 'pnl-pos' : 'pnl-neg'
+}
+
+async function previewReconcile() {
+  reconcileLoading.value = true
+  try {
+    reconcilePreview.value = await api.tradeReconcilePreview(reconcileDays.value)
+    reconcileDialog.value = true
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    reconcileLoading.value = false
+  }
+}
+
+async function applyReconcile() {
+  if (!reconcilePreview.value) return
+  reconcileApplying.value = true
+  try {
+    const result = await api.tradeReconcileApply(
+      reconcilePreview.value,
+      reconcileDays.value,
+    )
+    reconcileDialog.value = false
+    ElMessage.success(`核对修复完成，已启用版本 #${result.run_id}`)
+    await loadTrades()
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    reconcileApplying.value = false
+  }
 }
 
 async function loadTrades(options = {}) {
@@ -244,7 +282,30 @@ onUnmounted(() => {
             <el-radio-button value="orders">订单流水{{ rawLoaded ? `（${orders.length}）` : '' }}</el-radio-button>
             <el-radio-button value="rejects">风控拒单{{ rawLoaded ? `（${rejects.length}）` : '' }}</el-radio-button>
           </el-radio-group>
-          <el-button size="small" :loading="loading" :icon="'Refresh'" @click="load">刷新</el-button>
+          <div style="display:flex; gap:8px">
+            <el-select
+              v-if="tab === 'trades'"
+              v-model="reconcileDays"
+              size="small"
+              style="width:92px"
+              aria-label="核对范围"
+            >
+              <el-option label="近 30 天" :value="30" />
+              <el-option label="近 60 天" :value="60" />
+              <el-option label="近 90 天" :value="90" />
+            </el-select>
+            <el-button
+              v-if="tab === 'trades'"
+              size="small"
+              type="warning"
+              plain
+              :loading="reconcileLoading"
+              @click="previewReconcile"
+            >
+              一键核对修复
+            </el-button>
+            <el-button size="small" :loading="loading" :icon="'Refresh'" @click="load">刷新</el-button>
+          </div>
         </div>
       </template>
 
@@ -384,7 +445,9 @@ onUnmounted(() => {
             <template #default="{ row }">
               <el-tooltip
                 :content="row.record_type === 'external'
-                  ? '该记录来自 Binance 外部成交，仅同步归档，Engine 未接管止盈止损或主动平仓。'
+                  ? (row.ownership === 'mixed'
+                    ? '该交易周期同时包含外部/手工成交与 Engine 成交；每笔成交归属已单独核验。'
+                    : '该交易周期由 Binance 外部/手工订单形成，仅同步归档。')
                   : '该记录由 Engine 策略创建并管理。'"
                 placement="top"
               >
@@ -533,6 +596,79 @@ onUnmounted(() => {
         <el-table-column prop="reason" label="原因" min-width="260" show-overflow-tooltip />
       </el-table>
     </el-card>
+
+    <el-dialog
+      v-model="reconcileDialog"
+      title="Binance 成交核对修复预览"
+      width="760px"
+      destroy-on-close
+    >
+      <template v-if="reconcilePreview">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          title="应用前会再次拉取 Binance 数据、校验预览哈希并自动备份数据库；任何成交或持仓变化都会拒绝应用。"
+          style="margin-bottom:16px"
+        />
+        <el-descriptions :column="3" border>
+          <el-descriptions-item label="核对范围">
+            {{ reconcilePreview.summary.scope.days }} 天
+          </el-descriptions-item>
+          <el-descriptions-item label="Binance / 本地成交">
+            {{ reconcilePreview.summary.fills.remote }} / {{ reconcilePreview.summary.fills.local }}
+          </el-descriptions-item>
+          <el-descriptions-item label="未解决归属">
+            {{ reconcilePreview.summary.fills.unresolved }}
+          </el-descriptions-item>
+          <el-descriptions-item label="归属修正">
+            {{ reconcilePreview.summary.fills.ownership_changes }}
+          </el-descriptions-item>
+          <el-descriptions-item label="周期数（修复前 / 后）">
+            {{ reconcilePreview.summary.cycles.before }} / {{ reconcilePreview.summary.cycles.after }}
+          </el-descriptions-item>
+          <el-descriptions-item label="外部 / 混合周期">
+            {{ reconcilePreview.summary.cycles.external }} / {{ reconcilePreview.summary.cycles.mixed }}
+          </el-descriptions-item>
+          <el-descriptions-item label="持仓中 / 部分平仓 / 已平仓">
+            {{ reconcilePreview.summary.cycles.open }} /
+            {{ reconcilePreview.summary.cycles.partial }} /
+            {{ reconcilePreview.summary.cycles.closed }}
+          </el-descriptions-item>
+          <el-descriptions-item label="版本">
+            #{{ reconcilePreview.run_id }}
+          </el-descriptions-item>
+          <el-descriptions-item label="校验">
+            <el-tag type="success">全部通过</el-tag>
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <el-table
+          v-if="reconcilePreview.summary.ownership_changes.length"
+          :data="reconcilePreview.summary.ownership_changes"
+          size="small"
+          stripe
+          max-height="260"
+          style="margin-top:16px"
+        >
+          <el-table-column prop="symbol" label="币种" width="100" />
+          <el-table-column prop="trade_id" label="成交 ID" min-width="150" />
+          <el-table-column prop="before" label="原归属" width="100" />
+          <el-table-column prop="after" label="修正归属" width="100" />
+        </el-table>
+      </template>
+      <template #footer>
+        <el-button @click="reconcileDialog = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="reconcileApplying"
+          :disabled="!reconcilePreview?.safe_to_apply"
+          @click="applyReconcile"
+        >
+          备份并应用修复
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

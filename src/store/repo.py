@@ -44,6 +44,9 @@ from src.store.models import (
     ExchangeFillRow,
     ExternalTradeRow,
     ExternalTradeFillRow,
+    ExchangeReconcileRunRow,
+    BinanceTradeCycleRow,
+    BinanceTradeCycleFillRow,
     LiveBalanceRow,
     LLMPromptVersionRow,
     LivePositionRow,
@@ -131,6 +134,16 @@ _LIVE_ORDER_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("close_position", "BOOLEAN NOT NULL DEFAULT 0"),
     ("origin", "VARCHAR(16) NOT NULL DEFAULT 'EXTERNAL'"),
 )
+_EXCHANGE_FILL_RECONCILE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("resolved_ownership", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("resolved_client_order_id", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("resolved_reduce_only", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("resolved_order_type", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("resolved_exit_reason", "VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("resolved_algo_id", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("resolved_metadata_source", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("reconciled_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+)
 _LLM_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("api_key", "TEXT NOT NULL DEFAULT ''"),
     ("priority", "INTEGER NOT NULL DEFAULT 100"),
@@ -159,9 +172,13 @@ _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_orders_trade_ts_id ON orders(trade_id, ts_ms ASC, id ASC)",
     "CREATE INDEX IF NOT EXISTS ix_exchange_fills_ts_id ON exchange_fills(ts_ms ASC, id ASC)",
     "CREATE INDEX IF NOT EXISTS ix_exchange_fills_ownership_ts ON exchange_fills(ownership, ts_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_exchange_fills_resolved_ownership_ts ON exchange_fills(resolved_ownership, ts_ms DESC)",
     "CREATE INDEX IF NOT EXISTS ix_external_trades_opened_id ON external_trades(opened_at_ms DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS ix_external_trades_symbol_status ON external_trades(symbol, status)",
     "CREATE INDEX IF NOT EXISTS ix_external_trade_fills_trade ON external_trade_fills(external_trade_id, id)",
+    "CREATE INDEX IF NOT EXISTS ix_reconcile_runs_status_created ON exchange_reconcile_runs(status, created_at_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_binance_trade_cycles_run_opened ON binance_trade_cycles(run_id, opened_at_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_binance_cycle_fills_cycle ON binance_trade_cycle_fills(cycle_id, id)",
     "CREATE INDEX IF NOT EXISTS ix_llm_prompt_versions_version ON llm_prompt_versions(version DESC)",
 )
 
@@ -456,6 +473,13 @@ class Store:
         for name, ddl in _LIVE_ORDER_EXTENSION_COLUMNS:
             if live_order_existing and name not in live_order_existing:
                 await conn.execute(text(f"ALTER TABLE live_orders ADD COLUMN {name} {ddl}"))
+        exchange_fill_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(exchange_fills)"))).fetchall()
+        }
+        for name, ddl in _EXCHANGE_FILL_RECONCILE_COLUMNS:
+            if exchange_fill_existing and name not in exchange_fill_existing:
+                await conn.execute(text(f"ALTER TABLE exchange_fills ADD COLUMN {name} {ddl}"))
         for ddl in _SQLITE_INDEX_DDL:
             await conn.execute(text(ddl))
 

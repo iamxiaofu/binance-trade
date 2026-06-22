@@ -121,6 +121,75 @@ async def test_status_summary_limits_recent_decisions(db):
     assert len(summary["recent_decisions"]) == 5
 
 
+async def test_trade_search_prefers_active_reconciled_generation(db):
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT INTO exchange_reconcile_runs "
+            "(id, created_at_ms, created_at, applied_at_ms, status, scope_start_ms, "
+            "scope_end_ms, preview_hash, local_fill_count, remote_fill_count, "
+            "cycle_count, ownership_change_count, metadata_change_count, summary_json, error) "
+            "VALUES (1, 1, '', 1, 'applied', 0, 1, ?, 1, 1, 1, 0, 0, '{}', '')",
+            ("a" * 64,),
+        )
+        con.execute(
+            "INSERT INTO runtime_settings (key, value, updated_at) VALUES (?, ?, '')",
+            ("binance.trade_cycles.active_run_id", "1"),
+        )
+        con.execute(
+            """
+            INSERT INTO binance_trade_cycles
+            (id, run_id, sequence, symbol, direction, ownership, status,
+             opened_at_ms, opened_at, closed_at_ms, closed_at,
+             entry_price, exit_price, qty_opened, qty_closed,
+             entry_notional, exit_notional, entry_fee, exit_fee, total_fee,
+             gross_realized_pnl, net_realized_pnl, entry_liquidity, exit_liquidity,
+             exit_reason, confidence, classification_reason)
+            VALUES
+            (10, 1, 1, 'SOLUSDT', 'short', 'mixed', 'closed',
+             1000, '', 2000, '', 72, 71, 2, 2, 144, 142, 0.1, 0.1, 0.2,
+             2, 1.8, 'taker', 'taker', 'TP', 'exact', 'mixed lifecycle')
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO exchange_fills
+            (id, ts_ms, created_at, symbol, exchange_trade_id, exchange_order_id,
+             client_order_id, side, qty, price, notional, fee, fee_asset,
+             realized_pnl, liquidity, reduce_only, ownership,
+             classification_reason, source, raw_json,
+             resolved_ownership, resolved_client_order_id, resolved_reduce_only,
+             resolved_order_type, resolved_exit_reason, resolved_algo_id,
+             resolved_metadata_source, reconciled_at_ms)
+            VALUES
+            (50, 1000, '', 'SOLUSDT', '50', '500', '', 'sell', 2, 72, 144,
+             0.1, 'USDT', 0, 'taker', 0, 'external', '', 'rest', '{}',
+             'external', 'manual', 0, 'MARKET', 'MANUAL_CLOSE', '', 'order', 1)
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO binance_trade_cycle_fills
+            (run_id, cycle_id, exchange_fill_id, role, qty, price, fee,
+             realized_pnl, fill_ownership, exit_reason)
+            VALUES (1, 10, 50, 'ENTRY', 2, 72, 0.1, 0, 'external', '')
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    result = status.search_trades(
+        db, status.TradeFilters(sources=["external"], limit=20)
+    )
+
+    assert result["total"] == 1
+    assert result["items"][0]["record_key"] == "binance:1:10"
+    assert result["items"][0]["ownership"] == "mixed"
+    assert result["items"][0]["realized_pnl"] == 2
+    assert result["items"][0]["orders"][0]["fill_ownership"] == "external"
+
+
 async def test_decision_detail_includes_llm_trace_and_data_items(db):
     detail = status.decision_detail(db, 3)
     assert detail is not None
