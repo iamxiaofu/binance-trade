@@ -83,6 +83,10 @@ _EXCHANGE_FLAT_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0, 5.0)
 _EXCHANGE_FLAT_MIN_OPEN_AGE_MS = 60_000
 _POST_CLOSE_RECONCILE_GRACE_SECONDS = 30.0
 _UNMANAGED_LIVE_CONFIRM_DELAYS_SECONDS = (0.5, 1.5, 3.0)
+_RISK_DAY_KEY = "risk.drawdown.day_key"
+_RISK_DAY_EQUITY_PEAK_KEY = "risk.drawdown.day_equity_peak"
+_RISK_DRAWDOWN_BYPASS_DAY_KEY = "risk.drawdown.bypass_day"
+_RISK_DRAWDOWN_BYPASS_AT_MS_KEY = "risk.drawdown.bypass_at_ms"
 
 
 class ProtectionRepairError(ValueError):
@@ -709,14 +713,36 @@ class TradingEngine:
             return "strategy paused (persisted)"
         if name == "RESUME":
             self._assert_stream_ready_for_entries()
+            previous_reason = str(
+                await self._store.get_runtime_setting("strategy.pause.reason_code") or ""
+            )
+            bypass_drawdown = (
+                previous_reason == "MAX_DRAWDOWN"
+                or self.runtime.risk_day_drawdown_pct
+                >= self._settings.risk.max_drawdown_pct
+            )
+            bypass_day = ""
+            if bypass_drawdown:
+                bypass_day = self.runtime.grant_drawdown_bypass()
             self.runtime.resume_entries()
-            await self._store.set_runtime_settings({
+            settings = {
                 "strategy.paused": "false",
                 "strategy.pause.reason_code": "",
                 "strategy.pause.reason": "",
                 "strategy.pause.source": "",
                 "strategy.pause.at_ms": "",
-            })
+            }
+            if bypass_drawdown:
+                settings.update({
+                    _RISK_DRAWDOWN_BYPASS_DAY_KEY: bypass_day,
+                    _RISK_DRAWDOWN_BYPASS_AT_MS_KEY: str(int(time.time() * 1000)),
+                })
+            await self._store.set_runtime_settings(settings)
+            if bypass_drawdown:
+                return (
+                    f"strategy resumed; daily drawdown breaker bypassed for {bypass_day}; "
+                    "daily loss and other safety guards remain active"
+                )
             return "strategy resumed (persisted)"
         if name == "UPDATE_RISK_SETTINGS":
             return await self._update_risk_settings(arg)
@@ -765,10 +791,25 @@ class TradingEngine:
         raw_execution = await self._store.get_runtime_setting(RUNTIME_EXECUTION_KEY)
         raw_execution_version = await self._store.get_runtime_setting(RUNTIME_EXECUTION_VERSION_KEY)
         raw_equity_peak = await self._store.get_runtime_setting("risk.equity_peak")
+        raw_risk_day_key = await self._store.get_runtime_setting(_RISK_DAY_KEY)
+        raw_risk_day_peak = await self._store.get_runtime_setting(_RISK_DAY_EQUITY_PEAK_KEY)
+        raw_drawdown_bypass_day = await self._store.get_runtime_setting(
+            _RISK_DRAWDOWN_BYPASS_DAY_KEY
+        )
         try:
             self.runtime.equity_peak = max(float(raw_equity_peak or 0.0), 0.0)
         except (TypeError, ValueError):
             self.runtime.halt_entries("invalid persisted equity peak")
+        try:
+            risk_day_peak = max(float(raw_risk_day_peak or 0.0), 0.0)
+        except (TypeError, ValueError):
+            risk_day_peak = 0.0
+            self.runtime.halt_entries("invalid persisted daily equity peak")
+        self.runtime.restore_daily_risk(
+            day_key=str(raw_risk_day_key or ""),
+            equity_peak=risk_day_peak,
+            bypass_day=str(raw_drawdown_bypass_day or ""),
+        )
         try:
             self._settings.risk = decode_risk(raw_risk, self._risk_defaults)
             self._risk_version = int(raw_version or 0)
@@ -1072,6 +1113,15 @@ class TradingEngine:
         """Resume strategy and enable every configured symbol after a strict live precheck."""
         self._assert_stream_ready_for_entries()
         await self._assert_exchange_clear_for_resume_all()
+        previous_reason = str(
+            await self._store.get_runtime_setting("strategy.pause.reason_code") or ""
+        )
+        bypass_drawdown = (
+            previous_reason == "MAX_DRAWDOWN"
+            or self.runtime.risk_day_drawdown_pct
+            >= self._settings.risk.max_drawdown_pct
+        )
+        bypass_day = self.runtime.grant_drawdown_bypass() if bypass_drawdown else ""
         rows = await self._store.list_symbols()
         eligible = [
             normalize_symbol(row["symbol"])
@@ -1089,6 +1139,11 @@ class TradingEngine:
             self._symbol_enabled_key(symbol): "true"
             for symbol in eligible
         })
+        if bypass_drawdown:
+            values.update({
+                _RISK_DRAWDOWN_BYPASS_DAY_KEY: bypass_day,
+                _RISK_DRAWDOWN_BYPASS_AT_MS_KEY: str(int(time.time() * 1000)),
+            })
         await self._store.set_runtime_settings(values)
         for symbol in eligible:
             await self._store.set_symbol_enabled(symbol, True)
@@ -1100,6 +1155,10 @@ class TradingEngine:
         return (
             f"strategy resumed; enabled all symbols: {symbols}; "
             "precheck passed (no live positions/open orders/condition orders)"
+            + (
+                f"; daily drawdown breaker bypassed for {bypass_day}"
+                if bypass_drawdown else ""
+            )
         )
 
     def _assert_stream_ready_for_entries(self) -> None:
@@ -2725,8 +2784,14 @@ class TradingEngine:
         if daily_max_loss > 0 and rt.day_realized_pnl <= -abs(daily_max_loss):
             breached = (f"daily loss {rt.day_realized_pnl:.2f} <= -{daily_max_loss:.2f} "
                         f"({risk.daily_max_loss_pct}% of {base:.2f})")
-        elif rt.drawdown_pct >= risk.max_drawdown_pct:
-            breached = f"drawdown {rt.drawdown_pct:.2f}% >= {risk.max_drawdown_pct}%"
+        elif (
+            not rt.drawdown_bypass_active()
+            and rt.risk_day_drawdown_pct >= risk.max_drawdown_pct
+        ):
+            breached = (
+                f"daily drawdown {rt.risk_day_drawdown_pct:.2f}% "
+                f">= {risk.max_drawdown_pct}%"
+            )
         if breached and (
             not rt.halt_new_entries
             or not rt.halt_new_entries_reason.startswith("circuit breaker")
@@ -4339,9 +4404,15 @@ class TradingEngine:
             )
             return
         self.runtime.update_equity(total)
-        await self._store.set_runtime_setting(
-            "risk.equity_peak", str(self.runtime.equity_peak)
-        )
+        await self._store.set_runtime_settings({
+            "risk.equity_peak": str(self.runtime.equity_peak),
+            _RISK_DAY_KEY: self.runtime.risk_day_key,
+            _RISK_DAY_EQUITY_PEAK_KEY: str(self.runtime.risk_day_equity_peak),
+            _RISK_DRAWDOWN_BYPASS_DAY_KEY: (
+                self.runtime.drawdown_bypass_day
+                if self.runtime.drawdown_bypass_active() else ""
+            ),
+        })
         await self._store.snapshot_balance(
             total_equity=total,
             available_margin=free,

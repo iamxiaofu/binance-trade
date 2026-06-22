@@ -52,7 +52,7 @@ risk:
   max_symbol_margin_pct: 0.4       # 单标的累计占用保证金 = 权益 × 40%
   max_total_margin_pct: 0.8        # testnet 默认全账户累计占用保证金 = 权益 × 80%
   max_loss_per_order_margin_pct: 30 # 止损理论亏损 <= 本订单保证金 × 30%
-  max_drawdown_pct: 20             # 账户最大回撤熔断阈值(%) → 平仓+停开新仓
+  max_drawdown_pct: 20             # 当日权益峰值回撤熔断阈值(%) → 平仓+停开新仓
   daily_max_loss_pct: 10           # testnet 默认每日最大亏损 = 权益 × 10%
   liq_distance_min_pct: 5          # 开仓前估算强平价，距现价 < 5% → 拒单
   min_confidence: 0.6              # LLM confidence 低于此值视为 HOLD

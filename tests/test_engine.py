@@ -671,7 +671,7 @@ async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch)
 
 async def test_circuit_breaker_trips_on_drawdown(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
-    eng.runtime.drawdown_pct = settings.risk.max_drawdown_pct + 1
+    eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
     assert await eng._check_circuit_breaker() is True
     assert eng._executor.flattened == 1
 
@@ -684,7 +684,7 @@ async def test_circuit_breaker_trips_on_drawdown(settings, creds, monkeypatch):
 async def test_no_breaker_under_limits(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng.runtime.day_realized_pnl = -1.0
-    eng.runtime.drawdown_pct = 1.0
+    eng.runtime.risk_day_drawdown_pct = 1.0
     assert await eng._check_circuit_breaker() is False
     assert eng._executor.flattened == 0
 
@@ -758,6 +758,24 @@ async def test_runtime_execution_settings_applied_on_startup(settings, creds, mo
     assert eng._settings.execution.maker_timeout_seconds == pytest.approx(9)
     assert eng._execution_version == 4
     assert eng._executor.execution_config is eng._settings.execution
+
+
+async def test_daily_drawdown_cycle_and_bypass_restore_on_startup(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    eng._store.runtime_settings.update({
+        "risk.drawdown.day_key": today,
+        "risk.drawdown.day_equity_peak": "250.5",
+        "risk.drawdown.bypass_day": today,
+    })
+
+    await eng._apply_runtime_settings()
+
+    assert eng.runtime.risk_day_key == today
+    assert eng.runtime.risk_day_equity_peak == pytest.approx(250.5)
+    assert eng.runtime.drawdown_bypass_active() is True
 
 
 async def test_mainnet_runtime_settings_force_restart_pause(settings, creds, monkeypatch):
@@ -1788,6 +1806,30 @@ async def test_resume_command_clears_pause_meta(settings, creds, monkeypatch):
     assert eng._store.runtime_settings["strategy.pause.reason"] == ""
     assert eng._store.runtime_settings["strategy.pause.source"] == ""
     assert eng.runtime.halt_new_entries is False
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    assert eng.runtime.drawdown_bypass_day == today
+    assert eng._store.runtime_settings["risk.drawdown.bypass_day"] == today
+    assert "daily drawdown breaker bypassed" in eng._store.marked[-1][2]
+
+
+async def test_manual_drawdown_resume_bypasses_only_drawdown_until_day_end(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.update_equity(200.0)
+    eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
+    eng._store.runtime_settings["strategy.pause.reason_code"] = "MAX_DRAWDOWN"
+    eng._store.pending = [{"id": 1, "command": "RESUME", "arg": ""}]
+
+    await eng._process_commands()
+
+    assert eng.runtime.drawdown_bypass_active() is True
+    assert await eng._check_circuit_breaker() is False
+    eng.runtime.day_realized_pnl = -(
+        eng.runtime.current_equity * settings.risk.daily_max_loss_pct / 100.0
+    ) - 1
+    assert await eng._check_circuit_breaker() is True
+    assert eng._store.runtime_settings["strategy.pause.reason_code"] == "DAILY_LOSS"
 
 
 async def test_runtime_strategy_paused_applied_on_startup(settings, creds, monkeypatch):

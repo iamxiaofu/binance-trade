@@ -99,6 +99,13 @@ const strategyPauseTooltip = computed(() =>
     strategyPause.value.source,
   ].filter(Boolean).join(' | ')
 )
+const riskBalance = computed(() => live.summary?.balance || {})
+const drawdownBypassActive = computed(() => Boolean(riskBalance.value.drawdown_bypass_active))
+const drawdownResumeRequired = computed(() =>
+  strategyPauseReasonCode.value === 'MAX_DRAWDOWN'
+  || Number(riskBalance.value.risk_day_drawdown_pct || 0)
+    >= Number(cfg.value?.risk?.max_drawdown_pct || Infinity)
+)
 const streamState = computed(() => cfg.value?.user_stream || live.summary?.stream || {})
 const streamTagType = computed(() => ({
   LIVE: 'success',
@@ -265,9 +272,12 @@ async function reviewSymbol(symbol) {
 
 async function resumeAllSymbols() {
   const symbols = configuredSymbols.value.join(', ') || '全部配置币种'
+  const drawdownNote = drawdownResumeRequired.value && !drawdownBypassActive.value
+    ? ' 若当前处于当日回撤熔断，本次确认还会豁免今天剩余时间的回撤熔断；当日亏损和其他安全检查仍有效。'
+    : ''
   try {
     await ElMessageBox.confirm(
-      `将恢复全局策略并启用全部币种：${symbols}。交易进程会先检查交易所无持仓、无普通挂单、无条件单；检查失败则不会开启。`,
+      `将恢复全局策略并启用全部币种：${symbols}。交易进程会先检查交易所无持仓、无普通挂单、无条件单；检查失败则不会开启。${drawdownNote}`,
       '确认开启全部币种策略',
       {
         confirmButtonText: '确认开启',
@@ -278,6 +288,23 @@ async function resumeAllSymbols() {
     )
   } catch (_) { return }
   await send('RESUME_ALL_SYMBOLS')
+}
+
+async function resumeStrategy() {
+  if (drawdownResumeRequired.value && !drawdownBypassActive.value) {
+    try {
+      await ElMessageBox.confirm(
+        '本次恢复将人工豁免今天剩余时间的“当日回撤熔断”。当日亏损熔断、私有流和其他安全检查仍然有效；次日自动恢复回撤保护。',
+        '确认人工恢复交易',
+        {
+          confirmButtonText: '确认恢复并豁免今日回撤',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
+      )
+    } catch (_) { return }
+  }
+  await send('RESUME')
 }
 
 onMounted(() => {
@@ -310,6 +337,15 @@ watch(
     <el-alert type="warning" :closable="false" show-icon style="margin-bottom:16px"
       title="操作说明"
       description="所有命令写入命令队列，由交易主进程快速消费执行。Web 不直接操作交易所。" />
+    <el-alert
+      v-if="drawdownBypassActive"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom:16px"
+      :title="`今日已人工豁免回撤熔断（${riskBalance.drawdown_bypass_day}）`"
+      description="豁免仅持续到本地自然日结束；当日亏损熔断及其他安全检查仍然有效。"
+    />
 
     <el-row :gutter="16">
       <el-col :span="12">
@@ -331,7 +367,7 @@ watch(
                 暂停策略
               </el-button>
               <el-button type="success" :loading="loading" :disabled="!strategyPaused" style="flex:1"
-                         :icon="'VideoPlay'" @click="send('RESUME')">
+                         :icon="'VideoPlay'" @click="resumeStrategy">
                 恢复策略
               </el-button>
             </div>

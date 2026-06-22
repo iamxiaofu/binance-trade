@@ -333,6 +333,9 @@ def _apply_account_risk_metrics(
     summary: dict[str, Any],
     *,
     equity_peak: float = 0.0,
+    risk_day_key: str = "",
+    risk_day_equity_peak: float = 0.0,
+    drawdown_bypass_day: str = "",
 ) -> None:
     """Attach explicitly named account, position and reserved-margin metrics."""
     balance = dict(summary.get("balance") or {})
@@ -350,6 +353,18 @@ def _apply_account_risk_metrics(
     drawdown_pct = max(float(balance.get("drawdown_pct") or 0.0), 0.0)
     if equity_peak <= 0 and total_equity > 0 and drawdown_pct < 100:
         equity_peak = total_equity / (1.0 - drawdown_pct / 100.0)
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    if risk_day_key != today:
+        risk_day_key = today
+        risk_day_equity_peak = total_equity
+    risk_day_equity_peak = max(float(risk_day_equity_peak or 0.0), total_equity)
+    risk_day_drawdown_pct = (
+        max(0.0, (risk_day_equity_peak - total_equity) / risk_day_equity_peak * 100.0)
+        if risk_day_equity_peak > 0 else 0.0
+    )
+    drawdown_bypass_active = bool(
+        drawdown_bypass_day and drawdown_bypass_day == today
+    )
 
     balance.update({
         # Backward-compatible drawdown_pct remains the circuit-breaker metric.
@@ -368,7 +383,13 @@ def _apply_account_risk_metrics(
             1 for row in regular_orders
             if str(row.get("origin") or "EXTERNAL").upper() == "EXTERNAL"
         ),
-        "drawdown_breaker_basis": "ACCOUNT_EQUITY_HIGH_WATER_MARK",
+        "risk_period": "CALENDAR_DAY",
+        "risk_day_key": risk_day_key,
+        "risk_day_equity_peak": risk_day_equity_peak,
+        "risk_day_drawdown_pct": risk_day_drawdown_pct,
+        "drawdown_bypass_day": drawdown_bypass_day if drawdown_bypass_active else "",
+        "drawdown_bypass_active": drawdown_bypass_active,
+        "drawdown_breaker_basis": "DAILY_EQUITY_HIGH_WATER_MARK",
     })
     summary["balance"] = balance
 
@@ -483,15 +504,38 @@ async def _status_summary() -> dict[str, Any]:
         ]
         summary["all_open_orders"] = live_orders
         _attach_projection_metadata(summary["positions"], live_orders)
-        raw_peak = (
-            await store.get_runtime_setting("risk.equity_peak")
-            if hasattr(store, "get_runtime_setting") else None
-        )
+        if hasattr(store, "runtime_settings"):
+            runtime_settings = await store.runtime_settings()
+        elif hasattr(store, "get_runtime_setting"):
+            keys = (
+                "risk.equity_peak",
+                "risk.drawdown.day_key",
+                "risk.drawdown.day_equity_peak",
+                "risk.drawdown.bypass_day",
+            )
+            runtime_settings = {
+                key: await store.get_runtime_setting(key) for key in keys
+            }
+        else:
+            runtime_settings = {}
+        raw_peak = runtime_settings.get("risk.equity_peak")
         try:
             equity_peak = float(raw_peak or 0.0)
         except (TypeError, ValueError):
             equity_peak = 0.0
-        _apply_account_risk_metrics(summary, equity_peak=equity_peak)
+        try:
+            risk_day_equity_peak = float(
+                runtime_settings.get("risk.drawdown.day_equity_peak") or 0.0
+            )
+        except (TypeError, ValueError):
+            risk_day_equity_peak = 0.0
+        _apply_account_risk_metrics(
+            summary,
+            equity_peak=equity_peak,
+            risk_day_key=runtime_settings.get("risk.drawdown.day_key", ""),
+            risk_day_equity_peak=risk_day_equity_peak,
+            drawdown_bypass_day=runtime_settings.get("risk.drawdown.bypass_day", ""),
+        )
         summary["open_orders_error"] = ""
         summary["condition_orders_error"] = ""
         summary["open_orders_synced_at_ms"] = max(

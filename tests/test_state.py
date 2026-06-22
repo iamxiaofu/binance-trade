@@ -44,15 +44,49 @@ def test_day_roll_noop_same_day():
 
 def test_equity_peak_and_drawdown():
     rt = RuntimeState()
-    rt.update_equity(1000.0)
+    rt.update_equity(1000.0, now=0)
     assert rt.equity_peak == 1000.0
     assert rt.drawdown_pct == 0.0
-    rt.update_equity(900.0)
+    assert rt.risk_day_equity_peak == 1000.0
+    assert rt.risk_day_drawdown_pct == 0.0
+    rt.update_equity(900.0, now=0)
     assert rt.equity_peak == 1000.0
     assert abs(rt.drawdown_pct - 10.0) < 1e-9
-    rt.update_equity(1100.0)  # 新高
+    assert abs(rt.risk_day_drawdown_pct - 10.0) < 1e-9
+    rt.update_equity(1100.0, now=0)  # 新高
     assert rt.equity_peak == 1100.0
     assert rt.drawdown_pct == 0.0
+    assert rt.risk_day_equity_peak == 1100.0
+    assert rt.risk_day_drawdown_pct == 0.0
+
+
+def test_daily_drawdown_resets_and_bypass_expires_next_day():
+    rt = RuntimeState()
+    rt.update_equity(100.0, now=0)
+    rt.update_equity(80.0, now=0)
+    assert rt.risk_day_drawdown_pct == 20.0
+    assert rt.grant_drawdown_bypass(now=0) == "1970-01-01"
+    assert rt.drawdown_bypass_active(now=0) is True
+
+    rt.update_equity(79.0, now=86400)
+
+    assert rt.risk_day_key == "1970-01-02"
+    assert rt.risk_day_equity_peak == 79.0
+    assert rt.risk_day_drawdown_pct == 0.0
+    assert rt.drawdown_bypass_active(now=86400) is False
+
+
+def test_restore_daily_risk_ignores_stale_persisted_cycle():
+    rt = RuntimeState()
+    rt.restore_daily_risk(
+        day_key="1999-01-01",
+        equity_peak=999.0,
+        bypass_day="1999-01-01",
+        now=0,
+    )
+    assert rt.risk_day_key == "1970-01-01"
+    assert rt.risk_day_equity_peak == 0.0
+    assert rt.drawdown_bypass_day == ""
 
 
 def test_breaker_and_kill_flags():

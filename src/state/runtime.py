@@ -31,10 +31,16 @@ class RuntimeState:
     # 当日已实现盈亏累计（USDT，亏损为负）；日界用 day_key 重置
     day_realized_pnl: float = 0.0
     day_key: str = ""
-    # 账户权益峰值、当前权益与回撤(%)
+    # 账户历史权益峰值、当前权益与历史回撤(%)
     equity_peak: float = 0.0
     current_equity: float = 0.0
     drawdown_pct: float = 0.0
+    # 自然日风险周期：当日峰值与当日回撤用于 max_drawdown_pct 熔断。
+    risk_day_key: str = ""
+    risk_day_equity_peak: float = 0.0
+    risk_day_drawdown_pct: float = 0.0
+    # 人工确认恢复后，仅在该自然日跳过“回撤”熔断；日亏熔断仍有效。
+    drawdown_bypass_day: str = ""
 
     # 熔断/停机标志
     halt_new_entries: bool = False
@@ -81,6 +87,10 @@ class RuntimeState:
         if key != self.day_key:
             self.day_key = key
             self.day_realized_pnl = 0.0
+            self.risk_day_key = key
+            self.risk_day_equity_peak = max(self.current_equity, 0.0)
+            self.risk_day_drawdown_pct = 0.0
+            self.drawdown_bypass_day = ""
             return True
         return False
 
@@ -100,13 +110,58 @@ class RuntimeState:
         self.day_key = key
         self.day_realized_pnl = float(by_day.get(key, 0.0))
 
-    def update_equity(self, equity: float) -> None:
-        """更新当前权益、峰值并计算回撤百分比。"""
+    def update_equity(self, equity: float, now: float | None = None) -> None:
+        """更新历史与当日峰值，并分别计算历史回撤和当日风控回撤。"""
+        key = time.strftime("%Y-%m-%d", time.localtime(
+            now if now is not None else time.time()
+        ))
         self.current_equity = equity
         if equity > self.equity_peak:
             self.equity_peak = equity
         if self.equity_peak > 0:
             self.drawdown_pct = max(0.0, (self.equity_peak - equity) / self.equity_peak * 100.0)
+        if key != self.risk_day_key:
+            self.risk_day_key = key
+            self.risk_day_equity_peak = max(equity, 0.0)
+            self.risk_day_drawdown_pct = 0.0
+            self.drawdown_bypass_day = ""
+        elif equity > self.risk_day_equity_peak:
+            self.risk_day_equity_peak = equity
+        if self.risk_day_equity_peak > 0:
+            self.risk_day_drawdown_pct = max(
+                0.0,
+                (self.risk_day_equity_peak - equity) / self.risk_day_equity_peak * 100.0,
+            )
+
+    def restore_daily_risk(
+        self,
+        *,
+        day_key: str,
+        equity_peak: float,
+        bypass_day: str = "",
+        now: float | None = None,
+    ) -> None:
+        """Restore only today's persisted risk cycle; stale days are discarded."""
+        today = time.strftime("%Y-%m-%d", time.localtime(
+            now if now is not None else time.time()
+        ))
+        self.risk_day_key = today
+        self.risk_day_equity_peak = max(float(equity_peak or 0.0), 0.0) if day_key == today else 0.0
+        self.risk_day_drawdown_pct = 0.0
+        self.drawdown_bypass_day = today if bypass_day == today else ""
+
+    def grant_drawdown_bypass(self, now: float | None = None) -> str:
+        key = time.strftime("%Y-%m-%d", time.localtime(
+            now if now is not None else time.time()
+        ))
+        self.drawdown_bypass_day = key
+        return key
+
+    def drawdown_bypass_active(self, now: float | None = None) -> bool:
+        key = time.strftime("%Y-%m-%d", time.localtime(
+            now if now is not None else time.time()
+        ))
+        return bool(self.drawdown_bypass_day and self.drawdown_bypass_day == key)
 
     # ---------- 熔断 ----------
     def halt_entries(self, reason: str = "") -> None:
