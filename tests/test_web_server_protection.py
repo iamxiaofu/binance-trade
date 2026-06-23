@@ -202,6 +202,7 @@ def test_account_risk_metrics_separate_breaker_position_and_orders():
         equity_peak=222.222222,
         risk_day_key=time.strftime("%Y-%m-%d", time.localtime()),
         risk_day_equity_peak=210.0,
+        day_net_capital_flow=-20.0,
     )
 
     balance = summary["balance"]
@@ -214,9 +215,14 @@ def test_account_risk_metrics_separate_breaker_position_and_orders():
     assert balance["open_order_reserved_margin_estimate"] == pytest.approx(50.0)
     assert balance["regular_open_order_count"] == 2
     assert balance["external_open_order_count"] == 1
-    assert balance["risk_day_drawdown_pct"] == pytest.approx(100 / 21)
+    assert balance["risk_equity"] == pytest.approx(220.0)
+    assert balance["day_net_capital_flow"] == pytest.approx(-20.0)
+    assert balance["risk_day_drawdown_pct"] == pytest.approx(0.0)
     assert balance["drawdown_bypass_active"] is False
-    assert balance["drawdown_breaker_basis"] == "DAILY_EQUITY_HIGH_WATER_MARK"
+    assert (
+        balance["drawdown_breaker_basis"]
+        == "FLOW_ADJUSTED_DAILY_EQUITY_HIGH_WATER_MARK"
+    )
 
 
 async def test_status_summary_separates_regular_and_condition_orders(monkeypatch):

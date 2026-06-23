@@ -431,8 +431,62 @@ async def test_log_order_and_snapshots(store):
 
     rt = RuntimeState()
     rt.day_realized_pnl = -5.0
+    rt.day_net_capital_flow = -50.0
+    rt.risk_equity = 250.0
+    rt.risk_day_drawdown_pct = 2.5
+    rt.capital_flow_status = "CONFIRMED"
     await store.snapshot_balance(total_equity=200.0, available_margin=180.0, runtime=rt)
     assert await _count(store, BalanceSnapshotRow) == 1
+    async with sm() as session:
+        balance = (await session.execute(select(BalanceSnapshotRow))).scalars().one()
+    assert balance.net_capital_flow == pytest.approx(-50.0)
+    assert balance.risk_equity == pytest.approx(250.0)
+    assert balance.risk_day_drawdown_pct == pytest.approx(2.5)
+
+
+async def test_capital_flow_ledger_deduplicates_and_matches_stream(store):
+    ts_ms = int(time.time() * 1000)
+    assert await store.ingest_capital_flow(
+        flow_key="stream:event-1:USDT",
+        ts_ms=ts_ms,
+        asset="USDT",
+        flow_type="ASSET_TRANSFER",
+        amount=-300.0,
+        source="stream",
+        status="provisional",
+    )
+    assert not await store.ingest_capital_flow(
+        flow_key="stream:event-1:USDT",
+        ts_ms=ts_ms,
+        asset="USDT",
+        flow_type="ASSET_TRANSFER",
+        amount=-300.0,
+        source="stream",
+        status="provisional",
+    )
+    assert await store.ingest_capital_flow(
+        flow_key="rest:TRANSFER:123:USDT",
+        ts_ms=ts_ms,
+        asset="USDT",
+        flow_type="TRANSFER",
+        amount=-300.0,
+        source="rest",
+        status="confirmed",
+        transaction_id="123",
+    )
+    matched = await store.match_provisional_capital_flow(
+        confirmed_flow_key="rest:TRANSFER:123:USDT",
+        ts_ms=ts_ms,
+        asset="USDT",
+        amount=-300.0,
+    )
+    assert matched == "stream:event-1:USDT"
+    net = await store.day_net_capital_flow(
+        start_ms=ts_ms - 1,
+        end_ms=ts_ms + 1,
+        asset="USDT",
+    )
+    assert net == pytest.approx(-300.0)
 
 
 async def test_live_position_state_includes_margin_roi_and_liquidation(store):

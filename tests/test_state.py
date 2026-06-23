@@ -60,6 +60,37 @@ def test_equity_peak_and_drawdown():
     assert rt.risk_day_drawdown_pct == 0.0
 
 
+def test_withdrawal_does_not_count_as_trading_drawdown():
+    rt = RuntimeState()
+    rt.update_equity(1000.0, now=0, net_capital_flow=0.0)
+    rt.update_equity(700.0, now=0, net_capital_flow=-300.0)
+
+    assert rt.current_equity == 700.0
+    assert rt.risk_equity == 1000.0
+    assert rt.risk_day_equity_peak == 1000.0
+    assert rt.risk_day_drawdown_pct == 0.0
+    assert rt.drawdown_pct == 30.0
+
+
+def test_deposit_does_not_raise_risk_equity_peak():
+    rt = RuntimeState()
+    rt.update_equity(1000.0, now=0, net_capital_flow=0.0)
+    rt.update_equity(1500.0, now=0, net_capital_flow=500.0)
+
+    assert rt.risk_equity == 1000.0
+    assert rt.risk_day_equity_peak == 1000.0
+    assert rt.risk_day_drawdown_pct == 0.0
+
+
+def test_withdrawal_and_real_loss_only_count_the_real_loss():
+    rt = RuntimeState()
+    rt.update_equity(1000.0, now=0, net_capital_flow=0.0)
+    rt.update_equity(650.0, now=0, net_capital_flow=-300.0)
+
+    assert rt.risk_equity == 950.0
+    assert rt.risk_day_drawdown_pct == 5.0
+
+
 def test_daily_drawdown_resets_and_bypass_expires_next_day():
     rt = RuntimeState()
     rt.update_equity(100.0, now=0)

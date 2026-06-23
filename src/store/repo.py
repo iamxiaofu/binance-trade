@@ -27,6 +27,7 @@ from src.state.runtime import RuntimeState
 from src.store.models import (
     Base,
     BalanceSnapshotRow,
+    CapitalFlowRow,
     ControlCommandRow,
     DecisionRow,
     OpenOrderRow,
@@ -144,6 +145,12 @@ _EXCHANGE_FILL_RECONCILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("resolved_metadata_source", "VARCHAR(64) NOT NULL DEFAULT ''"),
     ("reconciled_at_ms", "INTEGER NOT NULL DEFAULT 0"),
 )
+_BALANCE_SNAPSHOT_EXTENSION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("net_capital_flow", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("risk_equity", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("risk_day_drawdown_pct", "FLOAT NOT NULL DEFAULT 0.0"),
+    ("capital_flow_status", "VARCHAR(24) NOT NULL DEFAULT 'CONFIRMED'"),
+)
 _LLM_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("api_key", "TEXT NOT NULL DEFAULT ''"),
     ("priority", "INTEGER NOT NULL DEFAULT 100"),
@@ -178,6 +185,8 @@ _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_external_trade_fills_trade ON external_trade_fills(external_trade_id, id)",
     "CREATE INDEX IF NOT EXISTS ix_reconcile_runs_status_created ON exchange_reconcile_runs(status, created_at_ms DESC)",
     "CREATE INDEX IF NOT EXISTS ix_binance_trade_cycles_run_opened ON binance_trade_cycles(run_id, opened_at_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_capital_flows_asset_ts ON capital_flows(asset, ts_ms ASC)",
+    "CREATE INDEX IF NOT EXISTS ix_capital_flows_status_ts ON capital_flows(status, ts_ms ASC)",
     "CREATE INDEX IF NOT EXISTS ix_binance_cycle_fills_cycle ON binance_trade_cycle_fills(cycle_id, id)",
     "CREATE INDEX IF NOT EXISTS ix_llm_prompt_versions_version ON llm_prompt_versions(version DESC)",
 )
@@ -480,6 +489,15 @@ class Store:
         for name, ddl in _EXCHANGE_FILL_RECONCILE_COLUMNS:
             if exchange_fill_existing and name not in exchange_fill_existing:
                 await conn.execute(text(f"ALTER TABLE exchange_fills ADD COLUMN {name} {ddl}"))
+        balance_existing = {
+            row[1]
+            for row in (await conn.execute(text("PRAGMA table_info(balance_snapshots)"))).fetchall()
+        }
+        for name, ddl in _BALANCE_SNAPSHOT_EXTENSION_COLUMNS:
+            if balance_existing and name not in balance_existing:
+                await conn.execute(
+                    text(f"ALTER TABLE balance_snapshots ADD COLUMN {name} {ddl}")
+                )
         for ddl in _SQLITE_INDEX_DDL:
             await conn.execute(text(ddl))
 
@@ -2786,8 +2804,102 @@ class Store:
                 available_margin=available_margin,
                 day_realized_pnl=runtime.day_realized_pnl,
                 drawdown_pct=runtime.drawdown_pct,
+                net_capital_flow=runtime.day_net_capital_flow,
+                risk_equity=runtime.risk_equity,
+                risk_day_drawdown_pct=runtime.risk_day_drawdown_pct,
+                capital_flow_status=runtime.capital_flow_status,
             )
         )
+
+    async def ingest_capital_flow(
+        self,
+        *,
+        flow_key: str,
+        ts_ms: int,
+        asset: str,
+        flow_type: str,
+        amount: float,
+        source: str,
+        status: str,
+        transaction_id: str = "",
+        event_key: str = "",
+        raw: dict[str, Any] | None = None,
+    ) -> bool:
+        """Insert one idempotent external capital-flow row."""
+        row = CapitalFlowRow(
+            flow_key=flow_key[:160],
+            ts_ms=int(ts_ms or _t.time() * 1000),
+            asset=str(asset or "")[:16],
+            flow_type=str(flow_type or "")[:48],
+            amount=float(amount or 0.0),
+            source=str(source or "")[:16],
+            status=str(status or "confirmed")[:16],
+            transaction_id=str(transaction_id or "")[:80],
+            event_key=str(event_key or "")[:80],
+            raw_json=json.dumps(raw or {}, default=str)[:8000],
+        )
+        async with self._sessionmaker() as session:
+            session.add(row)
+            try:
+                await session.commit()
+                return True
+            except IntegrityError:
+                await session.rollback()
+                return False
+
+    async def match_provisional_capital_flow(
+        self,
+        *,
+        confirmed_flow_key: str,
+        ts_ms: int,
+        asset: str,
+        amount: float,
+        window_ms: int = 300_000,
+    ) -> str:
+        """Mark the nearest equivalent stream flow as matched by a REST ledger row."""
+        tolerance = max(abs(float(amount)) * 1e-9, 1e-12)
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(CapitalFlowRow)
+                    .where(CapitalFlowRow.asset == str(asset))
+                    .where(CapitalFlowRow.status == "provisional")
+                    .where(CapitalFlowRow.ts_ms >= int(ts_ms) - int(window_ms))
+                    .where(CapitalFlowRow.ts_ms <= int(ts_ms) + int(window_ms))
+                    .order_by(CapitalFlowRow.ts_ms.asc(), CapitalFlowRow.id.asc())
+                )
+            ).scalars().all()
+            candidates = [
+                row for row in rows
+                if abs(float(row.amount or 0.0) - float(amount)) <= tolerance
+            ]
+            if not candidates:
+                return ""
+            matched = min(candidates, key=lambda row: abs(int(row.ts_ms) - int(ts_ms)))
+            matched.status = "matched"
+            matched.matched_flow_key = confirmed_flow_key[:160]
+            await session.commit()
+            return matched.flow_key
+
+    async def day_net_capital_flow(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        asset: str,
+    ) -> float:
+        """Sum confirmed REST flows plus unmatched provisional stream flows."""
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(CapitalFlowRow)
+                    .where(CapitalFlowRow.asset == str(asset))
+                    .where(CapitalFlowRow.ts_ms >= int(start_ms))
+                    .where(CapitalFlowRow.ts_ms <= int(end_ms))
+                    .where(CapitalFlowRow.status.in_(("confirmed", "provisional")))
+                )
+            ).scalars().all()
+            return sum(float(row.amount or 0.0) for row in rows)
 
     # ---------- 运行时设置 ----------
     async def set_runtime_setting(self, key: str, value: str) -> None:

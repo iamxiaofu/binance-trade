@@ -234,8 +234,6 @@ class AccountStateCoordinator:
             }
             self._balances[asset] = row
             await self._store.upsert_live_balance(row, "stream")
-            if asset == self._quote and row["wallet_balance"] > 0:
-                self._runtime.update_equity(row["wallet_balance"])
         for raw in account.get("P") or []:
             symbol = normalize_symbol(raw.get("s"))
             if not symbol or not self._newer(f"position:{symbol}", event.transaction_time_ms):
@@ -314,12 +312,3 @@ class AccountStateCoordinator:
             if order.get("status") in ("placed", "new", "open", "working", "partial"):
                 grouped.setdefault(order["symbol"], []).append(deepcopy(order))
         self._runtime.open_orders = grouped
-        quote = self._balances.get(self._quote)
-        if quote:
-            unrealized = sum(
-                normalize_position(position)["unrealized_pnl"]
-                for position in self._positions.values()
-            )
-            equity = float(quote.get("wallet_balance") or 0) + unrealized
-            if equity > 0:
-                self._runtime.update_equity(equity)

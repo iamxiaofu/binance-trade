@@ -403,6 +403,29 @@ class BalanceSnapshotRow(Base):
     available_margin: Mapped[float] = mapped_column(Float, default=0.0)
     day_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     drawdown_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    net_capital_flow: Mapped[float] = mapped_column(Float, default=0.0)
+    risk_equity: Mapped[float] = mapped_column(Float, default=0.0)
+    risk_day_drawdown_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    capital_flow_status: Mapped[str] = mapped_column(String(24), default="CONFIRMED")
+
+
+class CapitalFlowRow(Base):
+    """External account cash flow excluded from trading drawdown."""
+    __tablename__ = "capital_flows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    flow_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=_now_iso)
+    asset: Mapped[str] = mapped_column(String(16), default="", index=True)
+    flow_type: Mapped[str] = mapped_column(String(48), default="", index=True)
+    amount: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    status: Mapped[str] = mapped_column(String(16), default="confirmed", index=True)
+    transaction_id: Mapped[str] = mapped_column(String(80), default="", index=True)
+    event_key: Mapped[str] = mapped_column(String(80), default="", index=True)
+    matched_flow_key: Mapped[str] = mapped_column(String(160), default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
 
 
 class SymbolRow(Base):

@@ -336,6 +336,8 @@ def _apply_account_risk_metrics(
     risk_day_key: str = "",
     risk_day_equity_peak: float = 0.0,
     drawdown_bypass_day: str = "",
+    day_net_capital_flow: float = 0.0,
+    capital_flow_status: str = "CONFIRMED",
 ) -> None:
     """Attach explicitly named account, position and reserved-margin metrics."""
     balance = dict(summary.get("balance") or {})
@@ -354,12 +356,14 @@ def _apply_account_risk_metrics(
     if equity_peak <= 0 and total_equity > 0 and drawdown_pct < 100:
         equity_peak = total_equity / (1.0 - drawdown_pct / 100.0)
     today = time.strftime("%Y-%m-%d", time.localtime())
+    day_net_capital_flow = float(day_net_capital_flow or 0.0)
+    risk_equity = max(total_equity - day_net_capital_flow, 0.0)
     if risk_day_key != today:
         risk_day_key = today
-        risk_day_equity_peak = total_equity
-    risk_day_equity_peak = max(float(risk_day_equity_peak or 0.0), total_equity)
+        risk_day_equity_peak = risk_equity
+    risk_day_equity_peak = max(float(risk_day_equity_peak or 0.0), risk_equity)
     risk_day_drawdown_pct = (
-        max(0.0, (risk_day_equity_peak - total_equity) / risk_day_equity_peak * 100.0)
+        max(0.0, (risk_day_equity_peak - risk_equity) / risk_day_equity_peak * 100.0)
         if risk_day_equity_peak > 0 else 0.0
     )
     drawdown_bypass_active = bool(
@@ -367,7 +371,7 @@ def _apply_account_risk_metrics(
     )
 
     balance.update({
-        # Backward-compatible drawdown_pct remains the circuit-breaker metric.
+        # Raw historical drawdown remains display-only; breaker metrics are below.
         "account_drawdown_pct": drawdown_pct,
         "account_equity_peak": max(float(equity_peak or 0.0), 0.0),
         "position_unrealized_pnl": unrealized_pnl,
@@ -385,11 +389,14 @@ def _apply_account_risk_metrics(
         ),
         "risk_period": "CALENDAR_DAY",
         "risk_day_key": risk_day_key,
+        "day_net_capital_flow": day_net_capital_flow,
+        "risk_equity": risk_equity,
         "risk_day_equity_peak": risk_day_equity_peak,
         "risk_day_drawdown_pct": risk_day_drawdown_pct,
+        "capital_flow_status": str(capital_flow_status or "CONFIRMED"),
         "drawdown_bypass_day": drawdown_bypass_day if drawdown_bypass_active else "",
         "drawdown_bypass_active": drawdown_bypass_active,
-        "drawdown_breaker_basis": "DAILY_EQUITY_HIGH_WATER_MARK",
+        "drawdown_breaker_basis": "FLOW_ADJUSTED_DAILY_EQUITY_HIGH_WATER_MARK",
     })
     summary["balance"] = balance
 
@@ -512,6 +519,8 @@ async def _status_summary() -> dict[str, Any]:
                 "risk.drawdown.day_key",
                 "risk.drawdown.day_equity_peak",
                 "risk.drawdown.bypass_day",
+                "risk.capital_flow.day_net",
+                "risk.capital_flow.status",
             )
             runtime_settings = {
                 key: await store.get_runtime_setting(key) for key in keys
@@ -535,6 +544,12 @@ async def _status_summary() -> dict[str, Any]:
             risk_day_key=runtime_settings.get("risk.drawdown.day_key", ""),
             risk_day_equity_peak=risk_day_equity_peak,
             drawdown_bypass_day=runtime_settings.get("risk.drawdown.bypass_day", ""),
+            day_net_capital_flow=float(
+                runtime_settings.get("risk.capital_flow.day_net") or 0.0
+            ),
+            capital_flow_status=runtime_settings.get(
+                "risk.capital_flow.status", "CONFIRMED"
+            ),
         )
         summary["open_orders_error"] = ""
         summary["condition_orders_error"] = ""
@@ -1134,9 +1149,13 @@ async def api_risk_settings_preview(body: _RiskUpdateRequest, _: str = Depends(_
     before = risk_public(current)
     after = risk_public(updated)
     balance = st.latest_balance(_DB) or {}
-    equity = float(balance.get("total_equity") or 0.0)
+    equity = float(
+        balance.get("risk_equity")
+        or balance.get("total_equity")
+        or 0.0
+    )
     day_pnl = float(balance.get("day_realized_pnl") or 0.0)
-    drawdown = float(balance.get("drawdown_pct") or 0.0)
+    drawdown = float(balance.get("risk_day_drawdown_pct") or 0.0)
     daily_limit = equity * updated.daily_max_loss_pct / 100.0
     return {
         "mode": _settings.mode.value,

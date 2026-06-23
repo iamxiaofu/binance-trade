@@ -126,11 +126,23 @@ class ExchangeClient:
         bal = await self._exchange.fetch_balance()
         return bal
 
-    async def fetch_income_history(self, start_ms: int, limit: int = 1000) -> list[dict[str, Any]]:
+    async def fetch_income_history(
+        self,
+        start_ms: int,
+        *,
+        end_ms: int | None = None,
+        limit: int = 1000,
+        page: int = 1,
+    ) -> list[dict[str, Any]]:
         """Fetch Binance's realized PnL, funding and commission ledger."""
-        rows = await self._exchange.fapiPrivateGetIncome(
-            {"startTime": int(start_ms), "limit": min(max(int(limit), 1), 1000)}
-        )
+        params = {
+            "startTime": int(start_ms),
+            "limit": min(max(int(limit), 1), 1000),
+            "page": max(int(page), 1),
+        }
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        rows = await self._exchange.fapiPrivateGetIncome(params)
         return list(rows or [])
 
     async def fetch_available_margin(self, quote: str = "USDT") -> float:

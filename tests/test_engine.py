@@ -124,6 +124,7 @@ class FakeStore:
         self.open_qty = {}
         self.open_directions = {}
         self.audits = []
+        self.capital_flows = {}
         self.system_commands = []  # (command, arg, source, status, result)
         self.symbols = {
             "BTCUSDT": {
@@ -198,6 +199,35 @@ class FakeStore:
 
     async def log_audit(self, **kw):
         self.audits.append(kw)
+
+    async def ingest_capital_flow(self, **kw):
+        key = kw["flow_key"]
+        if key in self.capital_flows:
+            return False
+        self.capital_flows[key] = dict(kw)
+        return True
+
+    async def match_provisional_capital_flow(
+        self, *, confirmed_flow_key, ts_ms, asset, amount, window_ms=300_000
+    ):
+        for key, row in self.capital_flows.items():
+            if (
+                row.get("status") == "provisional"
+                and row.get("asset") == asset
+                and float(row.get("amount") or 0.0) == pytest.approx(float(amount))
+            ):
+                row["status"] = "matched"
+                row["matched_flow_key"] = confirmed_flow_key
+                return key
+        return ""
+
+    async def day_net_capital_flow(self, *, start_ms, end_ms, asset):
+        return sum(
+            float(row.get("amount") or 0.0)
+            for row in self.capital_flows.values()
+            if row.get("asset") == asset
+            and row.get("status") in ("confirmed", "provisional")
+        )
 
     async def mark_orders_status_by_exchange_ids(self, exchange_order_ids, status):
         self.marked_status_calls.append((list(exchange_order_ids or []), status))
@@ -881,6 +911,7 @@ async def test_daily_drawdown_cycle_and_bypass_restore_on_startup(
         "risk.drawdown.day_key": today,
         "risk.drawdown.day_equity_peak": "250.5",
         "risk.drawdown.bypass_day": today,
+        "risk.capital_flow.model_version": "1",
     })
 
     await eng._apply_runtime_settings()
@@ -888,6 +919,22 @@ async def test_daily_drawdown_cycle_and_bypass_restore_on_startup(
     assert eng.runtime.risk_day_key == today
     assert eng.runtime.risk_day_equity_peak == pytest.approx(250.5)
     assert eng.runtime.drawdown_bypass_active() is True
+
+
+async def test_legacy_raw_daily_peak_is_not_reused_by_flow_adjusted_model(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    eng._store.runtime_settings.update({
+        "risk.drawdown.day_key": today,
+        "risk.drawdown.day_equity_peak": "500",
+    })
+
+    await eng._apply_runtime_settings()
+
+    assert eng.runtime.risk_day_equity_peak == 0.0
+    assert eng.runtime.capital_flow_guard_since_ms == 0
 
 
 async def test_mainnet_runtime_settings_force_restart_pause(settings, creds, monkeypatch):
@@ -1054,17 +1101,190 @@ async def test_exchange_income_sync_includes_realized_funding_and_commission(
 ):
     eng = _engine(settings, creds, monkeypatch)
 
-    async def income(_start_ms):
+    async def income(_start_ms, **_kwargs):
         return [
             {"incomeType": "REALIZED_PNL", "asset": "USDT", "income": "10"},
             {"incomeType": "FUNDING_FEE", "asset": "USDT", "income": "-1"},
             {"incomeType": "COMMISSION", "asset": "USDT", "income": "-0.5"},
-            {"incomeType": "TRANSFER", "asset": "USDT", "income": "100"},
+            {
+                "incomeType": "TRANSFER",
+                "asset": "USDT",
+                "income": "100",
+                "time": int(time.time() * 1000),
+                "tranId": 123,
+            },
         ]
 
     monkeypatch.setattr(eng._client, "fetch_income_history", income, raising=False)
     await eng._sync_exchange_day_pnl()
     assert eng.runtime.day_realized_pnl == pytest.approx(8.5)
+    assert eng.runtime.day_net_capital_flow == pytest.approx(100.0)
+
+
+async def test_stream_and_rest_capital_flow_are_deduplicated(
+    settings, creds, monkeypatch
+):
+    eng = _engine(settings, creds, monkeypatch)
+    now_ms = int(time.time() * 1000)
+    event = SimpleNamespace(
+        payload={
+            "a": {
+                "m": "ASSET_TRANSFER",
+                "B": [{"a": "USDT", "bc": "-300", "wb": "700"}],
+            }
+        },
+        event_key="event-transfer-1",
+        transaction_time_ms=now_ms,
+        event_time_ms=now_ms,
+    )
+    await eng._ingest_stream_capital_flow(event)
+    assert eng.runtime.capital_flow_status == "RECONCILING"
+    assert eng.runtime.halt_new_entries is True
+    assert eng.runtime.risk_day_equity_peak == 0.0
+
+    async def income(_start_ms, **_kwargs):
+        return [{
+            "incomeType": "TRANSFER",
+            "asset": "USDT",
+            "income": "-300",
+            "time": now_ms,
+            "tranId": 456,
+        }]
+
+    monkeypatch.setattr(eng._client, "fetch_income_history", income, raising=False)
+    await eng._sync_exchange_day_pnl()
+
+    assert eng.runtime.day_net_capital_flow == pytest.approx(-300.0)
+    assert sorted(row["status"] for row in eng._store.capital_flows.values()) == [
+        "confirmed",
+        "matched",
+    ]
+
+
+async def test_stream_transfer_stays_paused_when_rest_confirmation_fails(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    now = [1_800_000_000.0]
+    monkeypatch.setattr(engine_loop.time, "time", lambda: now[0])
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 1000.0}, "free": {"USDT": 1000.0}}
+    )
+    event = SimpleNamespace(
+        payload={
+            "a": {
+                "m": "ASSET_TRANSFER",
+                "B": [{"a": "USDT", "bc": "-300", "wb": "700"}],
+            }
+        },
+        event_key="event-transfer-rest-fail",
+        transaction_time_ms=int(now[0] * 1000),
+        event_time_ms=int(now[0] * 1000),
+    )
+    await eng._ingest_stream_capital_flow(event)
+    eng.runtime.capital_flow_ledger_status = "ERROR"
+    now[0] += 5
+
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 700.0}, "free": {"USDT": 700.0}}
+    )
+
+    assert eng.runtime.risk_day_drawdown_pct == pytest.approx(0.0)
+    assert eng.runtime.capital_flow_status == "RECONCILING"
+    assert eng.runtime.halt_new_entries is True
+
+
+async def test_withdrawal_balance_drop_does_not_enter_drawdown_guard(
+    settings, creds, monkeypatch
+):
+    eng = _engine(settings, creds, monkeypatch)
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 1000.0}, "free": {"USDT": 1000.0}}
+    )
+    eng.runtime.day_net_capital_flow = -300.0
+    eng.runtime.capital_flow_ledger_status = "CONFIRMED"
+
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 700.0}, "free": {"USDT": 700.0}}
+    )
+
+    assert eng.runtime.risk_equity == pytest.approx(1000.0)
+    assert eng.runtime.risk_day_drawdown_pct == pytest.approx(0.0)
+    assert eng.runtime.capital_flow_status == "CONFIRMED"
+    assert eng.runtime.halt_new_entries is False
+
+
+async def test_first_real_drawdown_breach_reconciles_before_flattening(
+    settings, creds, monkeypatch
+):
+    eng = _engine(settings, creds, monkeypatch)
+    now = [1_800_000_000.0]
+    monkeypatch.setattr(engine_loop.time, "time", lambda: now[0])
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 1000.0}, "free": {"USDT": 1000.0}}
+    )
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+        "markPrice": 70.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+
+    now[0] += 1
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 700.0}, "free": {"USDT": 700.0}}
+    )
+
+    assert eng.runtime.capital_flow_status == "RECONCILING"
+    assert eng.runtime.halt_new_entries is True
+    assert await eng._check_circuit_breaker() is True
+    assert eng._executor.closed == []
+
+    now[0] += engine_loop._CAPITAL_FLOW_GUARD_GRACE_MS / 1000 + 1
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 700.0}, "free": {"USDT": 700.0}}
+    )
+
+    assert eng.runtime.capital_flow_status == "CONFIRMED"
+    assert await eng._check_circuit_breaker() is True
+    assert len(eng._executor.closed) == 1
+
+
+async def test_unavailable_capital_flow_ledger_never_flattens_unknown_balance_drop(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    now = [1_800_000_000.0]
+    monkeypatch.setattr(engine_loop.time, "time", lambda: now[0])
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 1000.0}, "free": {"USDT": 1000.0}}
+    )
+    eng.runtime.capital_flow_ledger_status = "ERROR"
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+        "markPrice": 70.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+
+    now[0] += 1
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 700.0}, "free": {"USDT": 700.0}}
+    )
+    now[0] += engine_loop._CAPITAL_FLOW_GUARD_GRACE_MS / 1000 + 60
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 700.0}, "free": {"USDT": 700.0}}
+    )
+
+    assert eng.runtime.capital_flow_status == "RECONCILING"
+    assert await eng._check_circuit_breaker() is True
+    assert eng._executor.closed == []
 
 
 async def test_record_balance_snapshot_skips_when_total_missing(settings, creds, monkeypatch):

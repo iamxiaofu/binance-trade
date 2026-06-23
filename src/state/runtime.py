@@ -39,6 +39,12 @@ class RuntimeState:
     risk_day_key: str = ""
     risk_day_equity_peak: float = 0.0
     risk_day_drawdown_pct: float = 0.0
+    # 风控权益剔除当日外部净资金流，避免充值/转出被当作交易损益。
+    risk_equity: float = 0.0
+    day_net_capital_flow: float = 0.0
+    capital_flow_status: str = "CONFIRMED"
+    capital_flow_guard_since_ms: int = 0
+    capital_flow_ledger_status: str = "CONFIRMED"
     # 人工确认恢复后，仅在该自然日跳过“回撤”熔断；日亏熔断仍有效。
     drawdown_bypass_day: str = ""
 
@@ -90,6 +96,11 @@ class RuntimeState:
             self.risk_day_key = key
             self.risk_day_equity_peak = max(self.current_equity, 0.0)
             self.risk_day_drawdown_pct = 0.0
+            self.risk_equity = max(self.current_equity, 0.0)
+            self.day_net_capital_flow = 0.0
+            self.capital_flow_status = "CONFIRMED"
+            self.capital_flow_ledger_status = "CONFIRMED"
+            self.capital_flow_guard_since_ms = 0
             self.drawdown_bypass_day = ""
             return True
         return False
@@ -110,27 +121,44 @@ class RuntimeState:
         self.day_key = key
         self.day_realized_pnl = float(by_day.get(key, 0.0))
 
-    def update_equity(self, equity: float, now: float | None = None) -> None:
+    def update_equity(
+        self,
+        equity: float,
+        now: float | None = None,
+        *,
+        net_capital_flow: float | None = None,
+        capital_flow_status: str | None = None,
+    ) -> None:
         """更新历史与当日峰值，并分别计算历史回撤和当日风控回撤。"""
         key = time.strftime("%Y-%m-%d", time.localtime(
             now if now is not None else time.time()
         ))
         self.current_equity = equity
+        if net_capital_flow is not None:
+            self.day_net_capital_flow = float(net_capital_flow)
+        if capital_flow_status:
+            self.capital_flow_status = str(capital_flow_status)
+            if capital_flow_status != "RECONCILING":
+                self.capital_flow_ledger_status = str(capital_flow_status)
+        self.risk_equity = max(equity - self.day_net_capital_flow, 0.0)
         if equity > self.equity_peak:
             self.equity_peak = equity
         if self.equity_peak > 0:
             self.drawdown_pct = max(0.0, (self.equity_peak - equity) / self.equity_peak * 100.0)
         if key != self.risk_day_key:
             self.risk_day_key = key
-            self.risk_day_equity_peak = max(equity, 0.0)
+            self.risk_day_equity_peak = self.risk_equity
             self.risk_day_drawdown_pct = 0.0
             self.drawdown_bypass_day = ""
-        elif equity > self.risk_day_equity_peak:
-            self.risk_day_equity_peak = equity
+            self.capital_flow_guard_since_ms = 0
+        elif self.risk_equity > self.risk_day_equity_peak:
+            self.risk_day_equity_peak = self.risk_equity
         if self.risk_day_equity_peak > 0:
             self.risk_day_drawdown_pct = max(
                 0.0,
-                (self.risk_day_equity_peak - equity) / self.risk_day_equity_peak * 100.0,
+                (self.risk_day_equity_peak - self.risk_equity)
+                / self.risk_day_equity_peak
+                * 100.0,
             )
 
     def restore_daily_risk(
@@ -139,6 +167,8 @@ class RuntimeState:
         day_key: str,
         equity_peak: float,
         bypass_day: str = "",
+        net_capital_flow: float = 0.0,
+        capital_flow_status: str = "CONFIRMED",
         now: float | None = None,
     ) -> None:
         """Restore only today's persisted risk cycle; stale days are discarded."""
@@ -148,6 +178,12 @@ class RuntimeState:
         self.risk_day_key = today
         self.risk_day_equity_peak = max(float(equity_peak or 0.0), 0.0) if day_key == today else 0.0
         self.risk_day_drawdown_pct = 0.0
+        self.day_net_capital_flow = (
+            float(net_capital_flow or 0.0) if day_key == today else 0.0
+        )
+        self.capital_flow_status = str(capital_flow_status or "CONFIRMED")
+        self.capital_flow_ledger_status = self.capital_flow_status
+        self.risk_equity = max(self.current_equity - self.day_net_capital_flow, 0.0)
         self.drawdown_bypass_day = today if bypass_day == today else ""
 
     def grant_drawdown_bypass(self, now: float | None = None) -> str:

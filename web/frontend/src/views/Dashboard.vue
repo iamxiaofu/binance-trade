@@ -126,7 +126,34 @@ watch(() => bal.value.ts_ms, () => loadEquity().catch(() => {}))
     <el-row :gutter="16" style="margin-top:16px">
       <el-col :span="6">
         <el-card class="metric-card" shadow="never">
-          <el-tooltip content="账户权益相对历史最高权益的回撤，仅用于绩效展示和审计，不再直接触发回撤熔断。" placement="top">
+          <el-tooltip content="交易所原始账户权益扣除今日净转入/转出后的权益；回撤熔断使用该值。" placement="top">
+            <div class="label">资金流调整后风控权益</div>
+          </el-tooltip>
+          <div class="value">{{ fmt(bal.risk_equity) }}</div>
+          <div class="metric-note">
+            核对状态 {{ bal.capital_flow_status || 'CONFIRMED' }}
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <el-tooltip content="今日转入为正、转出为负。该金额从原始权益中剔除，不计入交易盈亏和回撤。" placement="top">
+            <div class="label">今日净资金流</div>
+          </el-tooltip>
+          <div
+            class="value"
+            :class="Number(bal.day_net_capital_flow) > 0
+              ? 'pnl-pos'
+              : Number(bal.day_net_capital_flow) < 0 ? 'pnl-neg' : ''"
+          >
+            {{ Number(bal.day_net_capital_flow || 0) > 0 ? '+' : '' }}{{ fmt(bal.day_net_capital_flow) }}
+          </div>
+          <div class="metric-note">转出不会触发交易回撤熔断</div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
+        <el-card class="metric-card" shadow="never">
+          <el-tooltip content="账户权益相对历史最高权益的回撤，仅用于绩效展示和审计，不直接触发回撤熔断。" placement="top">
             <div class="label">账户历史回撤</div>
           </el-tooltip>
           <div class="value" :class="Number(bal.account_drawdown_pct ?? bal.drawdown_pct) > 0 ? 'pnl-neg' : ''">

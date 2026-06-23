@@ -87,6 +87,41 @@ _RISK_DAY_KEY = "risk.drawdown.day_key"
 _RISK_DAY_EQUITY_PEAK_KEY = "risk.drawdown.day_equity_peak"
 _RISK_DRAWDOWN_BYPASS_DAY_KEY = "risk.drawdown.bypass_day"
 _RISK_DRAWDOWN_BYPASS_AT_MS_KEY = "risk.drawdown.bypass_at_ms"
+_RISK_DAY_NET_CAPITAL_FLOW_KEY = "risk.capital_flow.day_net"
+_RISK_CAPITAL_FLOW_STATUS_KEY = "risk.capital_flow.status"
+_RISK_CAPITAL_FLOW_GUARD_SINCE_KEY = "risk.capital_flow.guard_since_ms"
+_RISK_CAPITAL_FLOW_MODEL_VERSION_KEY = "risk.capital_flow.model_version"
+_RISK_CAPITAL_FLOW_MODEL_VERSION = "1"
+_CAPITAL_FLOW_GUARD_GRACE_MS = 30_000
+_REST_CAPITAL_FLOW_TYPES = {
+    "TRANSFER",
+    "INTERNAL_TRANSFER",
+    "CROSS_COLLATERAL_TRANSFER",
+    "STRATEGY_UMFUTURES_TRANSFER",
+    "AUTO_EXCHANGE",
+    "COIN_SWAP_DEPOSIT",
+    "COIN_SWAP_WITHDRAW",
+    "WELCOME_BONUS",
+    "REFERRAL_KICKBACK",
+    "COMMISSION_REBATE",
+    "API_REBATE",
+    "CONTEST_REWARD",
+    "FEE_RETURN",
+    "BFUSD_REWARD",
+}
+_STREAM_CAPITAL_FLOW_REASONS = {
+    "DEPOSIT",
+    "WITHDRAW",
+    "WITHDRAW_REJECT",
+    "ADJUSTMENT",
+    "ADMIN_DEPOSIT",
+    "ADMIN_WITHDRAW",
+    "MARGIN_TRANSFER",
+    "ASSET_TRANSFER",
+    "AUTO_EXCHANGE",
+    "COIN_SWAP_DEPOSIT",
+    "COIN_SWAP_WITHDRAW",
+}
 
 
 class ProtectionRepairError(ValueError):
@@ -316,6 +351,8 @@ class TradingEngine:
     async def _apply_private_event(self, event) -> None:
         await self._account.submit(event)
         await self._account.drain()
+        if event.event_type == "ACCOUNT_UPDATE":
+            await self._ingest_stream_capital_flow(event)
         if event.event_type == "ORDER_TRADE_UPDATE":
             order = event.payload.get("o") or {}
             fill = private_order_trade_fill(event)
@@ -596,8 +633,14 @@ class TradingEngine:
         self._cycle_leader_snapshot = None
 
         # 0. 全局熔断（最高优先级）：日亏 / 回撤
+        capital_flow_guarding = self.runtime.capital_flow_status == "RECONCILING"
         if await self._check_circuit_breaker():
             await self._snapshot()
+            if (
+                capital_flow_guarding
+                and self.runtime.capital_flow_status != "RECONCILING"
+            ):
+                await self._check_circuit_breaker()
             return
 
         # 逐 symbol 处理
@@ -796,6 +839,18 @@ class TradingEngine:
         raw_drawdown_bypass_day = await self._store.get_runtime_setting(
             _RISK_DRAWDOWN_BYPASS_DAY_KEY
         )
+        raw_day_net_capital_flow = await self._store.get_runtime_setting(
+            _RISK_DAY_NET_CAPITAL_FLOW_KEY
+        )
+        raw_capital_flow_status = await self._store.get_runtime_setting(
+            _RISK_CAPITAL_FLOW_STATUS_KEY
+        )
+        raw_capital_flow_guard_since = await self._store.get_runtime_setting(
+            _RISK_CAPITAL_FLOW_GUARD_SINCE_KEY
+        )
+        raw_capital_flow_model_version = await self._store.get_runtime_setting(
+            _RISK_CAPITAL_FLOW_MODEL_VERSION_KEY
+        )
         try:
             self.runtime.equity_peak = max(float(raw_equity_peak or 0.0), 0.0)
         except (TypeError, ValueError):
@@ -805,11 +860,33 @@ class TradingEngine:
         except (TypeError, ValueError):
             risk_day_peak = 0.0
             self.runtime.halt_entries("invalid persisted daily equity peak")
+        if raw_capital_flow_model_version != _RISK_CAPITAL_FLOW_MODEL_VERSION:
+            # The legacy peak was based on raw wallet equity and is not comparable
+            # with flow-adjusted equity. Seed the new model from the first fresh
+            # reconciled balance instead of risking a false migration-time breach.
+            risk_day_peak = 0.0
+            raw_capital_flow_guard_since = "0"
+        try:
+            day_net_capital_flow = float(raw_day_net_capital_flow or 0.0)
+        except (TypeError, ValueError):
+            day_net_capital_flow = 0.0
+            self.runtime.halt_entries("invalid persisted daily capital flow")
         self.runtime.restore_daily_risk(
             day_key=str(raw_risk_day_key or ""),
             equity_peak=risk_day_peak,
             bypass_day=str(raw_drawdown_bypass_day or ""),
+            net_capital_flow=day_net_capital_flow,
+            capital_flow_status=str(raw_capital_flow_status or "CONFIRMED"),
         )
+        try:
+            self.runtime.capital_flow_guard_since_ms = max(
+                int(raw_capital_flow_guard_since or 0), 0
+            )
+        except (TypeError, ValueError):
+            self.runtime.capital_flow_guard_since_ms = 0
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        if str(raw_risk_day_key or "") != today:
+            self.runtime.capital_flow_guard_since_ms = 0
         try:
             self._settings.risk = decode_risk(raw_risk, self._risk_defaults)
             self._risk_version = int(raw_version or 0)
@@ -2696,7 +2773,6 @@ class TradingEngine:
             total = (balance.get("total") or {}).get(self._settings.account.quote_asset)
             equity = float(total or 0.0)
             if equity > 0:
-                self.runtime.update_equity(equity)
                 return equity
         except Exception as e:
             logger.warning("fetch equity for repair failed: {}", e)
@@ -2809,9 +2885,18 @@ class TradingEngine:
         """日亏或回撤超限 → 平仓 + 停开新仓 + 告警。返回是否已熔断。"""
         risk = self._settings.risk
         rt = self.runtime
+        if rt.capital_flow_status == "RECONCILING":
+            if not rt.halt_new_entries:
+                rt.halt_entries("capital flow reconciliation: new entries paused")
+                await self._persist_strategy_pause_reason(
+                    reason_code="CAPITAL_FLOW_RECONCILING",
+                    reason=rt.halt_new_entries_reason,
+                    source="engine:capital_flow",
+                )
+            return True
         breached = None
         # 日亏限额 = 权益 × daily_max_loss_pct（随资金缩放）；权益未知时退回 0 不触发
-        base = rt.current_equity if rt.current_equity > 0 else rt.equity_peak
+        base = rt.risk_equity if rt.risk_equity > 0 else rt.current_equity
         daily_max_loss = base * (risk.daily_max_loss_pct / 100.0)
         if daily_max_loss > 0 and rt.day_realized_pnl <= -abs(daily_max_loss):
             breached = (f"daily loss {rt.day_realized_pnl:.2f} <= -{daily_max_loss:.2f} "
@@ -4551,11 +4636,23 @@ class TradingEngine:
                 total_raw, free_raw, self.runtime.current_equity,
             )
             return
-        self.runtime.update_equity(total)
+        now_ms = int(time.time() * 1000)
+        self.runtime.update_equity(
+            total,
+            net_capital_flow=self.runtime.day_net_capital_flow,
+            capital_flow_status=self.runtime.capital_flow_ledger_status,
+        )
+        await self._update_capital_flow_guard(now_ms)
         await self._store.set_runtime_settings({
             "risk.equity_peak": str(self.runtime.equity_peak),
             _RISK_DAY_KEY: self.runtime.risk_day_key,
             _RISK_DAY_EQUITY_PEAK_KEY: str(self.runtime.risk_day_equity_peak),
+            _RISK_DAY_NET_CAPITAL_FLOW_KEY: str(self.runtime.day_net_capital_flow),
+            _RISK_CAPITAL_FLOW_STATUS_KEY: self.runtime.capital_flow_status,
+            _RISK_CAPITAL_FLOW_GUARD_SINCE_KEY: str(
+                self.runtime.capital_flow_guard_since_ms
+            ),
+            _RISK_CAPITAL_FLOW_MODEL_VERSION_KEY: _RISK_CAPITAL_FLOW_MODEL_VERSION,
             _RISK_DRAWDOWN_BYPASS_DAY_KEY: (
                 self.runtime.drawdown_bypass_day
                 if self.runtime.drawdown_bypass_active() else ""
@@ -4569,7 +4666,7 @@ class TradingEngine:
         )
 
     async def _sync_exchange_day_pnl(self) -> None:
-        """Recompute today's net realized PnL from Binance's authoritative ledger."""
+        """Recompute today's trading PnL and external cash flow from Binance."""
         if not hasattr(self._client, "fetch_income_history"):
             return
         now = time.time()
@@ -4578,25 +4675,201 @@ class TradingEngine:
             local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0,
             local.tm_wday, local.tm_yday, local.tm_isdst,
         )) * 1000)
+        end_ms = int(now * 1000)
+        rows: list[dict] = []
+        ledger_complete = False
         try:
-            rows = await self._client.fetch_income_history(start_ms)
+            for page in range(1, 21):
+                batch = await self._client.fetch_income_history(
+                    start_ms,
+                    end_ms=end_ms,
+                    limit=1000,
+                    page=page,
+                )
+                rows.extend(batch)
+                if len(batch) < 1000:
+                    ledger_complete = True
+                    break
         except Exception as e:
             logger.warning("exchange income sync failed; retaining local day pnl: {}", e)
+            self.runtime.capital_flow_ledger_status = "ERROR"
+            self.runtime.capital_flow_status = "ERROR"
             return
+        if not ledger_complete:
+            logger.error(
+                "exchange income sync exceeded 20000 rows for one day; "
+                "capital-flow ledger remains incomplete"
+            )
         allowed = {"REALIZED_PNL", "FUNDING_FEE", "COMMISSION"}
         quote = self._settings.account.quote_asset
         total = 0.0
         for row in rows:
-            if str(row.get("incomeType") or "") not in allowed:
-                continue
-            if str(row.get("asset") or quote) != quote:
+            income_type = str(row.get("incomeType") or "").upper()
+            asset = str(row.get("asset") or quote)
+            if asset != quote:
                 continue
             try:
-                total += float(row.get("income") or 0.0)
+                amount = float(row.get("income") or 0.0)
             except (TypeError, ValueError):
                 continue
+            if income_type in allowed:
+                total += amount
+            if income_type not in _REST_CAPITAL_FLOW_TYPES or amount == 0:
+                continue
+            transaction_id = str(row.get("tranId") or "")
+            ts_ms = int(row.get("time") or 0)
+            flow_key = (
+                f"rest:{income_type}:{transaction_id}:{asset}"
+                if transaction_id
+                else f"rest:{income_type}:{ts_ms}:{asset}:{amount:.12g}"
+            )
+            await self._store.ingest_capital_flow(
+                flow_key=flow_key,
+                ts_ms=ts_ms,
+                asset=asset,
+                flow_type=income_type,
+                amount=amount,
+                source="rest",
+                status="confirmed",
+                transaction_id=transaction_id,
+                raw=row,
+            )
+            await self._store.match_provisional_capital_flow(
+                confirmed_flow_key=flow_key,
+                ts_ms=ts_ms,
+                asset=asset,
+                amount=amount,
+            )
         self.runtime.roll_day_if_needed(now)
         self.runtime.day_realized_pnl = total
+        self.runtime.day_net_capital_flow = await self._store.day_net_capital_flow(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            asset=quote,
+        )
+        self.runtime.capital_flow_ledger_status = (
+            "CONFIRMED" if ledger_complete else "INCOMPLETE"
+        )
+        self.runtime.capital_flow_status = self.runtime.capital_flow_ledger_status
+
+    async def _ingest_stream_capital_flow(self, event) -> None:
+        """Record ACCOUNT_UPDATE balance changes until REST confirms them."""
+        account = event.payload.get("a") or {}
+        reason = str(account.get("m") or "").upper()
+        if reason not in _STREAM_CAPITAL_FLOW_REASONS:
+            return
+        quote = self._settings.account.quote_asset
+        inserted = False
+        for balance in account.get("B") or []:
+            asset = str(balance.get("a") or "")
+            if asset != quote:
+                continue
+            try:
+                amount = float(balance.get("bc") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if amount == 0:
+                continue
+            inserted = (
+                await self._store.ingest_capital_flow(
+                    flow_key=f"stream:{event.event_key}:{asset}",
+                    ts_ms=event.transaction_time_ms or event.event_time_ms,
+                    asset=asset,
+                    flow_type=reason,
+                    amount=amount,
+                    source="stream",
+                    status="provisional",
+                    event_key=event.event_key,
+                    raw=event.payload,
+                )
+                or inserted
+            )
+        if not inserted:
+            return
+        now = time.time()
+        local = time.localtime(now)
+        start_ms = int(time.mktime((
+            local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0,
+            local.tm_wday, local.tm_yday, local.tm_isdst,
+        )) * 1000)
+        self.runtime.day_net_capital_flow = await self._store.day_net_capital_flow(
+            start_ms=start_ms,
+            end_ms=int(now * 1000),
+            asset=quote,
+        )
+        self.runtime.capital_flow_ledger_status = "PROVISIONAL"
+        self.runtime.capital_flow_status = "RECONCILING"
+        if self.runtime.capital_flow_guard_since_ms <= 0:
+            self.runtime.capital_flow_guard_since_ms = int(now * 1000)
+        if not self.runtime.halt_new_entries:
+            self.runtime.halt_entries("capital flow reconciliation: new entries paused")
+            await self._persist_strategy_pause_reason(
+                reason_code="CAPITAL_FLOW_RECONCILING",
+                reason=self.runtime.halt_new_entries_reason,
+                source="engine:capital_flow",
+            )
+        await self._store.set_runtime_settings({
+            _RISK_DAY_NET_CAPITAL_FLOW_KEY: str(self.runtime.day_net_capital_flow),
+            _RISK_CAPITAL_FLOW_STATUS_KEY: "RECONCILING",
+            _RISK_CAPITAL_FLOW_GUARD_SINCE_KEY: str(
+                self.runtime.capital_flow_guard_since_ms
+            ),
+        })
+
+    async def _update_capital_flow_guard(self, now_ms: int) -> None:
+        """Delay a first drawdown breach while transfers are being attributed."""
+        rt = self.runtime
+        crossing = (
+            not rt.drawdown_bypass_active()
+            and rt.risk_day_drawdown_pct >= self._settings.risk.max_drawdown_pct
+        )
+        if not crossing:
+            if (
+                rt.capital_flow_guard_since_ms > 0
+                and rt.capital_flow_ledger_status != "CONFIRMED"
+            ):
+                rt.capital_flow_status = "RECONCILING"
+                if not rt.halt_new_entries:
+                    rt.halt_entries("capital flow reconciliation: new entries paused")
+                    await self._persist_strategy_pause_reason(
+                        reason_code="CAPITAL_FLOW_RECONCILING",
+                        reason=rt.halt_new_entries_reason,
+                        source="engine:capital_flow",
+                    )
+                return
+            rt.capital_flow_guard_since_ms = 0
+            rt.capital_flow_status = rt.capital_flow_ledger_status
+            if rt.halt_new_entries_reason.startswith("capital flow reconciliation"):
+                rt.resume_entries()
+                await self._store.set_runtime_settings({
+                    "strategy.paused": "false",
+                    "strategy.pause.reason_code": "",
+                    "strategy.pause.reason": "",
+                    "strategy.pause.source": "",
+                    "strategy.pause.at_ms": "",
+                })
+            return
+
+        if rt.capital_flow_guard_since_ms <= 0:
+            rt.capital_flow_guard_since_ms = now_ms
+        elapsed = now_ms - rt.capital_flow_guard_since_ms
+        if (
+            rt.capital_flow_ledger_status != "CONFIRMED"
+            or elapsed < _CAPITAL_FLOW_GUARD_GRACE_MS
+        ):
+            rt.capital_flow_status = "RECONCILING"
+            if not rt.halt_new_entries:
+                rt.halt_entries("capital flow reconciliation: new entries paused")
+                await self._persist_strategy_pause_reason(
+                    reason_code="CAPITAL_FLOW_RECONCILING",
+                    reason=rt.halt_new_entries_reason,
+                    source="engine:capital_flow",
+                )
+            return
+
+        rt.capital_flow_status = "CONFIRMED"
+        if rt.halt_new_entries_reason.startswith("capital flow reconciliation"):
+            rt.resume_entries()
 
     def _detect_external_closes(self, prev: dict[str, dict], curr: dict[str, dict]) -> list[dict]:
         """对比前后持仓，对消失的持仓估算已实现盈亏并累加。

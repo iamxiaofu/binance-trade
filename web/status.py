@@ -804,7 +804,8 @@ def balance_history(
     limit = max(1, min(int(limit or 500), 2000))
     cols = (
         "SELECT ts_ms, created_at, total_equity, available_margin, "
-        "day_realized_pnl, drawdown_pct FROM balance_snapshots"
+        "day_realized_pnl, drawdown_pct, net_capital_flow, risk_equity, "
+        "risk_day_drawdown_pct, capital_flow_status FROM balance_snapshots"
     )
     clauses, args = _ts_where(
         "ts_ms",

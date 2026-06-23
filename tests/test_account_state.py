@@ -87,6 +87,30 @@ async def test_duplicate_and_stale_private_events_are_idempotent(tmp_path):
         await store.close()
 
 
+async def test_account_update_balance_does_not_update_risk_equity_before_rest_reconcile(
+    tmp_path,
+):
+    store, runtime, coordinator = await _coordinator(tmp_path)
+    runtime.update_equity(1000.0)
+    try:
+        await coordinator.submit(ExchangeEvent(
+            event_type="ACCOUNT_UPDATE",
+            transaction_time_ms=200,
+            payload={"a": {
+                "m": "ASSET_TRANSFER",
+                "B": [{"a": "USDT", "wb": "700", "cw": "700", "bc": "-300"}],
+            }},
+            event_key="withdraw-balance-update",
+        ))
+        await coordinator.drain()
+
+        assert runtime.current_equity == 1000.0
+        assert runtime.risk_day_equity_peak == 1000.0
+    finally:
+        await coordinator.close()
+        await store.close()
+
+
 async def test_order_update_marks_strategy_wake_event(tmp_path):
     store, runtime, coordinator = await _coordinator(tmp_path)
     try:
