@@ -4630,7 +4630,15 @@ class TradingEngine:
             free = float(free_raw) if free_raw is not None else 0.0
         except (TypeError, ValueError):
             free = 0.0
-        if total <= 0 or free < 0:
+        explained_zero_balance = (
+            total_raw is not None
+            and free_raw is not None
+            and total == 0
+            and free == 0
+            and self.runtime.day_net_capital_flow < 0
+            and self.runtime.capital_flow_ledger_status == "CONFIRMED"
+        )
+        if total < 0 or free < 0 or (total == 0 and not explained_zero_balance):
             logger.warning(
                 "balance parse invalid, skip snapshot: total={} free={} (keep prev equity={:.2f})",
                 total_raw, free_raw, self.runtime.current_equity,

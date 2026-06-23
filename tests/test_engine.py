@@ -1300,6 +1300,23 @@ async def test_record_balance_snapshot_skips_when_total_missing(settings, creds,
     assert eng.runtime.current_equity == pytest.approx(200.0)
 
 
+async def test_record_balance_snapshot_accepts_confirmed_full_withdrawal_to_zero(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.day_net_capital_flow = -200.0
+    eng.runtime.capital_flow_ledger_status = "CONFIRMED"
+
+    await eng._record_balance_snapshot(
+        {"total": {"USDT": 0.0}, "free": {"USDT": 0.0}}
+    )
+
+    assert eng.runtime.current_equity == 0.0
+    assert eng.runtime.risk_equity == pytest.approx(200.0)
+    assert eng.runtime.risk_day_drawdown_pct == pytest.approx(0.0)
+    assert eng._store.balance_snapshots[-1]["total_equity"] == 0.0
+
+
 async def test_record_balance_snapshot_skips_when_total_is_none(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
     eng.runtime.current_equity = 200.0
