@@ -86,6 +86,8 @@ _store: Store | None = None
 _confirmations: dict[str, dict[str, Any]] = {}
 _MAINNET_CONFIRM_TTL_SECONDS = 120
 _reconcile_lock = asyncio.Lock()
+_reconcile_background_tasks: dict[int, asyncio.Task] = {}
+_RECONCILE_TASK_REUSE_SECONDS = 300
 
 
 def _ws_auth_cookie_value() -> str:
@@ -1037,32 +1039,98 @@ async def api_confirmation(
     return {"token": token, "expires_in": _MAINNET_CONFIRM_TTL_SECONDS}
 
 
-async def _run_trade_reconcile_preview(days: int) -> dict[str, Any]:
+async def _execute_trade_reconcile_task(task_id: int, days: int) -> None:
+    store = await _get_store()
+
+    async def progress(stage: str, pct: int, detail: str) -> None:
+        await store.update_reconcile_task(
+            task_id,
+            status="running",
+            stage=stage,
+            progress_pct=pct,
+            detail=detail,
+        )
+
     client = ExchangeClient(_settings, _creds)
     try:
-        reconciler = BinanceTradeReconciler(await _get_store(), client, _DB)
-        result = await reconciler.preview(days=days)
-        result.pop("_resolved_fills", None)
-        return result
+        async with _reconcile_lock:
+            await progress("initializing", 1, "后台核对任务已启动")
+            reconciler = BinanceTradeReconciler(
+                store, client, _DB, progress=progress
+            )
+            result = await reconciler.preview(days=days)
+            result.pop("_resolved_fills", None)
+            await store.update_reconcile_task(
+                task_id,
+                status="succeeded",
+                stage="completed",
+                progress_pct=100,
+                detail="核对预览完成",
+                run_id=int(result.get("run_id") or 0),
+                result=result,
+                error="",
+            )
+    except asyncio.CancelledError:
+        await store.update_reconcile_task(
+            task_id,
+            status="canceled",
+            stage="canceled",
+            detail="后台核对任务已取消",
+            error="任务已取消",
+        )
+        raise
+    except Exception as exc:
+        logger.exception("Binance trade reconcile background task failed")
+        await store.update_reconcile_task(
+            task_id,
+            status="failed",
+            stage="failed",
+            detail="核对失败",
+            error=str(exc),
+        )
     finally:
         await client.close()
+        _reconcile_background_tasks.pop(task_id, None)
 
 
-@app.post("/api/trades/reconcile/preview")
+@app.post("/api/trades/reconcile/preview", status_code=202)
 async def api_trade_reconcile_preview(
     body: _TradeReconcilePreviewRequest,
     _: str = Depends(_check_auth),
 ):
-    if _reconcile_lock.locked():
-        raise HTTPException(status_code=409, detail="已有 Binance 成交核对任务正在运行")
-    async with _reconcile_lock:
-        try:
-            return await _run_trade_reconcile_preview(body.days)
-        except ReconcileError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.exception("Binance trade reconcile preview failed")
-            raise HTTPException(status_code=502, detail=f"核对失败：{exc}") from exc
+    store = await _get_store()
+    now_ms = int(time.time() * 1000)
+    task_key = secrets.token_hex(32)
+    task, reused = await store.create_or_reuse_reconcile_task(
+        task_key=task_key,
+        days=body.days,
+        reuse_after_ms=now_ms - _RECONCILE_TASK_REUSE_SECONDS * 1000,
+    )
+    task_id = int(task["task_id"])
+    if not reused and task_id not in _reconcile_background_tasks:
+        background = asyncio.create_task(
+            _execute_trade_reconcile_task(task_id, body.days),
+            name=f"trade-reconcile-preview-{task_id}",
+        )
+        _reconcile_background_tasks[task_id] = background
+    return {**task, "reused": reused}
+
+
+@app.get("/api/trades/reconcile/tasks/latest")
+async def api_trade_reconcile_latest_task(_: str = Depends(_check_auth)):
+    task = await (await _get_store()).latest_reconcile_task()
+    return task or {"status": "none"}
+
+
+@app.get("/api/trades/reconcile/tasks/{task_id}")
+async def api_trade_reconcile_task(
+    task_id: int,
+    _: str = Depends(_check_auth),
+):
+    task = await (await _get_store()).get_reconcile_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="核对任务不存在")
+    return task
 
 
 @app.post("/api/trades/reconcile/apply")
@@ -2025,7 +2093,10 @@ async def healthz():
 async def _ensure_schema() -> None:
     """确保数据库表已建（即使交易进程尚未运行过），避免只读查询命中缺表。"""
     try:
-        await _get_store()  # Store.connect() 会 create_all（幂等）
+        store = await _get_store()  # Store.connect() 会 create_all（幂等）
+        interrupted = await store.fail_interrupted_reconcile_tasks()
+        if interrupted:
+            logger.warning("marked {} interrupted reconcile task(s) failed", interrupted)
     except Exception as e:
         logger.warning("ensure schema on startup failed: {}", e)
 

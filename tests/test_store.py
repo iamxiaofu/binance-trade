@@ -489,6 +489,68 @@ async def test_capital_flow_ledger_deduplicates_and_matches_stream(store):
     assert net == pytest.approx(-300.0)
 
 
+async def test_reconcile_background_task_is_idempotent_and_persistent(store):
+    now_ms = int(time.time() * 1000)
+    first, reused = await store.create_or_reuse_reconcile_task(
+        task_key="task-1",
+        days=30,
+        reuse_after_ms=now_ms - 300_000,
+    )
+    assert reused is False
+    assert first["status"] == "queued"
+
+    duplicate, reused = await store.create_or_reuse_reconcile_task(
+        task_key="task-2",
+        days=60,
+        reuse_after_ms=now_ms - 300_000,
+    )
+    assert reused is True
+    assert duplicate["task_id"] == first["task_id"]
+
+    running = await store.update_reconcile_task(
+        first["task_id"],
+        status="running",
+        stage="order_metadata",
+        progress_pct=65,
+        detail="查询订单 10/20",
+    )
+    assert running["progress_pct"] == 65
+    assert (await store.latest_reconcile_task())["stage"] == "order_metadata"
+
+    result = {"run_id": 9, "preview_hash": "x" * 64, "safe_to_apply": True}
+    finished = await store.update_reconcile_task(
+        first["task_id"],
+        status="succeeded",
+        stage="completed",
+        progress_pct=100,
+        run_id=9,
+        result=result,
+    )
+    assert finished["result"] == result
+
+    reused_result, reused = await store.create_or_reuse_reconcile_task(
+        task_key="task-3",
+        days=30,
+        reuse_after_ms=now_ms - 300_000,
+    )
+    assert reused is True
+    assert reused_result["task_id"] == first["task_id"]
+
+
+async def test_reconcile_background_task_restart_marks_active_failed(store):
+    task, _ = await store.create_or_reuse_reconcile_task(
+        task_key="interrupted",
+        days=30,
+        reuse_after_ms=0,
+    )
+    await store.update_reconcile_task(task["task_id"], status="running")
+
+    assert await store.fail_interrupted_reconcile_tasks() == 1
+    failed = await store.get_reconcile_task(task["task_id"])
+    assert failed["status"] == "failed"
+    assert failed["stage"] == "interrupted"
+
+
 async def test_live_position_state_includes_margin_roi_and_liquidation(store):
     await store.upsert_live_position({
         "symbol": "SOL/USDT:USDT",

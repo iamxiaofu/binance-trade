@@ -46,6 +46,7 @@ from src.store.models import (
     ExternalTradeRow,
     ExternalTradeFillRow,
     ExchangeReconcileRunRow,
+    ExchangeReconcileTaskRow,
     BinanceTradeCycleRow,
     BinanceTradeCycleFillRow,
     LiveBalanceRow,
@@ -184,6 +185,7 @@ _SQLITE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_external_trades_symbol_status ON external_trades(symbol, status)",
     "CREATE INDEX IF NOT EXISTS ix_external_trade_fills_trade ON external_trade_fills(external_trade_id, id)",
     "CREATE INDEX IF NOT EXISTS ix_reconcile_runs_status_created ON exchange_reconcile_runs(status, created_at_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_reconcile_tasks_status_updated ON exchange_reconcile_tasks(status, updated_at_ms DESC)",
     "CREATE INDEX IF NOT EXISTS ix_binance_trade_cycles_run_opened ON binance_trade_cycles(run_id, opened_at_ms DESC)",
     "CREATE INDEX IF NOT EXISTS ix_capital_flows_asset_ts ON capital_flows(asset, ts_ms ASC)",
     "CREATE INDEX IF NOT EXISTS ix_capital_flows_status_ts ON capital_flows(status, ts_ms ASC)",
@@ -2900,6 +2902,172 @@ class Store:
                 )
             ).scalars().all()
             return sum(float(row.amount or 0.0) for row in rows)
+
+    # ---------- Binance trade reconciliation background tasks ----------
+    @staticmethod
+    def _reconcile_task_public(row: ExchangeReconcileTaskRow) -> dict[str, Any]:
+        result: dict[str, Any] | None = None
+        if row.result_json:
+            try:
+                parsed = json.loads(row.result_json)
+                result = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                result = None
+        return {
+            "task_id": row.id,
+            "task_key": row.task_key,
+            "status": row.status,
+            "days": row.days,
+            "stage": row.stage,
+            "progress_pct": row.progress_pct,
+            "detail": row.detail,
+            "run_id": row.run_id,
+            "result": result,
+            "error": row.error,
+            "created_at_ms": row.created_at_ms,
+            "updated_at_ms": row.updated_at_ms,
+            "started_at_ms": row.started_at_ms,
+            "finished_at_ms": row.finished_at_ms,
+        }
+
+    async def create_or_reuse_reconcile_task(
+        self,
+        *,
+        task_key: str,
+        days: int,
+        reuse_after_ms: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create a queued task, reusing an active or recently completed equivalent."""
+        now_ms = int(_t.time() * 1000)
+        async with self._sessionmaker() as session:
+            active = (
+                await session.execute(
+                    select(ExchangeReconcileTaskRow)
+                    .where(ExchangeReconcileTaskRow.status.in_(("queued", "running")))
+                    .order_by(ExchangeReconcileTaskRow.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if active is not None:
+                return self._reconcile_task_public(active), True
+            recent = (
+                await session.execute(
+                    select(ExchangeReconcileTaskRow)
+                    .where(ExchangeReconcileTaskRow.days == int(days))
+                    .where(ExchangeReconcileTaskRow.status == "succeeded")
+                    .where(ExchangeReconcileTaskRow.finished_at_ms >= int(reuse_after_ms))
+                    .order_by(ExchangeReconcileTaskRow.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if recent is not None:
+                return self._reconcile_task_public(recent), True
+            row = ExchangeReconcileTaskRow(
+                task_key=task_key,
+                active_slot=1,
+                days=int(days),
+                status="queued",
+                stage="queued",
+                progress_pct=0,
+                detail="等待后台执行",
+                created_at_ms=now_ms,
+                updated_at_ms=now_ms,
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing = (
+                    await session.execute(
+                        select(ExchangeReconcileTaskRow)
+                        .where(ExchangeReconcileTaskRow.status.in_(("queued", "running")))
+                        .order_by(ExchangeReconcileTaskRow.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if existing is None:
+                    raise
+                return self._reconcile_task_public(existing), True
+            await session.refresh(row)
+            return self._reconcile_task_public(row), False
+
+    async def update_reconcile_task(
+        self,
+        task_id: int,
+        *,
+        status: str | None = None,
+        stage: str | None = None,
+        progress_pct: int | None = None,
+        detail: str | None = None,
+        run_id: int | None = None,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any] | None:
+        now_ms = int(_t.time() * 1000)
+        async with self._sessionmaker() as session:
+            row = await session.get(ExchangeReconcileTaskRow, int(task_id))
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status[:16]
+                if status == "running" and row.started_at_ms <= 0:
+                    row.started_at_ms = now_ms
+                if status in ("succeeded", "failed", "canceled"):
+                    row.finished_at_ms = now_ms
+                    row.active_slot = None
+            if stage is not None:
+                row.stage = stage[:48]
+            if progress_pct is not None:
+                row.progress_pct = min(max(int(progress_pct), 0), 100)
+            if detail is not None:
+                row.detail = detail[:500]
+            if run_id is not None:
+                row.run_id = int(run_id)
+            if result is not None:
+                row.result_json = json.dumps(result, ensure_ascii=False, default=str)
+            if error is not None:
+                row.error = error[:4000]
+            row.updated_at_ms = now_ms
+            await session.commit()
+            return self._reconcile_task_public(row)
+
+    async def get_reconcile_task(self, task_id: int) -> dict[str, Any] | None:
+        async with self._sessionmaker() as session:
+            row = await session.get(ExchangeReconcileTaskRow, int(task_id))
+            return self._reconcile_task_public(row) if row is not None else None
+
+    async def latest_reconcile_task(self) -> dict[str, Any] | None:
+        async with self._sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(ExchangeReconcileTaskRow)
+                    .order_by(ExchangeReconcileTaskRow.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            return self._reconcile_task_public(row) if row is not None else None
+
+    async def fail_interrupted_reconcile_tasks(self) -> int:
+        """Mark tasks orphaned by a Web-process restart as failed."""
+        now_ms = int(_t.time() * 1000)
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(ExchangeReconcileTaskRow)
+                    .where(ExchangeReconcileTaskRow.status.in_(("queued", "running")))
+                )
+            ).scalars().all()
+            for row in rows:
+                row.status = "failed"
+                row.stage = "interrupted"
+                row.detail = "Web 服务重启，后台任务已中断，请重新发起"
+                row.error = row.detail
+                row.finished_at_ms = now_ms
+                row.updated_at_ms = now_ms
+                row.active_slot = None
+            await session.commit()
+            return len(rows)
 
     # ---------- 运行时设置 ----------
     async def set_runtime_setting(self, key: str, value: str) -> None:

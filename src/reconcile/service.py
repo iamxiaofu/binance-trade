@@ -9,7 +9,7 @@ import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select, text
 
@@ -62,10 +62,23 @@ class ReconcileError(RuntimeError):
 
 
 class BinanceTradeReconciler:
-    def __init__(self, store: Store, client: ExchangeClient, db_path: str):
+    def __init__(
+        self,
+        store: Store,
+        client: ExchangeClient,
+        db_path: str,
+        progress: Callable[[str, int, str], Awaitable[None]] | None = None,
+    ):
         self.store = store
         self.client = client
         self.db_path = db_path
+        self._progress_callback = progress
+        self._progress_lock = asyncio.Lock()
+
+    async def _progress(self, stage: str, pct: int, detail: str) -> None:
+        if self._progress_callback is not None:
+            async with self._progress_lock:
+                await self._progress_callback(stage, pct, detail)
 
     async def preview(
         self,
@@ -75,17 +88,31 @@ class BinanceTradeReconciler:
         scope_start_ms: int | None = None,
     ) -> dict[str, Any]:
         days = min(max(int(days), 1), MAX_DAYS)
+        await self._progress("initializing", 3, "获取 Binance 服务器时间")
         scope_end_ms = int(await self.client.fetch_server_time())
         if scope_start_ms is None:
             scope_start_ms = scope_end_ms - days * 24 * 60 * 60 * 1000
+        await self._progress("local_fills", 8, "读取本地成交账本")
         local_rows = await self._local_fills(scope_start_ms, scope_end_ms)
+        await self._progress("symbols", 15, "发现核对范围内交易币种")
         symbols = await self._scope_symbols(local_rows, scope_start_ms, scope_end_ms)
+        await self._progress(
+            "remote_fills", 25, f"拉取 Binance 成交，共 {len(symbols)} 个币种"
+        )
         remote_rows = await self._remote_fills(symbols, scope_start_ms, scope_end_ms)
+        await self._progress("verify_fills", 45, "校验本地与 Binance 成交集合")
         self._verify_remote_local(local_rows, remote_rows)
 
+        await self._progress("event_metadata", 52, "读取私有流订单元数据")
         event_metadata = await self._event_order_metadata(scope_start_ms, scope_end_ms)
-        order_metadata = await self._fetch_order_metadata(local_rows)
-        resolved = self._resolve_fills(local_rows, order_metadata, event_metadata)
+        cached_metadata = self._cached_order_metadata(local_rows)
+        order_metadata = await self._fetch_order_metadata(
+            local_rows, event_metadata, cached_metadata
+        )
+        await self._progress("resolve_ownership", 75, "解析订单归属与分批平仓关系")
+        resolved = self._resolve_fills(
+            local_rows, order_metadata, event_metadata, cached_metadata
+        )
         unresolved = [
             row for row in resolved
             if row["ownership"] not in {"engine", "external"} or not row["client_order_id"]
@@ -96,10 +123,12 @@ class BinanceTradeReconciler:
             )
             raise ReconcileError(f"存在无法确认归属的成交，拒绝修复：{sample}")
 
+        await self._progress("replay", 82, "重建分批开仓和平仓周期")
         current_positions = await self._current_positions(symbols)
         initial_positions = self._derive_initial_positions(resolved, current_positions)
         canonical_fills = [CanonicalFill.from_mapping(row) for row in resolved]
         replay = replay_trade_cycles(canonical_fills, initial_positions=initial_positions)
+        await self._progress("validate", 90, "校验重建仓位与交易所当前仓位")
         errors = validate_replay(canonical_fills, replay)
         errors.extend(self._validate_final_positions(replay.final_positions, current_positions))
         if errors:
@@ -198,9 +227,11 @@ class BinanceTradeReconciler:
             "_resolved_fills": resolved,
         }
         if persist:
+            await self._progress("persist", 96, "保存不可变核对预览")
             result["run_id"] = await self._persist_preview(
                 result, scope_start_ms=scope_start_ms, scope_end_ms=scope_end_ms
             )
+        await self._progress("completed", 100, "核对预览完成")
         return result
 
     async def apply(self, *, run_id: int, preview_hash: str, days: int) -> dict[str, Any]:
@@ -290,6 +321,11 @@ class BinanceTradeReconciler:
                 "liquidity": row.liquidity,
                 "reduce_only": row.reduce_only,
                 "ownership": row.ownership,
+                "resolved_client_order_id": row.resolved_client_order_id,
+                "resolved_reduce_only": row.resolved_reduce_only,
+                "resolved_order_type": row.resolved_order_type,
+                "resolved_algo_id": row.resolved_algo_id,
+                "resolved_metadata_source": row.resolved_metadata_source,
             }
             for row in rows
         ]
@@ -298,7 +334,13 @@ class BinanceTradeReconciler:
         self, symbols: list[str], start_ms: int, end_ms: int
     ) -> list[dict[str, Any]]:
         rows: dict[tuple[str, str], dict[str, Any]] = {}
-        for symbol in symbols:
+        total_symbols = max(len(symbols), 1)
+        for symbol_index, symbol in enumerate(symbols, start=1):
+            await self._progress(
+                "remote_fills",
+                25 + int(18 * (symbol_index - 1) / total_symbols),
+                f"拉取 {symbol} 成交（{symbol_index}/{len(symbols)}）",
+            )
             cursor = start_ms
             while cursor <= end_ms:
                 window_end = min(cursor + WINDOW_MS - 1, end_ms)
@@ -349,11 +391,19 @@ class BinanceTradeReconciler:
             raise ReconcileError(f"成交字段与 Binance 不一致：{', '.join(mismatches[:10])}")
 
     async def _fetch_order_metadata(
-        self, local_rows: list[dict[str, Any]]
+        self,
+        local_rows: list[dict[str, Any]],
+        event_metadata: dict[str, dict[str, Any]],
+        cached_metadata: dict[tuple[str, str], dict[str, Any]],
     ) -> dict[tuple[str, str], dict[str, Any]]:
         keys = sorted({
             (row["symbol"], str(row["exchange_order_id"]))
-            for row in local_rows if row["exchange_order_id"]
+            for row in local_rows
+            if row["exchange_order_id"]
+            and (row["symbol"], str(row["exchange_order_id"])) not in cached_metadata
+            and not self._event_metadata_complete(
+                event_metadata.get(str(row["exchange_order_id"]), {})
+            )
         })
         semaphore = asyncio.Semaphore(6)
 
@@ -369,7 +419,54 @@ class BinanceTradeReconciler:
                     raise ReconcileError(f"查询 Binance 订单 {symbol}:{order_id} 失败：{exc}") from exc
                 return key, dict(raw or {})
 
-        return dict(await asyncio.gather(*(fetch(key) for key in keys)))
+        if not keys:
+            await self._progress("order_metadata", 72, "复用本地已核对订单元数据")
+            return {}
+
+        completed = 0
+        output: dict[tuple[str, str], dict[str, Any]] = {}
+
+        async def fetch_with_progress(key: tuple[str, str]):
+            nonlocal completed
+            item = await fetch(key)
+            completed += 1
+            await self._progress(
+                "order_metadata",
+                55 + int(17 * completed / len(keys)),
+                f"查询 Binance 订单元数据（{completed}/{len(keys)}）",
+            )
+            return item
+
+        output.update(await asyncio.gather(*(fetch_with_progress(key) for key in keys)))
+        return output
+
+    @staticmethod
+    def _event_metadata_complete(metadata: dict[str, Any]) -> bool:
+        return bool(
+            metadata.get("client_order_id")
+            and metadata.get("order_type")
+            and "reduce_only" in metadata
+        )
+
+    @staticmethod
+    def _cached_order_metadata(
+        local_rows: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        cached: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in local_rows:
+            key = (row["symbol"], str(row.get("exchange_order_id") or ""))
+            if not key[1] or not row.get("resolved_metadata_source"):
+                continue
+            if not row.get("resolved_client_order_id"):
+                continue
+            cached[key] = {
+                "clientOrderId": row["resolved_client_order_id"],
+                "reduceOnly": bool(row.get("resolved_reduce_only")),
+                "origType": row.get("resolved_order_type") or "",
+                "_cached_algo_id": row.get("resolved_algo_id") or "",
+                "_metadata_source": row.get("resolved_metadata_source") or "local_reconciled",
+            }
+        return cached
 
     async def _event_order_metadata(
         self, start_ms: int, end_ms: int
@@ -424,10 +521,13 @@ class BinanceTradeReconciler:
         local_rows: list[dict[str, Any]],
         orders: dict[tuple[str, str], dict[str, Any]],
         event_metadata: dict[str, dict[str, Any]],
+        cached_metadata: dict[tuple[str, str], dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         resolved = []
+        cached_metadata = cached_metadata or {}
         for local in local_rows:
-            order = orders.get((local["symbol"], str(local["exchange_order_id"])), {})
+            key = (local["symbol"], str(local["exchange_order_id"]))
+            order = orders.get(key) or cached_metadata.get(key, {})
             event = event_metadata.get(str(local["exchange_order_id"]), {})
             client_id = str(
                 order.get("clientOrderId") or event.get("client_order_id")
@@ -468,8 +568,13 @@ class BinanceTradeReconciler:
                 "ownership": ownership,
                 "order_type": order_type,
                 "exit_reason": exit_reason,
-                "algo_id": str(event.get("algo_id") or ""),
-                "metadata_source": "binance_order+private_event" if event else "binance_order",
+                "algo_id": str(
+                    event.get("algo_id") or order.get("_cached_algo_id") or ""
+                ),
+                "metadata_source": str(
+                    order.get("_metadata_source")
+                    or ("binance_order+private_event" if event else "binance_order")
+                ),
                 "original_ownership": local["ownership"],
                 "original_client_order_id": local["client_order_id"],
                 "original_reduce_only": bool(local["reduce_only"]),

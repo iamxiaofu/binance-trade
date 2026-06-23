@@ -37,6 +37,8 @@ const reconcileApplying = ref(false)
 const reconcileDialog = ref(false)
 const reconcileDays = ref(30)
 const reconcilePreview = ref(null)
+const reconcileTask = ref(null)
+let reconcilePollTimer = null
 const loading = computed(() => tab.value === 'trades' ? tradeLoading.value : rawLoading.value)
 const TRADE_SEARCH_DEBOUNCE_MS = 200
 const RAW_LIST_LIMIT = 100
@@ -139,12 +141,73 @@ function pnlClass(value) {
 async function previewReconcile() {
   reconcileLoading.value = true
   try {
-    reconcilePreview.value = await api.tradeReconcilePreview(reconcileDays.value)
-    reconcileDialog.value = true
+    const task = await api.tradeReconcilePreview(reconcileDays.value)
+    reconcileTask.value = task
+    if (task.status === 'succeeded' && task.result) {
+      reconcilePreview.value = task.result
+      reconcileDialog.value = true
+      reconcileLoading.value = false
+      return
+    }
+    ElMessage.info(task.reused ? '已恢复正在运行的核对任务' : '核对任务已在后台启动')
+    scheduleReconcilePoll()
   } catch (e) {
     ElMessage.error(e.message)
-  } finally {
     reconcileLoading.value = false
+  }
+}
+
+function clearReconcilePoll() {
+  if (reconcilePollTimer) {
+    clearTimeout(reconcilePollTimer)
+    reconcilePollTimer = null
+  }
+}
+
+function scheduleReconcilePoll(delay = 1000) {
+  clearReconcilePoll()
+  reconcilePollTimer = setTimeout(pollReconcileTask, delay)
+}
+
+async function pollReconcileTask() {
+  const taskId = Number(reconcileTask.value?.task_id || 0)
+  if (!taskId) return
+  try {
+    const task = await api.tradeReconcileTask(taskId)
+    reconcileTask.value = task
+    if (task.status === 'succeeded') {
+      reconcileLoading.value = false
+      reconcilePreview.value = task.result
+      reconcileDialog.value = Boolean(task.result)
+      ElMessage.success(`核对预览完成，版本 #${task.run_id}`)
+      return
+    }
+    if (task.status === 'failed' || task.status === 'canceled') {
+      reconcileLoading.value = false
+      ElMessage.error(task.error || task.detail || '核对任务失败')
+      return
+    }
+    reconcileLoading.value = true
+    scheduleReconcilePoll()
+  } catch (e) {
+    reconcileLoading.value = false
+    ElMessage.error(e.message)
+  }
+}
+
+async function restoreReconcileTask() {
+  const task = await api.latestTradeReconcileTask().catch(() => null)
+  if (!task || task.status === 'none') return
+  reconcileTask.value = task
+  if (task.status === 'queued' || task.status === 'running') {
+    reconcileLoading.value = true
+    scheduleReconcilePoll(100)
+  } else if (
+    task.status === 'succeeded'
+    && task.result
+    && Date.now() - Number(task.finished_at_ms || 0) < 10 * 60 * 1000
+  ) {
+    reconcilePreview.value = task.result
   }
 }
 
@@ -262,13 +325,14 @@ function handleSizeChange(size) {
 
 onMounted(async () => {
   cfg.value = await api.config().catch(() => null)
-  await loadTrades()
+  await Promise.all([loadTrades(), restoreReconcileTask()])
 })
 
 onUnmounted(() => {
   clearTradeSearchTimer()
   abortTradeRequest()
   abortRawRequest()
+  clearReconcilePoll()
 })
 </script>
 
@@ -310,6 +374,20 @@ onUnmounted(() => {
       </template>
 
       <template v-if="tab === 'trades'">
+        <el-alert
+          v-if="reconcileTask && ['queued', 'running'].includes(reconcileTask.status)"
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom:12px"
+          :title="`Binance 核对进行中：${reconcileTask.detail || reconcileTask.stage}`"
+        >
+          <el-progress
+            :percentage="Number(reconcileTask.progress_pct || 0)"
+            :stroke-width="8"
+            style="margin-top:8px"
+          />
+        </el-alert>
         <el-alert
           v-if="fillAudit.mixed || fillAudit.unknown"
           type="warning"

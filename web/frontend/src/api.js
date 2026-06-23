@@ -196,6 +196,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ days }),
     }),
+  tradeReconcileTask: (taskId) =>
+    req(`/api/trades/reconcile/tasks/${taskId}`),
+  latestTradeReconcileTask: () =>
+    req('/api/trades/reconcile/tasks/latest'),
   tradeReconcileApply: async (preview, days = 30) => {
     const commandPayload = JSON.stringify({
       run_id: preview.run_id,

@@ -284,6 +284,70 @@ async def test_status_summary_separates_regular_and_condition_orders(monkeypatch
     assert summary["balance"]["regular_open_order_count"] == 1
 
 
+async def test_reconcile_preview_endpoint_returns_background_task_immediately(monkeypatch):
+    class FakeStore:
+        async def create_or_reuse_reconcile_task(self, **_kw):
+            return ({
+                "task_id": 77,
+                "status": "queued",
+                "days": 30,
+                "stage": "queued",
+                "progress_pct": 0,
+                "detail": "等待后台执行",
+            }, False)
+
+    async def fake_get_store():
+        return FakeStore()
+
+    scheduled = []
+
+    def fake_create_task(coro, *, name):
+        scheduled.append(name)
+        coro.close()
+        return object()
+
+    server._reconcile_background_tasks.clear()
+    monkeypatch.setattr(server, "_get_store", fake_get_store)
+    monkeypatch.setattr(server.asyncio, "create_task", fake_create_task)
+
+    result = await server.api_trade_reconcile_preview(
+        server._TradeReconcilePreviewRequest(days=30),
+        _="tester",
+    )
+
+    assert result["task_id"] == 77
+    assert result["status"] == "queued"
+    assert scheduled == ["trade-reconcile-preview-77"]
+    server._reconcile_background_tasks.clear()
+
+
+async def test_reconcile_preview_endpoint_reuses_recent_result(monkeypatch):
+    preview = {"run_id": 8, "safe_to_apply": True, "preview_hash": "x" * 64}
+
+    class FakeStore:
+        async def create_or_reuse_reconcile_task(self, **_kw):
+            return ({
+                "task_id": 88,
+                "status": "succeeded",
+                "days": 30,
+                "stage": "completed",
+                "progress_pct": 100,
+                "result": preview,
+            }, True)
+
+    async def fake_get_store():
+        return FakeStore()
+
+    monkeypatch.setattr(server, "_get_store", fake_get_store)
+    result = await server.api_trade_reconcile_preview(
+        server._TradeReconcilePreviewRequest(days=30),
+        _="tester",
+    )
+
+    assert result["reused"] is True
+    assert result["result"] == preview
+
+
 def test_projection_metadata_applies_local_trade_fields(monkeypatch):
     monkeypatch.setattr(
         server.st,

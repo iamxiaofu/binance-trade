@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,3 +173,30 @@ def test_order_metadata_resolves_triggered_algo_and_manual_reduce():
     assert resolved["ownership"] == "engine"
     assert resolved["exit_reason"] == "TP"
     assert resolved["algo_id"] == "200"
+
+
+async def test_reconciled_order_metadata_is_reused_without_binance_lookup():
+    class Raw:
+        async def fapiPrivateGetOrder(self, _params):
+            raise AssertionError("already reconciled order must not be queried again")
+
+    reconciler = BinanceTradeReconciler(
+        store=SimpleNamespace(),
+        client=SimpleNamespace(raw=Raw()),
+        db_path="unused.db",
+    )
+    local = [{
+        "symbol": "SOLUSDT",
+        "exchange_order_id": "100",
+        "resolved_client_order_id": "bt-existing",
+        "resolved_reduce_only": True,
+        "resolved_order_type": "TAKE_PROFIT_MARKET",
+        "resolved_algo_id": "200",
+        "resolved_metadata_source": "binance_order+private_event",
+    }]
+    cached = reconciler._cached_order_metadata(local)
+
+    fetched = await reconciler._fetch_order_metadata(local, {}, cached)
+
+    assert fetched == {}
+    assert cached[("SOLUSDT", "100")]["clientOrderId"] == "bt-existing"

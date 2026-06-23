@@ -272,6 +272,27 @@ class ExchangeReconcileRunRow(Base):
     error: Mapped[str] = mapped_column(Text, default="")
 
 
+class ExchangeReconcileTaskRow(Base):
+    """Persistent background task for a Binance reconciliation preview."""
+    __tablename__ = "exchange_reconcile_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    active_slot: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    updated_at_ms: Mapped[int] = mapped_column(Integer, default=_now_ms, index=True)
+    started_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    finished_at_ms: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    days: Mapped[int] = mapped_column(Integer, default=30)
+    stage: Mapped[str] = mapped_column(String(48), default="queued")
+    progress_pct: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[str] = mapped_column(String(500), default="")
+    run_id: Mapped[int] = mapped_column(Integer, default=0)
+    result_json: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
 class BinanceTradeCycleRow(Base):
     """Canonical account lifecycle generation; only external-involved cycles are shown."""
     __tablename__ = "binance_trade_cycles"
