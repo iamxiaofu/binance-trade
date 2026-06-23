@@ -122,6 +122,8 @@ class FakeStore:
         self.claims = []
         self.takeover_trades = []
         self.open_qty = {}
+        self.open_directions = {}
+        self.audits = []
         self.system_commands = []  # (command, arg, source, status, result)
         self.symbols = {
             "BTCUSDT": {
@@ -194,6 +196,9 @@ class FakeStore:
         self.system_commands.append((command, arg, source, status, result))
         return len(self.system_commands)
 
+    async def log_audit(self, **kw):
+        self.audits.append(kw)
+
     async def mark_orders_status_by_exchange_ids(self, exchange_order_ids, status):
         self.marked_status_calls.append((list(exchange_order_ids or []), status))
         return len(exchange_order_ids or [])
@@ -239,6 +244,15 @@ class FakeStore:
 
     async def open_trade_qty(self, symbol):
         return self.open_qty.get(symbol, 0.0) if symbol in self.open_trades else 0.0
+
+    async def open_trade_qty_by_direction(self, symbol):
+        if symbol not in self.open_trades:
+            return {"long": 0.0, "short": 0.0}
+        direction = getattr(self, "open_directions", {}).get(symbol, "long")
+        return {
+            "long": self.open_qty.get(symbol, 0.0) if direction == "long" else 0.0,
+            "short": self.open_qty.get(symbol, 0.0) if direction == "short" else 0.0,
+        }
 
     async def begin_position_claim(self, **kw):
         claim_id = len(self.claims) + 1
@@ -646,6 +660,12 @@ def _ctx(price=100.0, margin=200.0):
 
 async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 90.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
     eng.runtime.update_equity(200.0)  # 权益基准
     # 日亏限额 = 200 * 10% = 20；亏 21 触发
     limit = 200.0 * settings.risk.daily_max_loss_pct / 100.0
@@ -654,7 +674,7 @@ async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch)
     assert tripped is True
     assert eng.runtime.halt_new_entries is True
     assert eng.runtime.halt_new_entries_reason.startswith("circuit breaker: daily loss")
-    assert eng._executor.flattened == 1
+    assert len(eng._executor.closed) == 1
     assert any(e == Event.CIRCUIT_BREAK for e, _ in eng._notifier.events)
 
     # 新增：pause 元数据 + 系统命令历史都写入了
@@ -666,14 +686,20 @@ async def test_circuit_breaker_trips_on_daily_loss(settings, creds, monkeypatch)
     assert system_cmds, "circuit breaker should write a system command record"
     assert system_cmds[0][1] == "DAILY_LOSS"
     assert system_cmds[0][3] == "done"
-    assert "flattened 1 positions" in system_cmds[0][4]
+    assert "flattened 1 managed positions" in system_cmds[0][4]
 
 
 async def test_circuit_breaker_trips_on_drawdown(settings, creds, monkeypatch):
     eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 80.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
     eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
     assert await eng._check_circuit_breaker() is True
-    assert eng._executor.flattened == 1
+    assert len(eng._executor.closed) == 1
 
     assert eng._store.runtime_settings["strategy.pause.reason_code"] == "MAX_DRAWDOWN"
     assert "drawdown" in eng._store.runtime_settings["strategy.pause.reason"]
@@ -687,6 +713,92 @@ async def test_no_breaker_under_limits(settings, creds, monkeypatch):
     eng.runtime.risk_day_drawdown_pct = 1.0
     assert await eng._check_circuit_breaker() is False
     assert eng._executor.flattened == 0
+
+
+async def test_circuit_breaker_preserves_external_position(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 75.0,
+    }]
+    eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
+
+    assert await eng._check_circuit_breaker() is True
+
+    assert eng._executor.closed == []
+    system = [row for row in eng._store.system_commands if row[0] == "CIRCUIT_BREAKER"][-1]
+    assert "preserved external positions: BTCUSDT(external qty=1)" in system[4]
+
+
+async def test_circuit_breaker_closes_only_managed_part_of_mixed_position(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.5,
+        "entryPrice": 100.0, "markPrice": 75.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.5
+    eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
+
+    assert await eng._check_circuit_breaker() is True
+
+    assert len(eng._executor.closed) == 1
+    assert eng._executor.closed[0][0]["contracts"] == pytest.approx(0.5)
+    system = [row for row in eng._store.system_commands if row[0] == "CIRCUIT_BREAKER"][-1]
+    assert "external remainder=1" in system[4]
+
+
+async def test_circuit_breaker_preserves_position_on_ownership_direction_conflict(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT", "side": "short", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 125.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.5
+    eng._store.open_directions = {"BTCUSDT": "long"}
+    eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
+
+    assert await eng._check_circuit_breaker() is True
+
+    assert eng._executor.closed == []
+    system = [row for row in eng._store.system_commands if row[0] == "CIRCUIT_BREAKER"][-1]
+    assert "ownership conflict" in system[4]
+
+
+async def test_circuit_breaker_fails_when_managed_close_is_not_filled(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 75.0,
+    }]
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+    eng.runtime.risk_day_drawdown_pct = settings.risk.max_drawdown_pct + 1
+
+    async def rejected_close(position, *, mode=None, skip_slippage_guard=False):
+        return {
+            "symbol": "BTCUSDT",
+            "kind": "CLOSE",
+            "status": "rejected",
+            "filled": False,
+            "remaining_qty": 1.0,
+        }
+
+    eng._executor.close_position = rejected_close
+
+    with pytest.raises(RuntimeError, match="emergency flatten failed"):
+        await eng._check_circuit_breaker()
+
+    assert eng._store.orders[-1]["status"] == "rejected"
+    system = [row for row in eng._store.system_commands if row[0] == "CIRCUIT_BREAKER"][-1]
+    assert system[3] == "failed"
 
 
 async def test_runtime_risk_update_is_versioned_and_applied(settings, creds, monkeypatch):
@@ -1155,6 +1267,8 @@ async def test_reconcile_defers_unmanaged_disable_after_recent_explicit_close(se
         "markPrice": 101.0,
     }
     eng.runtime.positions["BTCUSDT"] = position
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.1
 
     await eng._handle_close("BTCUSDT")
 
@@ -1276,6 +1390,7 @@ async def test_reconcile_repairs_disabled_managed_position_missing_stop(settings
     eng = _engine(settings, creds, monkeypatch)
     eng._symbol_enabled["BTCUSDT"] = False
     eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.1
     eng._store.set_decision(
         "BTCUSDT",
         action="OPEN_LONG",
@@ -1530,10 +1645,40 @@ async def test_close_accumulates_realized_pnl(settings, creds, monkeypatch):
         "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 2.0,
         "entryPrice": 100.0, "markPrice": 110.0,
     }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 2.0
     await eng._handle_close("BTCUSDT")
     assert eng.runtime.day_realized_pnl == pytest.approx(20.0)
     assert "BTCUSDT" not in eng.runtime.positions
     assert any(e == Event.CLOSE for e, _ in eng._notifier.events)
+
+
+async def test_llm_close_preserves_external_only_position(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.positions["BTCUSDT"] = {
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 90.0,
+    }
+
+    await eng._handle_close("BTCUSDT")
+
+    assert eng._executor.closed == []
+    assert eng._store.audits[-1]["action"] == "CLOSE_BLOCKED"
+    assert "external qty=1" in eng._store.audits[-1]["reason"]
+
+
+async def test_llm_close_limits_mixed_position_to_managed_qty(settings, creds, monkeypatch):
+    eng = _engine(settings, creds, monkeypatch)
+    eng.runtime.positions["BTCUSDT"] = {
+        "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.5,
+        "entryPrice": 100.0, "markPrice": 110.0,
+    }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.5
+
+    await eng._handle_close("BTCUSDT")
+
+    assert eng._executor.closed[0][0]["contracts"] == pytest.approx(0.5)
 
 
 async def test_losing_close_drives_daily_loss(settings, creds, monkeypatch):
@@ -1545,6 +1690,8 @@ async def test_losing_close_drives_daily_loss(settings, creds, monkeypatch):
         "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 3.0,
         "entryPrice": 100.0, "markPrice": 90.0,
     }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 3.0
     await eng._handle_close("BTCUSDT")
     assert eng.runtime.day_realized_pnl == pytest.approx(-30.0)
     # 熔断检查现在应判定日亏超限
@@ -2130,12 +2277,75 @@ async def test_command_repair_sl_tp_places_missing_orders(settings, creds, monke
         "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
         "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
     }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+    eng._store.open_directions["BTCUSDT"] = "short"
 
     result = await eng._exec_command("REPAIR_SL_TP", "BTCUSDT")
 
     assert "已补挂 SL@102.00, TP@95.00" in result
     assert [o["kind"] for o in eng._store.orders] == ["SL", "TP"]
     assert all(o["side"] == "buy" for o in eng._store.orders)
+
+
+async def test_command_repair_sl_tp_limits_mixed_position_to_managed_qty(
+    settings, creds, monkeypatch,
+):
+    settings.risk.max_loss_per_order_margin_pct = 10
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client = RepairClient(
+        position={
+            "symbol": "BTC/USDT:USDT",
+            "side": "short",
+            "contracts": 1.5,
+            "entryPrice": 100.0,
+            "markPrice": 99.0,
+        },
+        equity=1000.0,
+    )
+    eng._store.templates = {
+        "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
+        "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
+    }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 0.5
+    eng._store.open_directions["BTCUSDT"] = "short"
+
+    await eng._exec_command("REPAIR_SL_TP", "BTCUSDT")
+
+    assert [order["qty"] for order in eng._store.orders] == [0.5, 0.5]
+
+
+async def test_pre_attach_protection_does_not_take_over_external_remainder(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._client.positions = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.5,
+        "entryPrice": 100.0,
+        "markPrice": 100.0,
+    }]
+    decision = TradeDecision(
+        symbol="BTCUSDT",
+        action=Action.OPEN_LONG,
+        confidence=0.9,
+        size_pct=0.05,
+        leverage=2,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        reason="test",
+    )
+
+    result = await eng._precheck_before_attach_sl_tp(
+        symbol="BTCUSDT",
+        decision=decision,
+        open_result={"qty": 0.5, "price": 100.0},
+    )
+
+    assert result["ok"] is True
+    assert result["qty"] == pytest.approx(0.5)
 
 
 async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, monkeypatch):
@@ -2160,6 +2370,9 @@ async def test_command_repair_sl_tp_rejects_out_of_range_stop(settings, creds, m
         "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
         "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
     }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+    eng._store.open_directions["BTCUSDT"] = "short"
     eng._store.pending = [{"id": 9, "command": "REPAIR_SL_TP", "arg": "BTCUSDT"}]
 
     await eng._process_commands()
@@ -2174,6 +2387,8 @@ async def test_reconcile_emergency_closes_when_repair_sl_crossed_mark(settings, 
     eng = _engine(settings, creds, monkeypatch)
     eng._symbol_enabled["BTCUSDT"] = True
     eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+    eng._store.open_directions["BTCUSDT"] = "short"
     eng._client.positions = [{
         "symbol": "BTC/USDT:USDT",
         "side": "short",
@@ -2225,6 +2440,9 @@ async def test_command_repair_sl_tp_keeps_active_tp_after_mark_crosses_trigger(s
         "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
         "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
     }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+    eng._store.open_directions["BTCUSDT"] = "short"
 
     result = await eng._exec_command("REPAIR_SL_TP", "BTCUSDT")
 
@@ -2255,6 +2473,9 @@ async def test_command_repair_sl_tp_blocks_mismatched_stale_order(settings, cred
         "SL": {"price": 102.0, "order_type": "STOP_MARKET"},
         "TP": {"price": 95.0, "order_type": "TAKE_PROFIT_MARKET"},
     }
+    eng._store.open_trades.add("BTCUSDT")
+    eng._store.open_qty["BTCUSDT"] = 1.0
+    eng._store.open_directions["BTCUSDT"] = "short"
     eng._store.pending = [{"id": 10, "command": "REPAIR_SL_TP", "arg": "BTCUSDT"}]
 
     await eng._process_commands()
@@ -2552,6 +2773,62 @@ async def test_orphan_adoption_picks_up_managed_qty_and_repairs_sl_tp(settings, 
         if o.get("kind") in ("SL", "TP")
     ]
     assert sl_tp_orders, "orphan adoption should place SL/TP"
+
+
+async def test_orphan_adoption_preserves_exchange_qty_above_strategy_claim(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.set_finished_claim(
+        "BTCUSDT",
+        side="long",
+        planned_qty=1.0,
+        filled_qty=0.0,
+        status="canceled",
+        source="strategy",
+    )
+    eng._store.set_decision(
+        "BTCUSDT",
+        action="OPEN_LONG",
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+    )
+    eng._client = FakeExchangeClientWithPosition({
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.5,
+        "entryPrice": 100.0,
+        "markPrice": 100.0,
+        "info": {"leverage": "3"},
+    })
+
+    assert await eng._adopt_orphan_position("BTCUSDT", reason="test") is True
+
+    assert eng._store.takeover_trades[-1]["qty"] == pytest.approx(1.0)
+    assert all(order["qty"] == pytest.approx(1.0) for order in eng._store.orders)
+
+
+async def test_orphan_adoption_rejects_manual_claim_as_takeover_authority(
+    settings, creds, monkeypatch,
+):
+    eng = _engine(settings, creds, monkeypatch)
+    eng._store.set_finished_claim(
+        "BTCUSDT",
+        side="long",
+        planned_qty=1.0,
+        status="canceled",
+        source="manual",
+    )
+    eng._client = FakeExchangeClientWithPosition({
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "contracts": 1.0,
+        "entryPrice": 100.0,
+        "markPrice": 100.0,
+    })
+
+    assert await eng._adopt_orphan_position("BTCUSDT", reason="test") is False
+    assert eng._store.takeover_trades == []
 
 
 async def test_orphan_adoption_skips_when_no_recent_claim(settings, creds, monkeypatch):

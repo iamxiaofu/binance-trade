@@ -1503,6 +1503,7 @@ class Executor:
     async def flatten_all(self, symbols: list[str] | None = None) -> list[dict]:
         """平掉所有持仓。"""
         results: list[dict] = []
+        errors: list[str] = []
         positions = await self._client.fetch_positions(symbols or self._settings.symbols)
         for p in positions:
             try:

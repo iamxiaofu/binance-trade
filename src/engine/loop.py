@@ -1385,6 +1385,14 @@ class TradingEngine:
                 f"(side={side}, qty={qty}, entry={entry}, mark={mark})"
             )
 
+        managed_position, ownership_note = await self._managed_position_slice(position)
+        if managed_position is None:
+            raise ValueError(
+                f"{symbol}: 无可自动管理的本地托管仓位；{ownership_note}；"
+                "外部仓位需通过“接管保护”人工确认授权"
+            )
+        qty = float(managed_position["contracts"])
+
         close_side = "sell" if side == "long" else "buy"
         active_orders = await self._active_protection_orders(symbol)
         stale_orders = self._stale_protection_orders(
@@ -2047,9 +2055,19 @@ class TradingEngine:
         qty_tol = max(expected_qty * 1e-6, 1e-12)
         if abs(live_qty - expected_qty) > qty_tol:
             logger.warning(
-                "{} pre-attach qty drift: local={} exchange={} (use exchange value)",
+                "{} pre-attach qty drift: local={} exchange={} "
+                "(protection limited to this engine fill)",
                 symbol, expected_qty, live_qty,
             )
+        attach_qty = min(live_qty, expected_qty)
+        if attach_qty <= qty_tol:
+            return {
+                "ok": False,
+                "reason": (
+                    f"{symbol} 本次引擎成交数量 {expected_qty:g} "
+                    f"与交易所剩余数量 {live_qty:g} 无可保护交集"
+                ),
+            }
         live_entry = live["entry_price"]
         # 2) 检查已挂条件单
         try:
@@ -2072,7 +2090,7 @@ class TradingEngine:
                 "ok": False,
                 "reason": f"已存在 {len(active_sl_tp)} 个活跃条件单 ({details})，避免重复挂",
             }
-        return {"ok": True, "qty": live_qty, "entry": live_entry, "side": side}
+        return {"ok": True, "qty": attach_qty, "entry": live_entry, "side": side}
 
     async def _handle_missing_stop_after_open(
         self,
@@ -2255,7 +2273,21 @@ class TradingEngine:
         if raw is None:
             logger.warning("{} emergency close skipped, no live position ({})", symbol, reason)
             return
-        result = await self._executor.close_position(raw, mode=ExecutionMode.MARKET_TAKER)
+        managed_position, ownership_note = await self._managed_position_slice(raw)
+        if managed_position is None:
+            logger.error(
+                "{} emergency close skipped because no managed quantity: {} ({})",
+                symbol, ownership_note, reason,
+            )
+            await self._notifier.send(
+                Event.ERROR,
+                f"{symbol} emergency close skipped: {ownership_note}; manual review required",
+            )
+            return
+        result = await self._executor.close_position(
+            managed_position,
+            mode=ExecutionMode.MARKET_TAKER,
+        )
         await self._store.log_order(result)
         if not result.get("filled"):
             logger.error("{} emergency close failed: {}", symbol, result)
@@ -2806,9 +2838,7 @@ class TradingEngine:
             )
             flatten_error: Exception | None = None
             try:
-                results = await self._executor.flatten_all(symbols=self._tracked_symbols())
-                for result in results:
-                    await self._store.log_order(result)
+                results, skipped = await self._flatten_engine_managed_positions()
                 flattened = sum(1 for result in results if result.get("filled"))
             except Exception as e:
                 logger.error("circuit-breaker flatten failed: {}", e)
@@ -2827,7 +2857,10 @@ class TradingEngine:
                     arg=reason_code,
                     source="engine",
                     status="done",
-                    result=f"{rt.halt_new_entries_reason}; flattened {flattened} positions",
+                    result=(
+                        f"{rt.halt_new_entries_reason}; flattened {flattened} managed positions; "
+                        f"preserved external positions: {', '.join(skipped) or 'none'}"
+                    ),
                 )
             await self._notifier.send(Event.CIRCUIT_BREAK, breached)
             if flatten_error is not None:
@@ -2836,6 +2869,89 @@ class TradingEngine:
                 ) from flatten_error
             return True
         return rt.halt_new_entries
+
+    async def _flatten_engine_managed_positions(self) -> tuple[list[dict], list[str]]:
+        """Close only the quantity represented by local open trade lifecycles.
+
+        Exchange positions without a local Engine/takeover lifecycle are external and
+        must never be closed by an automatic circuit breaker.
+        """
+        positions = await self._client.fetch_positions(self._tracked_symbols())
+        results: list[dict] = []
+        skipped: list[str] = []
+        for raw in positions:
+            position = normalize_position(raw)
+            symbol = position["symbol"]
+            live_qty = abs(float(position.get("contracts") or 0.0))
+            if live_qty <= 0:
+                continue
+            partial, ownership_note = await self._managed_position_slice(raw)
+            if partial is None:
+                skipped.append(f"{symbol}({ownership_note})")
+                continue
+            close_qty = abs(float(partial.get("contracts") or 0.0))
+            result = await self._executor.close_position(
+                partial,
+                mode=self._settings.execution.emergency_exit_mode,
+                skip_slippage_guard=True,
+            )
+            results.append(result)
+            await self._store.log_order(result)
+            remaining_qty = max(float(result.get("remaining_qty") or 0.0), 0.0)
+            if not result.get("filled") or remaining_qty > max(close_qty * 1e-6, 1e-12):
+                raise RuntimeError(
+                    f"{symbol} managed flatten incomplete: "
+                    f"status={result.get('status') or 'unknown'} "
+                    f"requested={close_qty:g} remaining={remaining_qty:g}"
+                )
+            if live_qty - close_qty > max(live_qty * 1e-6, 1e-12):
+                skipped.append(
+                    f"{symbol}(external remainder={live_qty - close_qty:g})"
+                )
+        return results, skipped
+
+    async def _managed_position_slice(
+        self,
+        raw_position: dict,
+    ) -> tuple[dict | None, str]:
+        """Return only the exchange quantity explicitly owned by local trade lifecycles."""
+        position = normalize_position(raw_position)
+        symbol = position["symbol"]
+        side = str(position.get("side") or "").lower()
+        live_qty = abs(float(position.get("contracts") or 0.0))
+        if side not in ("long", "short") or live_qty <= 0:
+            return None, f"invalid exchange position side={side or '?'} qty={live_qty:g}"
+
+        managed_by_side = await self._store.open_trade_qty_by_direction(symbol)
+        tolerance = max(live_qty * 1e-6, 1e-12)
+        conflicting_qty = sum(
+            max(float(qty or 0.0), 0.0)
+            for direction, qty in managed_by_side.items()
+            if direction != side
+        )
+        if conflicting_qty > tolerance:
+            return None, (
+                f"ownership conflict: exchange={side} qty={live_qty:g}, "
+                f"local opposite qty={conflicting_qty:g}"
+            )
+
+        managed_qty = max(float(managed_by_side.get(side) or 0.0), 0.0)
+        if managed_qty <= tolerance:
+            return None, f"external qty={live_qty:g}"
+
+        close_qty = min(managed_qty, live_qty)
+        partial = dict(raw_position)
+        partial["symbol"] = symbol
+        partial["side"] = side
+        partial["contracts"] = close_qty
+        info = dict(partial.get("info") or {})
+        info["positionAmt"] = str(close_qty if side == "long" else -close_qty)
+        partial["info"] = info
+        return partial, (
+            f"managed qty={close_qty:g}"
+            if close_qty >= live_qty - tolerance
+            else f"managed qty={close_qty:g}, external remainder={live_qty - close_qty:g}"
+        )
 
     async def _enrich_position_timing(self, symbol: str, position: PositionSnapshot) -> None:
         """Add local lifecycle timing to the LLM-only position snapshot."""
@@ -3292,8 +3408,20 @@ class TradingEngine:
         if not raw:
             logger.info("[{}] CLOSE requested but no position", symbol)
             return
+        managed_position, ownership_note = await self._managed_position_slice(raw)
+        if managed_position is None:
+            await self._store.log_audit(
+                symbol=symbol,
+                action="CLOSE_BLOCKED",
+                reason=(
+                    f"LLM CLOSE blocked because no managed quantity: {ownership_note}; "
+                    "explicit manual takeover or close is required"
+                ),
+            )
+            logger.warning("[{}] LLM CLOSE blocked: {}", symbol, ownership_note)
+            return
         result = await self._executor.close_position(
-            raw,
+            managed_position,
             mode=self._settings.execution.normal_exit_mode,
         )
         if result.get("filled") and result.get("status") != "partial":
@@ -3359,6 +3487,19 @@ class TradingEngine:
         if side not in ("long", "short") or qty <= 0 or entry <= 0 or mark <= 0:
             logger.warning("[{}] ADJUST_SLTP: 持仓数据不完整，跳过", symbol)
             return
+        managed_position, ownership_note = await self._managed_position_slice(position)
+        if managed_position is None:
+            await self._store.log_audit(
+                symbol=symbol,
+                action="SLTP_BLOCKED",
+                reason=(
+                    f"LLM ADJUST_SLTP blocked because no managed quantity: {ownership_note}; "
+                    "explicit PROTECT_POSITION takeover is required"
+                ),
+            )
+            logger.warning("[{}] ADJUST_SLTP blocked: {}", symbol, ownership_note)
+            return
+        qty = float(managed_position["contracts"])
 
         is_long = side == "long"
         filters = self._client.filters(symbol)
@@ -4176,9 +4317,9 @@ class TradingEngine:
             return False
         if not claim:
             return False
-        # 只在 claim 来自策略（source=strategy）且有非零 planned_qty 时接管，
-        # 避免误把人工外部开仓的仓位也接管进来。
-        if claim.get("source") not in ("strategy", "manual", ""):
+        # 只允许明确来自策略开仓流程的 claim 自动接管。人工/旧空 source
+        # 不能作为托管授权，避免误把外部仓位纳入 Engine。
+        if claim.get("source") != "strategy":
             return False
         if claim.get("planned_qty", 0) <= 0:
             return False
@@ -4209,6 +4350,12 @@ class TradingEngine:
                 symbol, planned, qty, ratio,
             )
             return False
+        claimed_qty = float(claim.get("filled_qty") or 0.0)
+        if claimed_qty <= 0:
+            claimed_qty = planned
+        managed_qty = min(qty, claimed_qty)
+        if managed_qty <= 0:
+            return False
 
         # 1) 接管 trade 行
         leverage = int(position.get("leverage") or 0)
@@ -4216,7 +4363,7 @@ class TradingEngine:
             trade_id = await self._store.ensure_takeover_trade(
                 symbol=symbol,
                 direction=side,
-                qty=qty,
+                qty=managed_qty,
                 entry_price=entry,
                 leverage=leverage,
                 source="orphan_adoption",
@@ -4232,7 +4379,8 @@ class TradingEngine:
         position["markPrice"] = mark
         self.runtime.positions[symbol] = position
         message = (
-            f"{symbol} orphan position adopted: side={side} qty={qty} entry={entry} "
+            f"{symbol} orphan position adopted: side={side} managed_qty={managed_qty} "
+            f"exchange_qty={qty} entry={entry} "
             f"leverage={leverage} trade_id={trade_id} reason={reason}"
         )
         logger.warning(message)
@@ -4267,7 +4415,7 @@ class TradingEngine:
                     take_profit_targets=take_profit_targets,
                     reason="orphan_adoption",
                 )
-                placed_specs = self._planned_protection_specs(tdec, entry, qty)
+                placed_specs = self._planned_protection_specs(tdec, entry, managed_qty)
             except Exception as e:
                 logger.warning("{} orphan adopt: build specs failed: {}", symbol, e)
 
@@ -4276,7 +4424,7 @@ class TradingEngine:
                 results = await self._executor.place_protection_orders(
                     symbol=symbol,
                     pos_side=side,
-                    qty=qty,
+                    qty=managed_qty,
                     specs=placed_specs,
                 )
                 for order in results:

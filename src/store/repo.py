@@ -2522,6 +2522,28 @@ class Store:
                 qty += max(float(row.qty_opened or 0.0) - float(row.qty_closed or 0.0), 0.0)
             return qty
 
+    async def open_trade_qty_by_direction(self, symbol: str) -> dict[str, float]:
+        """Return locally managed open quantity split by position direction."""
+        symbol = normalize_symbol(symbol)
+        async with self._sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(TradeRow)
+                    .where(TradeRow.symbol == symbol)
+                    .where(TradeRow.status.in_(tuple(_OPEN_TRADE_STATUSES)))
+                )
+            ).scalars().all()
+            quantities = {"long": 0.0, "short": 0.0}
+            for row in rows:
+                direction = str(row.direction or "").lower()
+                if direction not in quantities:
+                    continue
+                quantities[direction] += max(
+                    float(row.qty_opened or 0.0) - float(row.qty_closed or 0.0),
+                    0.0,
+                )
+            return quantities
+
     async def latest_open_trade_summary(self, symbol: str) -> dict[str, Any] | None:
         """Return the latest local open trade lifecycle for execution guards."""
         symbol = normalize_symbol(symbol)
